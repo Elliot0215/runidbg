@@ -1,0 +1,18 @@
+[package]
+name = "arm64-emu-tracer"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight high-performance Android ARM64 .so emulator & binary tracer in pure Rust"
+
+[dependencies]
+unicorn-engine = "2.1"
+goblin = "0.10"
+bad64 = "0.13"
+memmap2 = "0.9"
+anyhow = "1.0"
+thiserror = "2.0"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
