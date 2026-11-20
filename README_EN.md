@@ -1,3 +1,6 @@
+> [!WARNING]
+> **Disclaimer**: This project (`runidbg`) is intended strictly for **binary security research, reverse-engineering education, benchmarking, and authorized security testing**. Any unlawful or unauthorized use is strictly prohibited; users assume full legal responsibility for how they use this software.
+
 <div align="center">
 
 # ⚡ runidbg (`runidbg-arm64-emu-tracer`)
@@ -19,6 +22,17 @@ Built-in Async Multi-Core RPC Server · MCP AI Reverse-Engineering Loop · GDB R
 | **77 ms** (`22.6×` vs unidbg) | **17.03 M insns/s** (`114×` vs unidbg) | **21.7 MB** (`82%` less) | **1,141 QPS** (10 cores) | **32 B / insn** (`3.7×` smaller) |
 
 </div>
+
+---
+
+## 🤝 Incompatible Sample Reports & Contributions Welcome
+
+`runidbg` is actively evolving — **incompatible Android ARM64 `.so` samples, bug reports, and pull requests are warmly welcomed!** Every real-world sample helps us expand HLE libc, syscall, VFS, and JNI coverage.
+
+When opening an Issue or PR, please redact any private credentials (cookies/tokens) and include:
+1. A **minimal reproduction script** (QuickJS or Rust) with sanitized test inputs;
+2. **`EnvDiag` output** (`JSON.stringify(emu.diag.report(), null, 2)` listing missing files, system properties, syscalls, and JNI methods);
+3. **Guest crash report** (if applicable, `emu.lastCrash()?.formatted` with ARM64 disassembly, registers, backtrace, and breadcrumbs).
 
 ---
 
@@ -248,14 +262,3 @@ cargo clippy --no-default-features --all-targets -- -D warnings
 cargo clippy --no-default-features --features js --all-targets -- -D warnings
 cargo clippy --no-default-features --features mcp --all-targets -- -D warnings
 ```
-
----
-
-## 🤝 Contributing & Incompatible Sample Reports
-
-`runidbg` is actively evolving — **incompatible Android ARM64 `.so` samples, bug reports, and pull requests are warmly welcomed!** Every real-world sample helps us expand HLE libc, syscall, VFS, and JNI coverage.
-
-When opening an Issue or PR, please redact any private credentials (cookies/tokens) and include:
-1. A **minimal reproduction script** (QuickJS or Rust) with sanitized test inputs;
-2. **`EnvDiag` output** (`JSON.stringify(emu.diag.report(), null, 2)` listing missing files, system properties, syscalls, and JNI methods);
-3. **Guest crash report** (if applicable, `emu.lastCrash()?.formatted` with ARM64 disassembly, registers, backtrace, and breadcrumbs).
