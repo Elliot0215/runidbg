@@ -81,9 +81,24 @@ fn test_dual_stream_full_trace_and_offline_reader() {
     assert_eq!(reader.len(), 5, "应精确记录 5 条指令");
     assert!(reader.ext_len() >= 2, "应记录至少 1 次 MemWrite 与 1 次 MemRead");
 
-    // 检索寄存器写入 0x1337 的记录
+    // 检索寄存器写入 0x1337 的记录（含执行后归属修正：应准确归属到 #0 的 MOVZ X1, #0x1337）
     let val_hits = reader.search_value(0x1337);
     assert!(!val_hits.is_empty(), "应检索到 X1=0x1337 的寄存器增量变化");
+    let attr_hits = reader.search_value_attributed(0x1337);
+    assert_eq!(attr_hits[0].0, 0, "X1=0x1337 应精确归属到第 #0 条指令 MOVZ");
+    assert_eq!(attr_hits[0].2, 1, "变更寄存器应为 X1");
+    let d0 = reader.reg_deltas_for(0);
+    assert!(d0.contains(&(1, 0x1337)), "reg_deltas_for(0) 应包含 X1=0x1337");
+
+    // 内存字节流匹配（小端 0x1337 -> [0x37, 0x13]）
+    let pat_hits = reader.search_mem_bytes(&[0x37, 0x13]);
+    assert_eq!(pat_hits.len(), 1, "应命中 1 次连续内存写入字节序列");
+    assert_eq!(pat_hits[0].addr, data_base);
+
+    // 验证调用树节点（至少包含根节点）
+    let tree = reader.build_calltree();
+    assert_eq!(tree.len(), 1);
+    assert_eq!(tree[0].insn_count(), 5);
 
     // 检索对 data_base 的访存事件
     let mem_hits = reader.search_mem_addr(data_base);

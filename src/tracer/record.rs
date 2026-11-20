@@ -126,24 +126,52 @@ pub(crate) fn format_reg_name(reg_id: u8) -> String {
     }
 }
 
+/// 若小端字节序列为 4 字节或 8 字节全可打印 ASCII（且非全空格），返回可读旁注（如 ` ("3019")`）
+pub fn format_ascii_hint(value: u64, byte_width: u8) -> Option<String> {
+    let bytes_all = value.to_le_bytes();
+    let slice: &[u8] = match byte_width {
+        4 => &bytes_all[..4],
+        8 => {
+            if value <= u32::MAX as u64 && value != 0 {
+                &bytes_all[..4]
+            } else {
+                &bytes_all[..8]
+            }
+        }
+        _ => return None,
+    };
+    if slice.iter().all(|&b| (0x20..=0x7E).contains(&b)) && slice.iter().any(|&b| b != b' ') {
+        let s = std::str::from_utf8(slice).ok()?;
+        Some(format!(" (\"{s}\")"))
+    } else {
+        None
+    }
+}
+
+/// 冷路径辅助：解码单条指令并附加已正确归属的执行后主寄存器变更
+pub fn decode_instruction_with_reg(pc: u64, opcode: u32, reg_delta: Option<(u8, u64)>) -> String {
+    let disasm = match bad64::decode(opcode, pc) {
+        Ok(insn) => insn.to_string(),
+        Err(_) => format!(".word 0x{opcode:08x}"),
+    };
+
+    if let Some((reg_id, reg_val)) = reg_delta {
+        let reg_name = format_reg_name(reg_id);
+        let hint = format_ascii_hint(reg_val, 8).unwrap_or_default();
+        format!("0x{pc:016x}: {disasm:<32} ; {reg_name} <- 0x{reg_val:016x}{hint}")
+    } else {
+        format!("0x{pc:016x}: {disasm}")
+    }
+}
+
 /// 冷路径辅助：利用 `bad64` 零堆分配解码器对单条 Trace 记录进行离线反汇编
 pub fn decode_trace_record(record: &TraceRecord) -> String {
     let pc = record.pc;
     let opcode = record.opcode;
     let reg_id = record.primary_reg_id;
     let reg_val = record.primary_reg_val;
-
-    let disasm = match bad64::decode(opcode, pc) {
-        Ok(insn) => insn.to_string(),
-        Err(_) => format!(".word 0x{opcode:08x}"),
-    };
-
-    if reg_id != 0xFF {
-        let reg_name = format_reg_name(reg_id);
-        format!("0x{pc:016x}: {disasm:<32} ; {reg_name} <- 0x{reg_val:016x}")
-    } else {
-        format!("0x{pc:016x}: {disasm}")
-    }
+    let delta = (reg_id != 0xFF).then_some((reg_id, reg_val));
+    decode_instruction_with_reg(pc, opcode, delta)
 }
 
 /// 冷路径辅助：格式化单条扩展事件记录
@@ -154,14 +182,17 @@ pub fn format_ext_record(ext: &ExtRecord) -> String {
     let size_or_reg = ext.size_or_reg;
     match kind {
         Some(ExtKind::MemRead) => {
-            format!("    [MEM R{size_or_reg}] [0x{addr:016x}] -> 0x{value:016x}")
+            let hint = format_ascii_hint(value, size_or_reg).unwrap_or_default();
+            format!("    [MEM R{size_or_reg}] [0x{addr:016x}] -> 0x{value:016x}{hint}")
         }
         Some(ExtKind::MemWrite) => {
-            format!("    [MEM W{size_or_reg}] [0x{addr:016x}] <- 0x{value:016x}")
+            let hint = format_ascii_hint(value, size_or_reg).unwrap_or_default();
+            format!("    [MEM W{size_or_reg}] [0x{addr:016x}] <- 0x{value:016x}{hint}")
         }
         Some(ExtKind::RegDeltaExtra) => {
             let name = format_reg_name(size_or_reg);
-            format!("    [REG] {name} <- 0x{value:016x}")
+            let hint = format_ascii_hint(value, 8).unwrap_or_default();
+            format!("    [REG] {name} <- 0x{value:016x}{hint}")
         }
         None => format!("    [EXT?] kind={} val=0x{value:016x}", ext.kind),
     }
