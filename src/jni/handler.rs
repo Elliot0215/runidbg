@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::jni::types::{FieldDesc, JObject, JObjectRef, JValue, MethodDesc, ObjectTable};
 
 /// 传递给 `JniHandler` 的上下文，提供对象表与基础环境信息
@@ -660,13 +662,58 @@ pub fn default_call_static_object_method(
     ctx: &mut JniContext<'_>,
     class_name: &str,
     method: &MethodDesc,
-    _args: &[JValue],
+    args: &[JValue],
 ) -> Option<JObjectRef> {
     match (class_name, method.name.as_str()) {
         ("java/lang/Thread", "currentThread") => Some(ctx.objects.add_local(JObject::Custom {
             class_name: "java/lang/Thread".to_string(),
             fields: Default::default(),
         })),
+        ("java/lang/Boolean", "valueOf") => {
+            let mut fields = HashMap::new();
+            let v = args.first().cloned().unwrap_or(JValue::Boolean(false));
+            fields.insert("value".to_string(), v);
+            Some(ctx.objects.add_local(JObject::Custom {
+                class_name: "java/lang/Boolean".to_string(),
+                fields,
+            }))
+        }
+        ("java/lang/Integer", "valueOf") => {
+            let mut fields = HashMap::new();
+            let v = args.first().cloned().unwrap_or(JValue::Int(0));
+            fields.insert("value".to_string(), v);
+            Some(ctx.objects.add_local(JObject::Custom {
+                class_name: "java/lang/Integer".to_string(),
+                fields,
+            }))
+        }
+        ("java/lang/Long", "valueOf") => {
+            let mut fields = HashMap::new();
+            let v = args.first().cloned().unwrap_or(JValue::Long(0));
+            fields.insert("value".to_string(), v);
+            Some(ctx.objects.add_local(JObject::Custom {
+                class_name: "java/lang/Long".to_string(),
+                fields,
+            }))
+        }
+        ("java/lang/Float", "valueOf") => {
+            let mut fields = HashMap::new();
+            let v = args.first().cloned().unwrap_or(JValue::Float(0.0));
+            fields.insert("value".to_string(), v);
+            Some(ctx.objects.add_local(JObject::Custom {
+                class_name: "java/lang/Float".to_string(),
+                fields,
+            }))
+        }
+        ("java/lang/Double", "valueOf") => {
+            let mut fields = HashMap::new();
+            let v = args.first().cloned().unwrap_or(JValue::Double(0.0));
+            fields.insert("value".to_string(), v);
+            Some(ctx.objects.add_local(JObject::Custom {
+                class_name: "java/lang/Double".to_string(),
+                fields,
+            }))
+        }
         _ => None,
     }
 }

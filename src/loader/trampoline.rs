@@ -59,11 +59,16 @@ pub enum HleBuiltin {
     Strerror,
     // 格式化与转换
     Snprintf,
+    SnprintfChk,
     Sprintf,
+    SprintfChk,
     Asprintf,
+    Vasprintf,
+    Sscanf,
     Vsnprintf,
     VsnprintfChk,
     Atoi,
+    Atol,
     Strtol,
     // POSIX 文件与内存映射（由 VirtualFs 支撑）
     Open,
@@ -156,12 +161,17 @@ impl HleBuiltin {
             "strcspn" => Some(Self::Strcspn),
             "strdup" => Some(Self::Strdup),
             "strerror" => Some(Self::Strerror),
-            "snprintf" | "__snprintf_chk" => Some(Self::Snprintf),
-            "sprintf" | "__sprintf_chk" => Some(Self::Sprintf),
+            "snprintf" => Some(Self::Snprintf),
+            "__snprintf_chk" => Some(Self::SnprintfChk),
+            "sprintf" => Some(Self::Sprintf),
+            "__sprintf_chk" => Some(Self::SprintfChk),
             "asprintf" => Some(Self::Asprintf),
+            "vasprintf" => Some(Self::Vasprintf),
+            "sscanf" => Some(Self::Sscanf),
             "vsnprintf" => Some(Self::Vsnprintf),
             "__vsnprintf_chk" => Some(Self::VsnprintfChk),
             "atoi" => Some(Self::Atoi),
+            "atol" | "atoll" => Some(Self::Atol),
             "strtol" | "strtoul" | "strtoll" | "strtoull" => Some(Self::Strtol),
             "open" | "__open_2" => Some(Self::Open),
             "close" => Some(Self::Close),
@@ -421,6 +431,209 @@ impl TrampolineTable {
     }
 }
 
+/// 解析 C 风格十进制有符号整数前缀（兼容 `atoi` / `atol` / `atoll`）
+fn parse_c_i64(s: &str) -> i64 {
+    let bytes = s.trim_start().as_bytes();
+    if bytes.is_empty() {
+        return 0;
+    }
+    let (neg, start) = match bytes[0] {
+        b'-' => (true, 1),
+        b'+' => (false, 1),
+        _ => (false, 0),
+    };
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    if end == start {
+        return 0;
+    }
+    let digits = &s.trim_start()[start..end];
+    let val = digits.parse::<i64>().unwrap_or(0);
+    if neg {
+        val.wrapping_neg()
+    } else {
+        val
+    }
+}
+
+/// 精简版 AAPCS64 `sscanf(input, fmt, ...)`（支持 `%d/%i/%u/%ld/%lu/%lld/%llu/%x/%X/%s/%c`）
+fn run_guest_sscanf<D>(uc: &mut Unicorn<'_, D>, input: &str, fmt: &str) -> i32 {
+    let mut in_pos = 0usize;
+    let in_bytes = input.as_bytes();
+    let fmt_bytes = fmt.as_bytes();
+    let mut fi = 0usize;
+    let mut arg_idx = 2usize; // x2..x7, 然后栈参
+    let mut matched = 0i32;
+
+    let read_arg_ptr = |uc: &Unicorn<'_, D>, idx: usize| -> u64 {
+        const REGS: [RegisterARM64; 8] = [
+            RegisterARM64::X0,
+            RegisterARM64::X1,
+            RegisterARM64::X2,
+            RegisterARM64::X3,
+            RegisterARM64::X4,
+            RegisterARM64::X5,
+            RegisterARM64::X6,
+            RegisterARM64::X7,
+        ];
+        if idx < 8 {
+            uc.reg_read(REGS[idx]).unwrap_or(0)
+        } else {
+            let sp = uc.reg_read(RegisterARM64::SP).unwrap_or(0);
+            let mut b = [0u8; 8];
+            let _ = uc.mem_read(sp + ((idx - 8) as u64) * 8, &mut b);
+            u64::from_le_bytes(b)
+        }
+    };
+
+    while fi < fmt_bytes.len() {
+        if fmt_bytes[fi].is_ascii_whitespace() {
+            while fi < fmt_bytes.len() && fmt_bytes[fi].is_ascii_whitespace() {
+                fi += 1;
+            }
+            while in_pos < in_bytes.len() && in_bytes[in_pos].is_ascii_whitespace() {
+                in_pos += 1;
+            }
+            continue;
+        }
+        if fmt_bytes[fi] != b'%' {
+            if in_pos < in_bytes.len() && in_bytes[in_pos] == fmt_bytes[fi] {
+                in_pos += 1;
+                fi += 1;
+                continue;
+            }
+            break;
+        }
+        fi += 1;
+        if fi < fmt_bytes.len() && fmt_bytes[fi] == b'%' {
+            if in_pos < in_bytes.len() && in_bytes[in_pos] == b'%' {
+                in_pos += 1;
+                fi += 1;
+                continue;
+            }
+            break;
+        }
+        let suppress = if fi < fmt_bytes.len() && fmt_bytes[fi] == b'*' {
+            fi += 1;
+            true
+        } else {
+            false
+        };
+        let mut width: Option<usize> = None;
+        while fi < fmt_bytes.len() && fmt_bytes[fi].is_ascii_digit() {
+            width = Some(width.unwrap_or(0) * 10 + (fmt_bytes[fi] - b'0') as usize);
+            fi += 1;
+        }
+        let mut is_long = false;
+        while fi < fmt_bytes.len() && matches!(fmt_bytes[fi], b'l' | b'h' | b'z') {
+            if fmt_bytes[fi] == b'l' || fmt_bytes[fi] == b'z' {
+                is_long = true;
+            }
+            fi += 1;
+        }
+        if fi >= fmt_bytes.len() {
+            break;
+        }
+        let spec = fmt_bytes[fi];
+        fi += 1;
+
+        match spec {
+            b'd' | b'i' | b'u' | b'x' | b'X' => {
+                while in_pos < in_bytes.len() && in_bytes[in_pos].is_ascii_whitespace() {
+                    in_pos += 1;
+                }
+                let max_end = width
+                    .map(|w| in_pos.saturating_add(w).min(in_bytes.len()))
+                    .unwrap_or(in_bytes.len());
+                let mut neg = false;
+                if in_pos < max_end && matches!(in_bytes[in_pos], b'-' | b'+') {
+                    neg = in_bytes[in_pos] == b'-';
+                    in_pos += 1;
+                }
+                let mut radix = if matches!(spec, b'x' | b'X') { 16u32 } else { 10u32 };
+                if matches!(spec, b'i' | b'x' | b'X')
+                    && in_pos + 1 < max_end
+                    && in_bytes[in_pos] == b'0'
+                    && matches!(in_bytes[in_pos + 1], b'x' | b'X')
+                {
+                    radix = 16;
+                    in_pos += 2;
+                }
+                let dstart = in_pos;
+                while in_pos < max_end && (in_bytes[in_pos] as char).is_digit(radix) {
+                    in_pos += 1;
+                }
+                if in_pos == dstart {
+                    break;
+                }
+                let raw = &input[dstart..in_pos];
+                let uval = u64::from_str_radix(raw, radix).unwrap_or(0);
+                let val = if neg {
+                    (uval as i64).wrapping_neg() as u64
+                } else {
+                    uval
+                };
+                if !suppress {
+                    let dst = read_arg_ptr(uc, arg_idx);
+                    arg_idx += 1;
+                    if dst != 0 {
+                        if is_long {
+                            let _ = uc.mem_write(dst, &val.to_le_bytes());
+                        } else {
+                            let _ = uc.mem_write(dst, &(val as u32).to_le_bytes());
+                        }
+                    }
+                    matched += 1;
+                }
+            }
+            b's' => {
+                while in_pos < in_bytes.len() && in_bytes[in_pos].is_ascii_whitespace() {
+                    in_pos += 1;
+                }
+                let max_end = width
+                    .map(|w| in_pos.saturating_add(w).min(in_bytes.len()))
+                    .unwrap_or(in_bytes.len());
+                let start = in_pos;
+                while in_pos < max_end && !in_bytes[in_pos].is_ascii_whitespace() {
+                    in_pos += 1;
+                }
+                if in_pos == start {
+                    break;
+                }
+                if !suppress {
+                    let dst = read_arg_ptr(uc, arg_idx);
+                    arg_idx += 1;
+                    if dst != 0 {
+                        let mut out = in_bytes[start..in_pos].to_vec();
+                        out.push(0);
+                        let _ = uc.mem_write(dst, &out);
+                    }
+                    matched += 1;
+                }
+            }
+            b'c' => {
+                let count = width.unwrap_or(1);
+                if in_pos + count > in_bytes.len() {
+                    break;
+                }
+                if !suppress {
+                    let dst = read_arg_ptr(uc, arg_idx);
+                    arg_idx += 1;
+                    if dst != 0 {
+                        let _ = uc.mem_write(dst, &in_bytes[in_pos..in_pos + count]);
+                    }
+                    matched += 1;
+                }
+                in_pos += count;
+            }
+            _ => break,
+        }
+    }
+    matched
+}
+
 /// 按 AAPCS64 规则解析 `snprintf`/`sprintf` 变参格式化字符串
 /// 支持 `%s`、`%d`/`%i`/`%u`、`%x`/`%X`、`%p`、`%c`、`%%` 以及宽度/零填充（如 `%02x`、`%08X`）
 fn format_guest_printf<D>(uc: &Unicorn<'_, D>, fmt: &str, first_gpr_idx: usize) -> String {
@@ -438,7 +651,7 @@ fn format_guest_printf<D>(uc: &Unicorn<'_, D>, fmt: &str, first_gpr_idx: usize) 
     let mut gpr = first_gpr_idx;
     let mut stack_off = 0u64;
 
-    let mut next_arg = || -> u64 {
+    format_guest_printf_with_reader(uc, fmt, || {
         if gpr < GPRS.len() {
             let v = uc.reg_read(GPRS[gpr]).unwrap_or(0);
             gpr += 1;
@@ -453,7 +666,50 @@ fn format_guest_printf<D>(uc: &Unicorn<'_, D>, fmt: &str, first_gpr_idx: usize) 
             stack_off += 8;
             v
         }
-    };
+    })
+}
+
+/// 按 AAPCS64 `va_list` 结构解析 `vsnprintf`/`__vsnprintf_chk`/`vasprintf`
+/// AAPCS64 `va_list` (32B): `{ __stack: u64, __gr_top: u64, __vr_top: u64, __gr_offs: i32, __vr_offs: i32 }`
+fn format_guest_vprintf<D>(uc: &Unicorn<'_, D>, fmt: &str, va_list_ptr: u64) -> String {
+    if va_list_ptr == 0 {
+        return fmt.to_string();
+    }
+    let mut raw = [0u8; 32];
+    if uc.mem_read(va_list_ptr, &mut raw).is_err() {
+        return fmt.to_string();
+    }
+    let mut stack_ptr = u64::from_le_bytes(raw[0..8].try_into().unwrap());
+    let gr_top = u64::from_le_bytes(raw[8..16].try_into().unwrap());
+    let mut gr_offs = i32::from_le_bytes(raw[24..28].try_into().unwrap());
+
+    format_guest_printf_with_reader(uc, fmt, || {
+        let addr = if gr_offs < 0 {
+            let a = (gr_top as i64).wrapping_add(gr_offs as i64) as u64;
+            gr_offs = gr_offs.saturating_add(8);
+            a
+        } else {
+            let a = stack_ptr;
+            stack_ptr = stack_ptr.wrapping_add(8);
+            a
+        };
+        let mut buf = [0u8; 8];
+        if uc.mem_read(addr, &mut buf).is_ok() {
+            u64::from_le_bytes(buf)
+        } else {
+            0
+        }
+    })
+}
+
+fn format_guest_printf_with_reader<D, F>(
+    uc: &Unicorn<'_, D>,
+    fmt: &str,
+    mut next_arg: F,
+) -> String
+where
+    F: FnMut() -> u64,
+{
 
     let bytes = fmt.as_bytes();
     let mut out = String::with_capacity(fmt.len() + 32);
@@ -939,10 +1195,38 @@ where
             }
             formatted.len() as u64
         }
+        HleBuiltin::SnprintfChk => {
+            // int __snprintf_chk(char *dst, size_t size, int flags, size_t destlen, const char *fmt, ...)
+            let max_sz = x1 as usize;
+            let fmt_ptr = uc.reg_read(RegisterARM64::X4).unwrap_or(0);
+            let fmt = read_guest_cstr(uc, fmt_ptr, 4096);
+            let formatted = format_guest_printf(uc, &fmt, 5);
+            if max_sz > 0 && x0 != 0 {
+                let bytes = formatted.as_bytes();
+                let copy_len = bytes.len().min(max_sz - 1);
+                let mut out = Vec::with_capacity(copy_len + 1);
+                out.extend_from_slice(&bytes[..copy_len]);
+                out.push(0);
+                let _ = uc.mem_write(x0, &out);
+            }
+            formatted.len() as u64
+        }
         HleBuiltin::Sprintf => {
             // int sprintf(char *str, const char *format, ...)
             let fmt = read_guest_cstr(uc, x1, 4096);
             let formatted = format_guest_printf(uc, &fmt, 2);
+            if x0 != 0 {
+                let mut out = formatted.as_bytes().to_vec();
+                out.push(0);
+                let _ = uc.mem_write(x0, &out);
+            }
+            formatted.len() as u64
+        }
+        HleBuiltin::SprintfChk => {
+            // int __sprintf_chk(char *dst, int flags, size_t destlen, const char *fmt, ...)
+            let fmt_ptr = uc.reg_read(RegisterARM64::X3).unwrap_or(0);
+            let fmt = read_guest_cstr(uc, fmt_ptr, 4096);
+            let formatted = format_guest_printf(uc, &fmt, 4);
             if x0 != 0 {
                 let mut out = formatted.as_bytes().to_vec();
                 out.push(0);
@@ -970,34 +1254,58 @@ where
                 (-1i64) as u64
             }
         }
+        HleBuiltin::Vasprintf => {
+            // int vasprintf(char **strp, const char *format, va_list ap)
+            let fmt = read_guest_cstr(uc, x1, 4096);
+            let formatted = format_guest_vprintf(uc, &fmt, x2);
+            let mut out = formatted.as_bytes().to_vec();
+            out.push(0);
+            let ptr = {
+                let (_, mem, _) = get_state(uc.get_data_mut());
+                mem.alloc_heap(out.len() as u64).unwrap_or(0)
+            };
+            if ptr != 0 {
+                let _ = uc.mem_write(ptr, &out);
+                if x0 != 0 {
+                    let _ = uc.mem_write(x0, &ptr.to_le_bytes());
+                }
+                formatted.len() as u64
+            } else {
+                (-1i64) as u64
+            }
+        }
         HleBuiltin::Vsnprintf => {
             // int vsnprintf(char *str, size_t size, const char *fmt, va_list ap)
             let max_sz = x1 as usize;
             let fmt = read_guest_cstr(uc, x2, 4096);
+            let ap_ptr = uc.reg_read(RegisterARM64::X3).unwrap_or(0);
+            let formatted = format_guest_vprintf(uc, &fmt, ap_ptr);
             if max_sz > 0 && x0 != 0 {
-                let bytes = fmt.as_bytes();
+                let bytes = formatted.as_bytes();
                 let copy_len = bytes.len().min(max_sz - 1);
                 let mut out = Vec::with_capacity(copy_len + 1);
                 out.extend_from_slice(&bytes[..copy_len]);
                 out.push(0);
                 let _ = uc.mem_write(x0, &out);
             }
-            fmt.len() as u64
+            formatted.len() as u64
         }
         HleBuiltin::VsnprintfChk => {
             // int __vsnprintf_chk(char *dst, size_t size, int flags, size_t destlen, const char *fmt, va_list ap)
             let max_sz = x1 as usize;
             let fmt_ptr = uc.reg_read(RegisterARM64::X4).unwrap_or(0);
+            let ap_ptr = uc.reg_read(RegisterARM64::X5).unwrap_or(0);
             let fmt = read_guest_cstr(uc, fmt_ptr, 4096);
+            let formatted = format_guest_vprintf(uc, &fmt, ap_ptr);
             if max_sz > 0 && x0 != 0 {
-                let bytes = fmt.as_bytes();
+                let bytes = formatted.as_bytes();
                 let copy_len = bytes.len().min(max_sz - 1);
                 let mut out = Vec::with_capacity(copy_len + 1);
                 out.extend_from_slice(&bytes[..copy_len]);
                 out.push(0);
                 let _ = uc.mem_write(x0, &out);
             }
-            fmt.len() as u64
+            formatted.len() as u64
         }
         HleBuiltin::Strerror => {
             let msg_addr = {
@@ -1286,7 +1594,17 @@ where
         }
         HleBuiltin::Atoi => {
             let s = read_guest_cstr(uc, x0, 64);
-            s.trim().parse::<i32>().unwrap_or(0) as i64 as u64
+            parse_c_i64(&s) as i32 as i64 as u64
+        }
+        HleBuiltin::Atol => {
+            let s = read_guest_cstr(uc, x0, 128);
+            parse_c_i64(&s) as u64
+        }
+        HleBuiltin::Sscanf => {
+            // int sscanf(const char *str, const char *format, ...)
+            let input = read_guest_cstr(uc, x0, 4096);
+            let fmt = read_guest_cstr(uc, x1, 1024);
+            run_guest_sscanf(uc, &input, &fmt) as u64
         }
         HleBuiltin::Strtol => {
             let s = read_guest_cstr(uc, x0, 128);
