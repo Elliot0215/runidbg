@@ -267,5 +267,5 @@ cargo clippy --no-default-features --features mcp --all-targets -- -D warnings
 
 ## 🙏 Acknowledgements
 
-- Special thanks to [**unidbg**](https://github.com/zhkl0228/unidbg) (`zhkl0228`): the name `runidbg` (`Rust + unidbg`), Android sandbox architecture, and JNI bridging model are deeply inspired by `unidbg`. Huge respect for its foundational work in the mobile security community.
+- Special thanks to [**unidbg**](https://github.com/zhkl0228/unidbg) and its author **`zhkl0228`**: the name `runidbg` (`Rust + unidbg`), Android sandbox architecture, and JNI bridging model are deeply inspired by `unidbg`. Building and continuously maintaining such a comprehensive Android ARM32/ARM64 and iOS emulator entirely by hand in the pre-AI era reflects extraordinary low-level engineering mastery and remarkable perseverance.
 - Thanks as well to [Unicorn Engine](https://github.com/unicorn-engine/unicorn), [QuickJS](https://bellard.org/quickjs/) / `rquickjs`, `goblin`, and `bad64`.
