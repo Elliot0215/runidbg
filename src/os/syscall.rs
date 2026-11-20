@@ -364,8 +364,7 @@ where
             let tp_addr = args[1];
             let ns = {
                 let (_, vfs) = get_state(uc.get_data_mut());
-                vfs.mono_clock_ns += 1_000_000; // 每次递增 1ms，确定性推进
-                vfs.mono_clock_ns
+                vfs.current_clock_ns()
             };
             let sec = (ns / 1_000_000_000) as i64;
             let nsec = (ns % 1_000_000_000) as i64;
@@ -381,8 +380,7 @@ where
             let tv_addr = args[0];
             let ns = {
                 let (_, vfs) = get_state(uc.get_data_mut());
-                vfs.mono_clock_ns += 1_000_000;
-                vfs.mono_clock_ns
+                vfs.current_clock_ns()
             };
             let sec = (ns / 1_000_000_000) as i64;
             let usec = ((ns % 1_000_000_000) / 1_000) as i64;

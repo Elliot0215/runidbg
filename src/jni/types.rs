@@ -346,12 +346,20 @@ impl ObjectTable {
     }
 
     /// 释放 LocalRef；若无 GlobalRef 持有则销毁底层对象
+    fn is_referenced_by_container(&self, r: JObjectRef) -> bool {
+        self.objects.values().any(|obj| match obj {
+            JObject::ObjectArray(elems) => elems.contains(&r),
+            JObject::Custom { fields, .. } => fields.values().any(|v| v.as_object() == Some(r)),
+            _ => false,
+        })
+    }
+
     pub fn delete_local(&mut self, r: JObjectRef) {
         if r.is_null() {
             return;
         }
         self.local_refs.remove(&r.0);
-        if !self.global_refs.contains_key(&r.0) {
+        if !self.global_refs.contains_key(&r.0) && !self.is_referenced_by_container(r) {
             self.objects.remove(&r.0);
         }
     }

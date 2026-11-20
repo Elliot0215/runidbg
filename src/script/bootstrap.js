@@ -432,6 +432,7 @@
           },
         },
         jni: {
+          envPtr: 0x18001000,
           hook(className, methods) {
             if (!methods || typeof methods !== "object") {
               throw new TypeError("jni.hook(className, methods) expects an object of functions");
@@ -472,6 +473,27 @@
           newObject(className, fields) {
             return __native.jniNewObject(emuId, String(className), fields || null);
           },
+          findClass(className) {
+            return __native.jniFindClass(emuId, String(className));
+          },
+          newStringArray(items) {
+            if (!Array.isArray(items)) {
+              throw new TypeError("jni.newStringArray expects a string array");
+            }
+            return __native.jniNewStringArray(emuId, items.map(String));
+          },
+          getStringArray(ref) {
+            return __native.jniGetStringArray(emuId, toAddr(ref)) ?? null;
+          },
+          newObjectArray(refs) {
+            if (!Array.isArray(refs)) {
+              throw new TypeError("jni.newObjectArray expects a ref array");
+            }
+            return __native.jniNewObjectArray(emuId, refs.map(toAddr));
+          },
+          getObjectArray(ref) {
+            return __native.jniGetObjectArray(emuId, toAddr(ref)) ?? null;
+          },
           getString(ref) {
             return __native.jniGetString(emuId, toAddr(ref)) ?? null;
           },
@@ -498,6 +520,12 @@
           },
           mountOverlay(guestDir, hostDir) {
             __native.vfsMountOverlay(emuId, String(guestDir), String(hostDir));
+          },
+          setTime(unixSecs) {
+            __native.vfsSetTime(emuId, Number(unixSecs));
+          },
+          useRealClock(enabled = true) {
+            __native.vfsUseRealClock(emuId, Boolean(enabled));
           },
         },
         trace: {

@@ -64,6 +64,8 @@ pub struct VirtualFs {
     rng_state: u64,
     /// 虚拟单调时钟（纳秒），每次调用递增 1ms，防止时间差反调试
     pub mono_clock_ns: u64,
+    /// 为 true 时直接读取宿主机真实时间（适用于需要当前 Unix 时间戳的实签场景）
+    pub use_real_clock: bool,
     /// 缺环境自动诊断器（关闭时零开销）
     diag: EnvDiag,
     /// 最近外部事件环形缓冲（供崩溃现场报告使用）
@@ -152,6 +154,7 @@ impl VirtualFs {
             next_fd: 3,
             rng_state: 0x2026_1119_CAFE_BABE,
             mono_clock_ns: 1_700_000_000_000_000_000,
+            use_real_clock: false,
             diag: EnvDiag::new(),
             breadcrumbs: BreadcrumbRing::new(),
         }
@@ -167,6 +170,32 @@ impl VirtualFs {
 
     pub fn breadcrumbs(&self) -> &BreadcrumbRing {
         &self.breadcrumbs
+    }
+
+    /// 切换是否使用宿主机真实时间戳（默认关闭，使用确定性虚拟时钟）
+    pub fn set_use_real_clock(&mut self, enabled: bool) {
+        self.use_real_clock = enabled;
+    }
+
+    /// 手动设置虚拟时钟基准（Unix 秒），同时切回确定性虚拟时钟模式
+    pub fn set_clock_secs(&mut self, unix_secs: u64) {
+        self.use_real_clock = false;
+        self.mono_clock_ns = unix_secs.saturating_mul(1_000_000_000);
+    }
+
+    /// 获取当前仿真时钟（纳秒）：开启 `use_real_clock` 时返回宿主机实时时间，否则确定性递增 1ms
+    pub fn current_clock_ns(&mut self) -> u64 {
+        if self.use_real_clock {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(self.mono_clock_ns);
+            self.mono_clock_ns = now;
+            now
+        } else {
+            self.mono_clock_ns = self.mono_clock_ns.saturating_add(1_000_000);
+            self.mono_clock_ns
+        }
     }
 
     /// 挂载宿主机只读目录到虚拟路径（例如 `/system` -> `./sysroot/system`）

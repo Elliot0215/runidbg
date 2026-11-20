@@ -27,11 +27,14 @@ pub trait JniHandler {
 
     fn call_static_object_method(
         &mut self,
-        _ctx: &mut JniContext<'_>,
+        ctx: &mut JniContext<'_>,
         class_name: &str,
         method: &MethodDesc,
-        _args: &[JValue],
+        args: &[JValue],
     ) -> JObjectRef {
+        if let Some(r) = default_call_static_object_method(ctx, class_name, method, args) {
+            return r;
+        }
         tracing::warn!(target: "runidbg::jni", 
             "[JNI] 未处理的 CallStaticObjectMethod: {}.{}{}",
             class_name, method.name, method.sig
@@ -112,13 +115,10 @@ pub trait JniHandler {
         &mut self,
         ctx: &mut JniContext<'_>,
         class_name: &str,
-        _method: &MethodDesc,
-        _args: &[JValue],
+        method: &MethodDesc,
+        args: &[JValue],
     ) -> JObjectRef {
-        ctx.objects.add_local(JObject::Custom {
-            class_name: class_name.to_string(),
-            fields: Default::default(),
-        })
+        default_new_object(ctx, class_name, method, args)
     }
 
     fn call_static_boolean_method(
@@ -555,6 +555,24 @@ pub fn default_call_object_method(
                 ctx.objects.find_or_create_class(&cls_name)
             }
         }
+        (Some(JObject::Custom { class_name, .. }), "getName")
+            if class_name == "java/lang/Thread" =>
+        {
+            ctx.objects.add_string("main")
+        }
+        (Some(JObject::Custom { class_name, .. }), "getThreadGroup")
+            if class_name == "java/lang/Thread" =>
+        {
+            ctx.objects.add_local(JObject::Custom {
+                class_name: "java/lang/ThreadGroup".to_string(),
+                fields: Default::default(),
+            })
+        }
+        (Some(JObject::Custom { class_name, .. }), "getStackTrace")
+            if class_name == "java/lang/Thread" =>
+        {
+            ctx.objects.add_local(JObject::ObjectArray(Vec::new()))
+        }
         _ => {
             tracing::warn!(target: "runidbg::jni", 
                 "[JNI] 未处理的 CallObjectMethod: {}.{}{}",
@@ -635,4 +653,77 @@ pub fn default_get_object_field(
         }
         _ => JObjectRef::NULL,
     }
+}
+
+/// 内置高频 `CallStaticObjectMethod` 默认分发
+pub fn default_call_static_object_method(
+    ctx: &mut JniContext<'_>,
+    class_name: &str,
+    method: &MethodDesc,
+    _args: &[JValue],
+) -> Option<JObjectRef> {
+    match (class_name, method.name.as_str()) {
+        ("java/lang/Thread", "currentThread") => Some(ctx.objects.add_local(JObject::Custom {
+            class_name: "java/lang/Thread".to_string(),
+            fields: Default::default(),
+        })),
+        _ => None,
+    }
+}
+
+/// 内置高频 `NewObject` 默认分发（支持 `java/lang/String` 从 `byte[]`/`String` 构造）
+pub fn default_new_object(
+    ctx: &mut JniContext<'_>,
+    class_name: &str,
+    method: &MethodDesc,
+    args: &[JValue],
+) -> JObjectRef {
+    if class_name == "java/lang/String" {
+        if method.sig.starts_with("([BII") {
+            let bytes = args
+                .first()
+                .and_then(|v| v.as_object())
+                .and_then(|r| match ctx.objects.get(r) {
+                    Some(JObject::ByteArray(b)) => Some(b.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let offset = args.get(1).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+            let count = args.get(2).and_then(|v| v.as_int()).unwrap_or(0).max(0) as usize;
+            let end = offset.saturating_add(count).min(bytes.len());
+            let slice = if offset <= end { &bytes[offset..end] } else { &[] };
+            return ctx
+                .objects
+                .add_string(String::from_utf8_lossy(slice).into_owned());
+        }
+        if method.sig.starts_with("([B") {
+            let bytes = args
+                .first()
+                .and_then(|v| v.as_object())
+                .and_then(|r| match ctx.objects.get(r) {
+                    Some(JObject::ByteArray(b)) => Some(b.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            return ctx
+                .objects
+                .add_string(String::from_utf8_lossy(&bytes).into_owned());
+        }
+        if method.sig == "(Ljava/lang/String;)V" {
+            let s = args
+                .first()
+                .and_then(|v| v.as_object())
+                .and_then(|r| ctx.objects.get_string(r))
+                .unwrap_or("")
+                .to_string();
+            return ctx.objects.add_string(s);
+        }
+        if method.sig == "()V" {
+            return ctx.objects.add_string("");
+        }
+    }
+    ctx.objects.add_local(JObject::Custom {
+        class_name: class_name.to_string(),
+        fields: Default::default(),
+    })
 }

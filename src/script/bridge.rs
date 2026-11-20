@@ -561,6 +561,159 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
+    // jniFindClass(emuId, className) -> jclass handle
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniFindClass",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, cls: String| -> rquickjs::Result<f64> {
+                    let norm = cls.replace('.', "/");
+                    if let Some(r) = with_active_objects(|objs| objs.find_or_create_class(&norm)) {
+                        return Ok(r.0 as f64);
+                    }
+                    let mut h = host.borrow_mut();
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    Ok(entry.emu.jni_mut().objects.find_or_create_class(&norm).0 as f64)
+                },
+            )?,
+        )?;
+    }
+
+    // jniNewStringArray(emuId, string[]) -> jobjectArray handle
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniNewStringArray",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, items: Vec<String>| -> rquickjs::Result<f64> {
+                    let build = |objs: &mut crate::jni::ObjectTable| {
+                        let refs: Vec<JObjectRef> =
+                            items.iter().map(|s| objs.add_string(s.as_str())).collect();
+                        objs.add_local(JObject::ObjectArray(refs))
+                    };
+                    if let Some(r) = with_active_objects(build) {
+                        return Ok(r.0 as f64);
+                    }
+                    let mut h = host.borrow_mut();
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let refs: Vec<JObjectRef> = items
+                        .into_iter()
+                        .map(|s| entry.emu.jni_mut().objects.add_string(s))
+                        .collect();
+                    let arr = entry
+                        .emu
+                        .jni_mut()
+                        .objects
+                        .add_local(JObject::ObjectArray(refs));
+                    Ok(arr.0 as f64)
+                },
+            )?,
+        )?;
+    }
+
+    // jniGetStringArray(emuId, ref) -> (string | null)[] | null
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniGetStringArray",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>,
+                      emu_id: usize,
+                      r: f64|
+                      -> rquickjs::Result<Option<Vec<Option<String>>>> {
+                    let jref = JObjectRef(r as u64);
+                    let read = |objs: &crate::jni::ObjectTable| match objs.get(jref) {
+                        Some(JObject::ObjectArray(elems)) => Some(
+                            elems
+                                .iter()
+                                .map(|&e| objs.get_string(e).map(str::to_string))
+                                .collect::<Vec<_>>(),
+                        ),
+                        _ => None,
+                    };
+                    if let Some(res) = with_active_objects(|objs| read(objs)) {
+                        return Ok(res);
+                    }
+                    let h = host.borrow();
+                    let entry = h
+                        .emus
+                        .get(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    Ok(read(&entry.emu.jni().objects))
+                },
+            )?,
+        )?;
+    }
+
+    // jniNewObjectArray(emuId, refs[]) -> jobjectArray handle
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniNewObjectArray",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, refs: Vec<f64>| -> rquickjs::Result<f64> {
+                    let jrefs: Vec<JObjectRef> = refs.into_iter().map(|v| JObjectRef(v as u64)).collect();
+                    if let Some(r) =
+                        with_active_objects(|objs| objs.add_local(JObject::ObjectArray(jrefs.clone())))
+                    {
+                        return Ok(r.0 as f64);
+                    }
+                    let mut h = host.borrow_mut();
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    Ok(entry
+                        .emu
+                        .jni_mut()
+                        .objects
+                        .add_local(JObject::ObjectArray(jrefs))
+                        .0 as f64)
+                },
+            )?,
+        )?;
+    }
+
+    // jniGetObjectArray(emuId, ref) -> number[] | null
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniGetObjectArray",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, r: f64| -> rquickjs::Result<Option<Vec<f64>>> {
+                    let jref = JObjectRef(r as u64);
+                    let read = |objs: &crate::jni::ObjectTable| match objs.get(jref) {
+                        Some(JObject::ObjectArray(elems)) => {
+                            Some(elems.iter().map(|e| e.0 as f64).collect::<Vec<_>>())
+                        }
+                        _ => None,
+                    };
+                    if let Some(res) = with_active_objects(|objs| read(objs)) {
+                        return Ok(res);
+                    }
+                    let h = host.borrow();
+                    let entry = h
+                        .emus
+                        .get(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    Ok(read(&entry.emu.jni().objects))
+                },
+            )?,
+        )?;
+    }
+
     // jniGetBytes(emuId, ref) -> Uint8Array | null
     {
         let host = Rc::clone(host);
@@ -995,6 +1148,44 @@ pub(super) fn register_native_bridge<'js>(
                         .get_mut(emu_id)
                         .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
                     entry.emu.vfs_mut().mount_readonly(guest_dir, host_dir);
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "vfsSetTime",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, unix_secs: f64| -> rquickjs::Result<()> {
+                    let mut h = host.borrow_mut();
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    entry.emu.vfs_mut().set_clock_secs(unix_secs.max(0.0) as u64);
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "vfsUseRealClock",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, enabled: bool| -> rquickjs::Result<()> {
+                    let mut h = host.borrow_mut();
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    entry.emu.vfs_mut().set_use_real_clock(enabled);
                     Ok(())
                 },
             )?,

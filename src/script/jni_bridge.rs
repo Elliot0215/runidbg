@@ -11,8 +11,9 @@ use crate::crash::BreadcrumbRing;
 use crate::diag::EnvDiag;
 use crate::jni::handler::{
     default_call_boolean_method, default_call_int_method, default_call_object_method,
+    default_call_static_object_method,
 };
-use crate::jni::{JObject, JObjectRef, JValue, JniContext, JniHandler, MethodDesc, ObjectTable};
+use crate::jni::{JObjectRef, JValue, JniContext, JniHandler, MethodDesc, ObjectTable};
 
 thread_local! {
     static CURRENT_JS_CTX: Cell<Option<NonNull<JSContext>>> = const { Cell::new(None) };
@@ -374,11 +375,19 @@ impl JniHandler for JsJniHandler {
         args: &[JValue],
     ) -> JObjectRef {
         let mut out = JObjectRef::NULL;
-        if self.invoke_js(
+        if self.invoke_hook(ctx, class_name, None, method, args, |_, v, objs| {
+            out = js_to_jobject(v, objs);
+        }) {
+            return out;
+        }
+        if let Some(default_ret) = default_call_static_object_method(ctx, class_name, method, args)
+        {
+            return default_ret;
+        }
+        if self.invoke_unhandled(
             ctx,
             "CallStaticObjectMethod",
             class_name,
-            None,
             method,
             args,
             |_, v, objs| {
@@ -682,9 +691,6 @@ impl JniHandler for JsJniHandler {
         }) {
             return out;
         }
-        ctx.objects.add_local(JObject::Custom {
-            class_name: class_name.to_string(),
-            fields: HashMap::new(),
-        })
+        crate::jni::handler::default_new_object(ctx, class_name, method, args)
     }
 }

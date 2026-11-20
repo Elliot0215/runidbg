@@ -139,13 +139,19 @@ interface ModuleHandle {
 }
 
 interface JniNamespace {
+  readonly envPtr: number;
   hook(className: string, methods: Record<string, (...args: any[]) => any>): void;
   onUnhandled(callback: (info: UnhandledJniInfo) => any): void;
   registeredNatives(): RegisteredNativeInfo[];
   callNative(className: string, methodName: string, args?: Array<number | bigint>): number;
+  findClass(className: string): number;
   newString(value: string): number;
   newByteArray(bytes: Uint8Array): number;
   newObject(className: string, fields?: Record<string, unknown>): number;
+  newStringArray(items: string[]): number;
+  getStringArray(ref: number | bigint): Array<string | null> | null;
+  newObjectArray(refs: Array<number | bigint>): number;
+  getObjectArray(ref: number | bigint): number[] | null;
   getString(ref: number | bigint): string | null;
   getBytes(ref: number | bigint): Uint8Array | null;
 }
@@ -171,6 +177,8 @@ interface VfsNamespace {
   writeFile(guestPath: string, data: string | Uint8Array): void;
   readFile(guestPath: string): Uint8Array | null;
   mountOverlay(guestDir: string, hostDir: string): void;
+  setTime(unixSecs: number): void;
+  useRealClock(enabled?: boolean): void;
 }
 
 interface TraceNamespace {

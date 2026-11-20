@@ -60,6 +60,7 @@ pub enum HleBuiltin {
     // 格式化与转换
     Snprintf,
     Sprintf,
+    Asprintf,
     Vsnprintf,
     VsnprintfChk,
     Atoi,
@@ -157,6 +158,7 @@ impl HleBuiltin {
             "strerror" => Some(Self::Strerror),
             "snprintf" | "__snprintf_chk" => Some(Self::Snprintf),
             "sprintf" | "__sprintf_chk" => Some(Self::Sprintf),
+            "asprintf" => Some(Self::Asprintf),
             "vsnprintf" => Some(Self::Vsnprintf),
             "__vsnprintf_chk" => Some(Self::VsnprintfChk),
             "atoi" => Some(Self::Atoi),
@@ -948,6 +950,26 @@ where
             }
             formatted.len() as u64
         }
+        HleBuiltin::Asprintf => {
+            // int asprintf(char **strp, const char *format, ...)
+            let fmt = read_guest_cstr(uc, x1, 4096);
+            let formatted = format_guest_printf(uc, &fmt, 2);
+            let mut out = formatted.as_bytes().to_vec();
+            out.push(0);
+            let ptr = {
+                let (_, mem, _) = get_state(uc.get_data_mut());
+                mem.alloc_heap(out.len() as u64).unwrap_or(0)
+            };
+            if ptr != 0 {
+                let _ = uc.mem_write(ptr, &out);
+                if x0 != 0 {
+                    let _ = uc.mem_write(x0, &ptr.to_le_bytes());
+                }
+                formatted.len() as u64
+            } else {
+                (-1i64) as u64
+            }
+        }
         HleBuiltin::Vsnprintf => {
             // int vsnprintf(char *str, size_t size, const char *fmt, va_list ap)
             let max_sz = x1 as usize;
@@ -1374,8 +1396,7 @@ where
         HleBuiltin::Time => {
             let sec = {
                 let (_, _, vfs) = get_state(uc.get_data_mut());
-                vfs.mono_clock_ns += 1_000_000;
-                vfs.mono_clock_ns / 1_000_000_000
+                vfs.current_clock_ns() / 1_000_000_000
             };
             if x0 != 0 {
                 let _ = uc.mem_write(x0, &(sec as i64).to_le_bytes());
@@ -1386,8 +1407,7 @@ where
             // int clock_gettime(clockid_t clk_id, struct timespec *tp)
             let ns = {
                 let (_, _, vfs) = get_state(uc.get_data_mut());
-                vfs.mono_clock_ns += 1_000_000;
-                vfs.mono_clock_ns
+                vfs.current_clock_ns()
             };
             if x1 != 0 {
                 let sec = (ns / 1_000_000_000) as i64;
@@ -1403,8 +1423,7 @@ where
             // int gettimeofday(struct timeval *tv, struct timezone *tz)
             let ns = {
                 let (_, _, vfs) = get_state(uc.get_data_mut());
-                vfs.mono_clock_ns += 1_000_000;
-                vfs.mono_clock_ns
+                vfs.current_clock_ns()
             };
             if x0 != 0 {
                 let sec = (ns / 1_000_000_000) as i64;
