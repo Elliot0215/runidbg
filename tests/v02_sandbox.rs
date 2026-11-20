@@ -1,10 +1,10 @@
-use arm64_emu_tracer::cpu::{CpuContext, DEFAULT_STACK_GUARD, RET_MAGIC_ADDR, TLS_BASE};
-use arm64_emu_tracer::loader::{attach_trampoline_hook, DynamicLinker, TrampolineTable};
-use arm64_emu_tracer::memory::{MemoryManager, PAGE_SIZE};
-use arm64_emu_tracer::os::syscall::{
+use runidbg_arm64_emu_tracer::cpu::{CpuContext, DEFAULT_STACK_GUARD, RET_MAGIC_ADDR, TLS_BASE};
+use runidbg_arm64_emu_tracer::loader::{attach_trampoline_hook, DynamicLinker, TrampolineTable};
+use runidbg_arm64_emu_tracer::memory::{MemoryManager, PAGE_SIZE};
+use runidbg_arm64_emu_tracer::os::syscall::{
     SYS_CLOCK_GETTIME, SYS_CLOSE, SYS_GETPID, SYS_OPENAT, SYS_READ,
 };
-use arm64_emu_tracer::os::{attach_syscall_hook, VirtualFs};
+use runidbg_arm64_emu_tracer::os::{attach_syscall_hook, VirtualFs};
 use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
 use unicorn_engine::{RegisterARM64, Unicorn};
 

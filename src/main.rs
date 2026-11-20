@@ -2,11 +2,11 @@ use std::env;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use arm64_emu_tracer::tracer::{BinaryTracer, TraceLevel};
-use arm64_emu_tracer::AndroidEmulator;
+use runidbg_arm64_emu_tracer::tracer::{BinaryTracer, TraceLevel};
+use runidbg_arm64_emu_tracer::AndroidEmulator;
 
 fn main() -> Result<()> {
-    // 命令行用法: arm64-emu-tracer <so_path> [symbol_name] [sysroot_lib64_dir]
+    // 命令行用法: runidbg-arm64-emu-tracer <so_path> [symbol_name] [sysroot_lib64_dir]
     let args: Vec<String> = env::args().collect();
     let so_path = args.get(1).map(String::as_str).unwrap_or("libtest.so");
     let symbol_name = args.get(2).map(String::as_str).unwrap_or("target_func");

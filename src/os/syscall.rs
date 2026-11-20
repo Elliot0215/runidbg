@@ -70,10 +70,27 @@ fn linux_prot_to_uc(prot: u64) -> Prot {
 /// 实现与宿主状态的完全解耦。
 pub fn attach_syscall_hook<'a, D, F>(
     uc: &mut Unicorn<'a, D>,
-    mut get_state: F,
+    get_state: F,
 ) -> EmuResult<UcHookId>
 where
     F: FnMut(&mut D) -> (&mut MemoryManager, &mut VirtualFs) + 'a,
+{
+    attach_syscall_hook_with_interceptor(uc, get_state, |_, _, _| None)
+}
+
+/// 挂载带前置拦截器的 ARM64 `SVC #0` 系统调用 Hook
+///
+/// 每次触发 `SVC #0` 时先调用 `interceptor(uc, nr, &args)`：
+/// - 返回 `Some(ret)`：跳过内置分发，直接将 `ret` 写入 `X0`；
+/// - 返回 `None`：放行给内置 SVC 分发器处理。
+pub fn attach_syscall_hook_with_interceptor<'a, D, F, I>(
+    uc: &mut Unicorn<'a, D>,
+    mut get_state: F,
+    mut interceptor: I,
+) -> EmuResult<UcHookId>
+where
+    F: FnMut(&mut D) -> (&mut MemoryManager, &mut VirtualFs) + 'a,
+    I: FnMut(&mut Unicorn<'_, D>, u64, &[u64; 6]) -> Option<u64> + 'a,
 {
     let hook_id = uc.add_intr_hook(move |uc, intno| {
         if intno != ARM64_EXCP_SWI {
@@ -88,8 +105,14 @@ where
         let a3 = uc.reg_read(RegisterARM64::X3).unwrap_or(0);
         let a4 = uc.reg_read(RegisterARM64::X4).unwrap_or(0);
         let a5 = uc.reg_read(RegisterARM64::X5).unwrap_or(0);
+        let args = [a0, a1, a2, a3, a4, a5];
 
-        let ret = dispatch_syscall(uc, nr, [a0, a1, a2, a3, a4, a5], &mut get_state);
+        if let Some(custom_ret) = interceptor(uc, nr, &args) {
+            let _ = uc.reg_write(RegisterARM64::X0, custom_ret);
+            return;
+        }
+
+        let ret = dispatch_syscall(uc, nr, args, &mut get_state);
         let _ = uc.reg_write(RegisterARM64::X0, ret as u64);
     })?;
 
@@ -409,6 +432,13 @@ where
             let _ = uc.emu_stop();
             0
         }
-        _ => ENOSYS,
+        _ => {
+            let (_, vfs) = get_state(uc.get_data_mut());
+            vfs.diag().record_missing_syscall(nr);
+            vfs.breadcrumbs()
+                .push(format!("[SVC ENOSYS] nr={nr} (x0=0x{:x})", args[0]));
+            tracing::warn!(target: "runidbg::syscall", nr, x0 = format_args!("0x{:x}", args[0]), "未实现的 ARM64 Syscall");
+            ENOSYS
+        }
     }
 }

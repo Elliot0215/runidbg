@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use arm64_emu_tracer::jni::{JObject, JValue};
-use arm64_emu_tracer::memory::read_guest_cstr;
-use arm64_emu_tracer::AndroidEmulator;
+use runidbg_arm64_emu_tracer::jni::{JObject, JValue};
+use runidbg_arm64_emu_tracer::memory::read_guest_cstr;
+use runidbg_arm64_emu_tracer::AndroidEmulator;
 
 #[test]
 fn official_zstd_compress_decompress_roundtrip() {
@@ -303,14 +303,14 @@ fn official_conscrypt_boringssl_sha256_and_rand() {
 
 struct CronetTestJniHandler;
 
-impl arm64_emu_tracer::jni::JniHandler for CronetTestJniHandler {
+impl runidbg_arm64_emu_tracer::jni::JniHandler for CronetTestJniHandler {
     fn call_static_object_method(
         &mut self,
-        ctx: &mut arm64_emu_tracer::jni::JniContext<'_>,
+        ctx: &mut runidbg_arm64_emu_tracer::jni::JniContext<'_>,
         class_name: &str,
-        method: &arm64_emu_tracer::jni::MethodDesc,
+        method: &runidbg_arm64_emu_tracer::jni::MethodDesc,
         _args: &[JValue],
-    ) -> arm64_emu_tracer::jni::JObjectRef {
+    ) -> runidbg_arm64_emu_tracer::jni::JObjectRef {
         if class_name == "org/chromium/base/JNIUtils" && method.name == "getSplitClassLoader" {
             return ctx.objects.add_local(JObject::Custom {
                 class_name: "java/lang/ClassLoader".to_string(),
@@ -324,10 +324,10 @@ impl arm64_emu_tracer::jni::JniHandler for CronetTestJniHandler {
             });
             return ctx.objects.add_local(JObject::ObjectArray(vec![
                 empty_map,
-                arm64_emu_tracer::jni::JObjectRef::NULL,
+                runidbg_arm64_emu_tracer::jni::JObjectRef::NULL,
             ]));
         }
-        arm64_emu_tracer::jni::JObjectRef::NULL
+        runidbg_arm64_emu_tracer::jni::JObjectRef::NULL
     }
 }
 

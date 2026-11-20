@@ -32,7 +32,7 @@ pub trait JniHandler {
         method: &MethodDesc,
         _args: &[JValue],
     ) -> JObjectRef {
-        eprintln!(
+        tracing::warn!(target: "runidbg::jni", 
             "[JNI] 未处理的 CallStaticObjectMethod: {}.{}{}",
             class_name, method.name, method.sig
         );
@@ -56,7 +56,7 @@ pub trait JniHandler {
         method: &MethodDesc,
         _args: &[JValue],
     ) -> i64 {
-        eprintln!(
+        tracing::warn!(target: "runidbg::jni", 
             "[JNI] 未处理的 CallLongMethod: {}.{}{}",
             method.class_name, method.name, method.sig
         );
@@ -80,7 +80,7 @@ pub trait JniHandler {
         method: &MethodDesc,
         _args: &[JValue],
     ) {
-        eprintln!(
+        tracing::warn!(target: "runidbg::jni", 
             "[JNI] 未处理的 CallVoidMethod: {}.{}{}",
             method.class_name, method.name, method.sig
         );
@@ -101,7 +101,7 @@ pub trait JniHandler {
         class_name: &str,
         field: &FieldDesc,
     ) -> JObjectRef {
-        eprintln!(
+        tracing::warn!(target: "runidbg::jni", 
             "[JNI] 未处理的 GetStaticObjectField: {}.{} ({})",
             class_name, field.name, field.sig
         );
@@ -128,7 +128,7 @@ pub trait JniHandler {
         method: &MethodDesc,
         _args: &[JValue],
     ) -> bool {
-        eprintln!(
+        tracing::warn!(target: "runidbg::jni", 
             "[JNI] 未处理的 CallStaticBooleanMethod: {}.{}{}",
             class_name, method.name, method.sig
         );
@@ -142,7 +142,7 @@ pub trait JniHandler {
         method: &MethodDesc,
         _args: &[JValue],
     ) -> i32 {
-        eprintln!(
+        tracing::warn!(target: "runidbg::jni", 
             "[JNI] 未处理的 CallStaticIntMethod: {}.{}{}",
             class_name, method.name, method.sig
         );
@@ -156,7 +156,7 @@ pub trait JniHandler {
         method: &MethodDesc,
         _args: &[JValue],
     ) -> i64 {
-        eprintln!(
+        tracing::warn!(target: "runidbg::jni", 
             "[JNI] 未处理的 CallStaticLongMethod: {}.{}{}",
             class_name, method.name, method.sig
         );
@@ -170,7 +170,7 @@ pub trait JniHandler {
         method: &MethodDesc,
         _args: &[JValue],
     ) {
-        eprintln!(
+        tracing::warn!(target: "runidbg::jni", 
             "[JNI] 未处理的 CallStaticVoidMethod: {}.{}{}",
             class_name, method.name, method.sig
         );
@@ -230,7 +230,7 @@ pub trait JniHandler {
         class_name: &str,
         field: &FieldDesc,
     ) -> bool {
-        eprintln!(
+        tracing::warn!(target: "runidbg::jni", 
             "[JNI] 未处理的 GetStaticBooleanField: {}.{}",
             class_name, field.name
         );
@@ -243,7 +243,7 @@ pub trait JniHandler {
         class_name: &str,
         field: &FieldDesc,
     ) -> i32 {
-        eprintln!(
+        tracing::warn!(target: "runidbg::jni", 
             "[JNI] 未处理的 GetStaticIntField: {}.{}",
             class_name, field.name
         );
@@ -256,7 +256,7 @@ pub trait JniHandler {
         class_name: &str,
         field: &FieldDesc,
     ) -> i64 {
-        eprintln!(
+        tracing::warn!(target: "runidbg::jni", 
             "[JNI] 未处理的 GetStaticLongField: {}.{}",
             class_name, field.name
         );
@@ -556,7 +556,7 @@ pub fn default_call_object_method(
             }
         }
         _ => {
-            eprintln!(
+            tracing::warn!(target: "runidbg::jni", 
                 "[JNI] 未处理的 CallObjectMethod: {}.{}{}",
                 method.class_name, method.name, method.sig
             );
@@ -575,7 +575,7 @@ pub fn default_call_int_method(
     match (ctx.objects.get(obj), method.name.as_str()) {
         (Some(JObject::String(s)), "length") => s.chars().count() as i32,
         _ => {
-            eprintln!(
+            tracing::warn!(target: "runidbg::jni", 
                 "[JNI] 未处理的 CallIntMethod: {}.{}{}",
                 method.class_name, method.name, method.sig
             );
@@ -600,7 +600,7 @@ pub fn default_call_boolean_method(
             rhs == Some(lhs.as_str())
         }
         _ => {
-            eprintln!(
+            tracing::warn!(target: "runidbg::jni", 
                 "[JNI] 未处理的 CallBooleanMethod: {}.{}{}",
                 method.class_name, method.name, method.sig
             );

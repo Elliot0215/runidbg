@@ -1,10 +1,10 @@
 use std::fs;
 use std::mem::size_of;
 
-use arm64_emu_tracer::cpu::{CpuContext, RET_MAGIC_ADDR};
-use arm64_emu_tracer::loader::ElfLoader;
-use arm64_emu_tracer::memory::{align_down, align_up, MemoryManager, PAGE_SIZE};
-use arm64_emu_tracer::tracer::{attach_code_hook, BinaryTracer, TraceRecord};
+use runidbg_arm64_emu_tracer::cpu::{CpuContext, RET_MAGIC_ADDR};
+use runidbg_arm64_emu_tracer::loader::ElfLoader;
+use runidbg_arm64_emu_tracer::memory::{align_down, align_up, MemoryManager, PAGE_SIZE};
+use runidbg_arm64_emu_tracer::tracer::{attach_code_hook, BinaryTracer, TraceRecord};
 use unicorn_engine::unicorn_const::{Arch, Mode};
 use unicorn_engine::{RegisterARM64, Unicorn};
 

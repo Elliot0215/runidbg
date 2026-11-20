@@ -1,9 +1,9 @@
-use arm64_emu_tracer::cpu::{CpuContext, RET_MAGIC_ADDR};
-use arm64_emu_tracer::jni::{
+use runidbg_arm64_emu_tracer::cpu::{CpuContext, RET_MAGIC_ADDR};
+use runidbg_arm64_emu_tracer::jni::{
     attach_jni_hook, JObject, JObjectRef, JValue, JniContext, JniHandler, JniVm, MethodDesc,
     JNI_VERSION_1_6,
 };
-use arm64_emu_tracer::memory::{MemoryManager, PAGE_SIZE};
+use runidbg_arm64_emu_tracer::memory::{MemoryManager, PAGE_SIZE};
 use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
 use unicorn_engine::{RegisterARM64, Unicorn};
 
@@ -36,7 +36,7 @@ impl JniHandler for CustomSignHandler {
             let magic = args.get(1).and_then(|v| v.as_int()).unwrap_or(0);
             return ctx.objects.add_string(format!("KEY_{magic}_{text}"));
         }
-        arm64_emu_tracer::jni::handler::default_call_object_method(ctx, obj, method, args)
+        runidbg_arm64_emu_tracer::jni::handler::default_call_object_method(ctx, obj, method, args)
     }
 }
 
@@ -336,7 +336,7 @@ fn test_jni_object_table_refs_and_builtin_models() {
         sig: "()Ljava/lang/String;".to_string(),
         is_static: false,
     };
-    let pkg_ref = arm64_emu_tracer::jni::handler::default_call_object_method(
+    let pkg_ref = runidbg_arm64_emu_tracer::jni::handler::default_call_object_method(
         &mut jni_ctx,
         ctx_ref,
         &m,

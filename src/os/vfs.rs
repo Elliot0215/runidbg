@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::crash::BreadcrumbRing;
+use crate::diag::EnvDiag;
 use crate::memory::MemoryManager;
 
 /// 标准 Linux 负错误码
@@ -62,6 +64,10 @@ pub struct VirtualFs {
     rng_state: u64,
     /// 虚拟单调时钟（纳秒），每次调用递增 1ms，防止时间差反调试
     pub mono_clock_ns: u64,
+    /// 缺环境自动诊断器（关闭时零开销）
+    diag: EnvDiag,
+    /// 最近外部事件环形缓冲（供崩溃现场报告使用）
+    breadcrumbs: BreadcrumbRing,
 }
 
 impl Default for VirtualFs {
@@ -146,7 +152,21 @@ impl VirtualFs {
             next_fd: 3,
             rng_state: 0x2026_1119_CAFE_BABE,
             mono_clock_ns: 1_700_000_000_000_000_000,
+            diag: EnvDiag::new(),
+            breadcrumbs: BreadcrumbRing::new(),
         }
+    }
+
+    pub fn set_diag(&mut self, diag: EnvDiag) {
+        self.diag = diag;
+    }
+
+    pub fn diag(&self) -> &EnvDiag {
+        &self.diag
+    }
+
+    pub fn breadcrumbs(&self) -> &BreadcrumbRing {
+        &self.breadcrumbs
     }
 
     /// 挂载宿主机只读目录到虚拟路径（例如 `/system` -> `./sysroot/system`）
@@ -175,9 +195,24 @@ impl VirtualFs {
         self.overlay_files.insert(path, data);
     }
 
-    /// 读取 Android 系统属性
+    /// 读取内存 Overlay 文件
+    pub fn get_overlay_file(&self, guest_path: &str) -> Option<&[u8]> {
+        let path = Self::clean_path(guest_path);
+        self.overlay_files.get(&path).map(Vec::as_slice)
+    }
+
+    /// 设置 Android 系统属性
+    pub fn set_property(&mut self, key: impl Into<String>, value: impl Into<String>) {
+        self.properties.insert(key.into(), value.into());
+    }
+
+    /// 读取 Android 系统属性（未命中时自动记入缺环境诊断器）
     pub fn get_property(&self, key: &str) -> Option<&str> {
-        self.properties.get(key).map(String::as_str)
+        let res = self.properties.get(key).map(String::as_str);
+        if res.is_none() {
+            self.diag.record_missing_property(key);
+        }
+        res
     }
 
     /// 生成确定性随机字节（供 `/dev/urandom` 与 `getrandom` Syscall 使用）
@@ -310,6 +345,9 @@ impl VirtualFs {
             return self.alloc_fd(path, OpenFileKind::Overlay { cursor: 0 });
         }
 
+        self.diag.record_missing_file(&path);
+        self.breadcrumbs.push(format!("[VFS ENOENT] open({path})"));
+        tracing::debug!(target: "runidbg::syscall", path = %path, "open 返回 ENOENT");
         ENOENT
     }
 

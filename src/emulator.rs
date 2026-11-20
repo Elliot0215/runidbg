@@ -4,17 +4,25 @@ use unicorn_engine::unicorn_const::{Arch, Mode};
 use unicorn_engine::{RegisterARM64, UcHookId, Unicorn};
 
 use crate::cpu::{CpuContext, RET_MAGIC_ADDR};
+use crate::crash::{BreadcrumbRing, CrashReport};
+use crate::diag::EnvDiag;
 use crate::error::{EmuError, EmuResult};
 use crate::jni::{attach_jni_hook, DefaultJniHandler, JObjectRef, JniHandler, JniVm};
+#[cfg(feature = "apk")]
+use crate::loader::ApkPackage;
 use crate::loader::{attach_trampoline_hook, DynamicLinker, LoadedModule, TrampolineTable};
 use crate::memory::MemoryManager;
-use crate::os::{attach_syscall_hook, VirtualFs};
+use crate::os::{attach_syscall_hook_with_interceptor, VirtualFs};
 use crate::snapshot::EmuSnapshot;
 use crate::tracer::{attach_code_hook, attach_mem_trace_hook, BinaryTracer, TraceLevel};
 
 /// 默认模拟堆基址与大小（32MB）
 pub const DEFAULT_HEAP_BASE: u64 = 0x5000_0000;
 pub const DEFAULT_HEAP_SIZE: u64 = 0x0200_0000;
+
+/// 可选的自定义 Syscall 前置拦截回调
+pub type SyscallInterceptor =
+    Box<dyn FnMut(&mut Unicorn<'_, EmuState>, u64, &[u64; 6]) -> Option<u64>>;
 
 /// 挂载在 Unicorn UserData 中的统一运行时状态
 pub struct EmuState {
@@ -23,6 +31,8 @@ pub struct EmuState {
     pub trampolines: TrampolineTable,
     pub jni: JniVm,
     pub tracer: BinaryTracer,
+    pub syscall_interceptor: Option<SyscallInterceptor>,
+    pub manual_stop: bool,
 }
 
 /// 开箱即用的 Android ARM64 模拟器构建器
@@ -116,6 +126,8 @@ impl AndroidEmulatorBuilder {
             trampolines: TrampolineTable::new(),
             jni: JniVm::default(),
             tracer: BinaryTracer::new_in_memory(0),
+            syscall_interceptor: None,
+            manual_stop: false,
         };
         let mut uc = Unicorn::new_with_data(Arch::ARM64, Mode::LITTLE_ENDIAN, placeholder)?;
 
@@ -133,9 +145,22 @@ impl AndroidEmulatorBuilder {
         state.trampolines = trampolines;
         state.jni = jni;
         state.tracer = tracer;
+        state.syscall_interceptor = None;
+        state.manual_stop = false;
 
         // 3. 自动挂载 Syscall / HLE Trampoline / JNI 三个核心 Hook
-        attach_syscall_hook(&mut uc, |s| (&mut s.mem, &mut s.vfs))?;
+        attach_syscall_hook_with_interceptor(
+            &mut uc,
+            |s| (&mut s.mem, &mut s.vfs),
+            |uc, nr, args| {
+                let mut cb = uc.get_data_mut().syscall_interceptor.take()?;
+                let res = cb(uc, nr, args);
+                if uc.get_data().syscall_interceptor.is_none() {
+                    uc.get_data_mut().syscall_interceptor = Some(cb);
+                }
+                res
+            },
+        )?;
         attach_trampoline_hook(&mut uc, |s| (&mut s.trampolines, &mut s.mem, &mut s.vfs))?;
         attach_jni_hook(&mut uc, |s| (&mut s.jni, &mut s.mem))?;
 
@@ -150,6 +175,9 @@ impl AndroidEmulatorBuilder {
             linker,
             trace_code_hook: None,
             trace_mem_hook: None,
+            exec_timeout_us: 0,
+            max_instructions: 0,
+            last_crash: None,
         };
 
         if self.auto_attach_trace {
@@ -170,6 +198,9 @@ pub struct AndroidEmulator {
     linker: DynamicLinker,
     trace_code_hook: Option<UcHookId>,
     trace_mem_hook: Option<UcHookId>,
+    exec_timeout_us: u64,
+    max_instructions: usize,
+    last_crash: Option<CrashReport>,
 }
 
 impl AndroidEmulator {
@@ -293,10 +324,94 @@ impl AndroidEmulator {
         self.call_address(fn_ptr, &all_args)
     }
 
+    /// 设置单次执行的 Unicorn 硬超时（微秒，0 表示不限）与最大指令数（0 表示不限）
+    pub fn set_execution_limits(&mut self, timeout_us: u64, max_instructions: usize) {
+        self.exec_timeout_us = timeout_us;
+        self.max_instructions = max_instructions;
+    }
+
+    /// 获取当前执行限制 `(timeout_us, max_instructions)`
+    pub fn execution_limits(&self) -> (u64, usize) {
+        (self.exec_timeout_us, self.max_instructions)
+    }
+
+    /// 主动请求中止当前 Unicorn 执行（与超时强杀区分）
+    pub fn request_stop(&mut self) -> EmuResult<()> {
+        self.uc.get_data_mut().manual_stop = true;
+        self.uc.emu_stop()?;
+        Ok(())
+    }
+
+    /// 获取最近一次 Guest 崩溃或超时的完整现场报告
+    pub fn last_crash(&self) -> Option<&CrashReport> {
+        self.last_crash.as_ref()
+    }
+
+    /// 获取最近外部事件环形缓冲（供 HLE/JNI/Syscall 写入前因轨迹）
+    pub fn breadcrumbs(&self) -> &BreadcrumbRing {
+        self.uc.get_data().vfs.breadcrumbs()
+    }
+
     /// 调用任意指定地址的函数（重置 `LR = RET_MAGIC_ADDR`），返回 `X0`
     pub fn call_address(&mut self, pc: u64, args: &[u64]) -> EmuResult<u64> {
         self.cpu.prepare_call(&mut self.uc, args)?;
-        self.uc.emu_start(pc, RET_MAGIC_ADDR, 0, 0)?;
+        self.uc.get_data_mut().manual_stop = false;
+        self.last_crash = None;
+
+        if let Err(uc_err) = self.uc.emu_start(
+            pc,
+            RET_MAGIC_ADDR,
+            self.exec_timeout_us,
+            self.max_instructions,
+        ) {
+            let report = CrashReport::capture(
+                &self.uc,
+                &self.linker,
+                &self.uc.get_data().mem,
+                self.uc.get_data().vfs.breadcrumbs(),
+                format!("Unicorn({uc_err:?})"),
+            );
+            tracing::error!(
+                target: "runidbg::crash",
+                pc = format_args!("0x{:016x}", report.pc),
+                location = %report.pc_location,
+                reason = %report.reason,
+                "\n{report}"
+            );
+            self.last_crash = Some(report.clone());
+            return Err(EmuError::GuestCrash(Box::new(report)));
+        }
+
+        let end_pc = self.uc.reg_read(RegisterARM64::PC)?;
+        let manual_stop = self.uc.get_data().manual_stop;
+        if (self.exec_timeout_us > 0 || self.max_instructions > 0)
+            && !manual_stop
+            && end_pc != RET_MAGIC_ADDR
+        {
+            let report = CrashReport::capture(
+                &self.uc,
+                &self.linker,
+                &self.uc.get_data().mem,
+                self.uc.get_data().vfs.breadcrumbs(),
+                format!(
+                    "ExecutionTimeout(timeout_us={}, max_instructions={})",
+                    self.exec_timeout_us, self.max_instructions
+                ),
+            );
+            tracing::warn!(
+                target: "runidbg::crash",
+                pc = format_args!("0x{:016x}", report.pc),
+                location = %report.pc_location,
+                reason = %report.reason,
+                "\n{report}"
+            );
+            self.last_crash = Some(report);
+            return Err(EmuError::ExecutionTimeout {
+                pc: end_pc,
+                timeout_us: self.exec_timeout_us,
+                max_instructions: self.max_instructions,
+            });
+        }
         Ok(self.uc.reg_read(RegisterARM64::X0)?)
     }
 
@@ -305,6 +420,14 @@ impl AndroidEmulator {
         if self.trace_code_hook.is_none() {
             let h = attach_code_hook(&mut self.uc, begin, end, |s| &mut s.tracer)?;
             self.trace_code_hook = Some(h);
+            // 清除已加载模块的 Unicorn JIT TB 缓存，确保之前已执行过的函数也能命中新挂载的 Trace Hook
+            for name in self.linker.load_order() {
+                if let Some(m) = self.linker.get_module(name) {
+                    let _ = self
+                        .uc
+                        .ctl_remove_cache(m.base_addr, m.base_addr.saturating_add(m.image_size));
+                }
+            }
         }
         if self.uc.get_data().tracer.level() == TraceLevel::Full && self.trace_mem_hook.is_none() {
             let mh = attach_mem_trace_hook(&mut self.uc, 0, u64::MAX, |s| &mut s.tracer)?;
@@ -317,6 +440,17 @@ impl AndroidEmulator {
     pub fn set_tracer(&mut self, tracer: BinaryTracer) -> EmuResult<()> {
         self.uc.get_data_mut().tracer = tracer;
         self.attach_tracer(0, u64::MAX)
+    }
+
+    /// 卸载 Trace Hook 并刷盘
+    pub fn detach_tracer(&mut self) -> EmuResult<()> {
+        if let Some(h) = self.trace_code_hook.take() {
+            let _ = self.uc.remove_hook(h);
+        }
+        if let Some(mh) = self.trace_mem_hook.take() {
+            let _ = self.uc.remove_hook(mh);
+        }
+        self.uc.get_data().tracer.flush()
     }
 
     /// 捕获完整 CPU + 可写内存快照（供批量回放）
@@ -354,6 +488,57 @@ impl AndroidEmulator {
 
     pub fn vfs_mut(&mut self) -> &mut VirtualFs {
         &mut self.uc.get_data_mut().vfs
+    }
+
+    /// 获取缺环境自动诊断器（共享引用，可动态开启/关闭/导出补环境脚本）
+    pub fn diag(&self) -> &EnvDiag {
+        self.uc.get_data().vfs.diag()
+    }
+
+    /// 一键加载 Android APK：
+    /// - 解析包名与签名证书（`AndroidManifest.xml` + `META-INF/*.RSA`）
+    /// - 将 `lib/arm64-v8a/*.so` 注册到内存动态链接器（自动解析 `DT_NEEDED`）
+    /// - 将 `assets/**` 与 `base.apk` 挂载到内存 VFS
+    #[cfg(feature = "apk")]
+    pub fn load_apk(&mut self, path: impl AsRef<Path>) -> EmuResult<ApkPackage> {
+        let apk = ApkPackage::from_path(path)?;
+        self.install_apk(&apk);
+        Ok(apk)
+    }
+
+    /// 从已解析的 `ApkPackage` 注入运行环境（包名、内存 `.so` 库、VFS `assets/` 与 `base.apk`）
+    #[cfg(feature = "apk")]
+    pub fn install_apk(&mut self, apk: &ApkPackage) {
+        let pkg_name = apk
+            .package_name
+            .clone()
+            .unwrap_or_else(|| self.uc.get_data().vfs.package_name.clone());
+        {
+            let vfs = &mut self.uc.get_data_mut().vfs;
+            vfs.package_name = pkg_name.clone();
+            vfs.add_overlay_file(format!("/data/app/{pkg_name}/base.apk"), apk.raw_apk.clone());
+            for (rel, data) in &apk.assets {
+                vfs.add_overlay_file(format!("/assets/{rel}"), data.clone());
+                vfs.add_overlay_file(format!("/data/app/{pkg_name}/assets/{rel}"), data.clone());
+            }
+            if let Some(cert) = &apk.signature_cert {
+                vfs.add_overlay_file(format!("/data/app/{pkg_name}/META-INF/CERT.RSA"), cert.clone());
+            }
+        }
+        for (lib_name, bytes) in &apk.native_libs {
+            self.linker.add_memory_library(lib_name.clone(), bytes.clone());
+        }
+    }
+
+    /// 加载先前通过 `load_apk` 注册到内存中的 `lib/arm64-v8a/<lib_name>`
+    #[cfg(feature = "apk")]
+    pub fn load_apk_library(&mut self, lib_name: &str) -> EmuResult<LoadedModule> {
+        let bytes = self
+            .linker
+            .get_memory_library(lib_name)
+            .ok_or_else(|| EmuError::InvalidElf(format!("APK 中未找到 arm64-v8a 库: {lib_name}")))?
+            .to_vec();
+        self.load_library_bytes(lib_name, &bytes, true)
     }
 
     pub fn tracer(&self) -> &BinaryTracer {

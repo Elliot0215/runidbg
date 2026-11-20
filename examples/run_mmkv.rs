@@ -1,6 +1,6 @@
 use anyhow::{ensure, Result};
-use arm64_emu_tracer::jni::{JObject, JObjectRef, JValue, JniContext, JniHandler, MethodDesc};
-use arm64_emu_tracer::AndroidEmulator;
+use runidbg_arm64_emu_tracer::jni::{JObject, JObjectRef, JValue, JniContext, JniHandler, MethodDesc};
+use runidbg_arm64_emu_tracer::AndroidEmulator;
 
 /// 捕获 MMKV 内部日志回调 `MMKV.mmkvLogImp`
 struct MmkvJniHandler;

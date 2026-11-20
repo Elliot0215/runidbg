@@ -1,10 +1,10 @@
 use std::time::Instant;
 
-use arm64_emu_tracer::cpu::{CpuContext, RET_MAGIC_ADDR};
-use arm64_emu_tracer::memory::{MemoryManager, PAGE_SIZE};
-use arm64_emu_tracer::os::syscall::{SYS_CLOCK_GETTIME, SYS_NANOSLEEP, SYS_PTRACE};
-use arm64_emu_tracer::os::{attach_syscall_hook, TaskScheduler, VirtualFs};
-use arm64_emu_tracer::snapshot::EmuSnapshot;
+use runidbg_arm64_emu_tracer::cpu::{CpuContext, RET_MAGIC_ADDR};
+use runidbg_arm64_emu_tracer::memory::{MemoryManager, PAGE_SIZE};
+use runidbg_arm64_emu_tracer::os::syscall::{SYS_CLOCK_GETTIME, SYS_NANOSLEEP, SYS_PTRACE};
+use runidbg_arm64_emu_tracer::os::{attach_syscall_hook, TaskScheduler, VirtualFs};
+use runidbg_arm64_emu_tracer::snapshot::EmuSnapshot;
 use unicorn_engine::unicorn_const::{Arch, Mode, Prot};
 use unicorn_engine::{RegisterARM64, Unicorn};
 

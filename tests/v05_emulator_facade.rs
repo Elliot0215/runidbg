@@ -1,7 +1,7 @@
-use arm64_emu_tracer::emulator::AndroidEmulator;
-use arm64_emu_tracer::loader::HleBuiltin;
-use arm64_emu_tracer::memory::PAGE_SIZE;
-use arm64_emu_tracer::tracer::TraceLevel;
+use runidbg_arm64_emu_tracer::emulator::AndroidEmulator;
+use runidbg_arm64_emu_tracer::loader::HleBuiltin;
+use runidbg_arm64_emu_tracer::memory::PAGE_SIZE;
+use runidbg_arm64_emu_tracer::tracer::TraceLevel;
 use unicorn_engine::unicorn_const::Prot;
 
 #[test]
@@ -28,7 +28,7 @@ fn test_android_emulator_facade_and_expanded_hle() {
     let (snprintf_addr, key_create_addr, set_spec_addr, get_spec_addr) = {
         let mut mem = std::mem::replace(
             &mut emu.uc_mut().get_data_mut().mem,
-            arm64_emu_tracer::memory::MemoryManager::new(0, 0),
+            runidbg_arm64_emu_tracer::memory::MemoryManager::new(0, 0),
         );
         let mut tramp = std::mem::take(&mut emu.uc_mut().get_data_mut().trampolines);
         let a1 = tramp

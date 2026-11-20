@@ -1,8 +1,15 @@
 [package]
-name = "arm64-emu-tracer"
+name = "runidbg-arm64-emu-tracer"
 version = "0.1.0"
 edition = "2021"
 description = "Lightweight high-performance Android ARM64 .so emulator & binary tracer in pure Rust"
+
+[features]
+default = ["js", "rpc", "mcp", "apk"]
+js = ["dep:rquickjs"]
+rpc = ["js", "dep:serde_json", "dep:tokio", "dep:axum", "dep:async-channel"]
+mcp = ["js", "dep:serde_json"]
+apk = ["dep:zip"]
 
 [dependencies]
 unicorn-engine = "2.1"
@@ -11,6 +18,14 @@ bad64 = "0.13"
 memmap2 = "0.9"
 anyhow = "1.0"
 thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+rquickjs = { version = "0.9", optional = true }
+serde_json = { version = "1.0", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros"], optional = true }
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"], optional = true }
+async-channel = { version = "2", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"], optional = true }
 
 [profile.release]
 opt-level = 3

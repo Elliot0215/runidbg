@@ -1300,7 +1300,10 @@ where
         HleBuiltin::AndroidLogPrint => {
             let tag = read_guest_cstr(uc, x1, 128);
             let fmt = read_guest_cstr(uc, x2, 512);
-            eprintln!("[android_log/{tag}] {fmt}");
+            let (_, _, vfs) = get_state(uc.get_data_mut());
+            vfs.breadcrumbs()
+                .push(format!("[android_log/{tag}] {fmt}"));
+            tracing::info!(target: "runidbg::hle", tag = %tag, "{fmt}");
             fmt.len() as u64
         }
         HleBuiltin::Errno => {
@@ -1488,11 +1491,15 @@ where
             }
         }
         HleBuiltin::StackChkFail => {
-            eprintln!("[HLE WARN] 触发 __stack_chk_fail (已拦截并安全返回)");
+            let (_, _, vfs) = get_state(uc.get_data_mut());
+            vfs.breadcrumbs().push("[HLE WARN] __stack_chk_fail");
+            tracing::warn!(target: "runidbg::hle", "触发 __stack_chk_fail (已拦截并安全返回)");
             0
         }
         HleBuiltin::Abort => {
-            eprintln!("[HLE FATAL] Guest 调用 abort()，终止仿真");
+            let (_, _, vfs) = get_state(uc.get_data_mut());
+            vfs.breadcrumbs().push("[HLE FATAL] abort()");
+            tracing::error!(target: "runidbg::hle", "Guest 调用 abort()，终止仿真");
             let _ = uc.emu_stop();
             0
         }
@@ -1613,7 +1620,16 @@ where
             table.pthread_keys.get(&(x0 as u32)).copied().unwrap_or(0)
         }
         HleBuiltin::UnimplementedStub(sym) => {
-            eprintln!("[HLE WARN] 调用未实现的外部符号 `{sym}` (X0=0x{x0:x}, X1=0x{x1:x})");
+            let (_, _, vfs) = get_state(uc.get_data_mut());
+            vfs.breadcrumbs()
+                .push(format!("[HLE UNIMPL] {sym}(x0=0x{x0:x}, x1=0x{x1:x}) -> 0"));
+            tracing::warn!(
+                target: "runidbg::hle",
+                symbol = %sym,
+                x0 = format_args!("0x{x0:x}"),
+                x1 = format_args!("0x{x1:x}"),
+                "调用未实现的外部符号"
+            );
             0
         }
     };

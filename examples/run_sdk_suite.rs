@@ -1,6 +1,6 @@
 use anyhow::{ensure, Result};
-use arm64_emu_tracer::memory::read_guest_cstr;
-use arm64_emu_tracer::AndroidEmulator;
+use runidbg_arm64_emu_tracer::memory::read_guest_cstr;
+use runidbg_arm64_emu_tracer::AndroidEmulator;
 
 fn test_zstd() -> Result<()> {
     println!("\n=== [1/4] Zstandard (libzstd-jni-1.5.7-28.so) ===");
@@ -196,7 +196,7 @@ fn test_conscrypt() -> Result<()> {
     let rand_arr = emu.new_jbyte_array(vec![0u8; 16]);
     emu.call_registered_native(CLS, "RAND_bytes", &[rand_arr.0])?;
     let rand_bytes = match emu.jni().objects.get(rand_arr) {
-        Some(arm64_emu_tracer::jni::JObject::ByteArray(b)) => b.clone(),
+        Some(runidbg_arm64_emu_tracer::jni::JObject::ByteArray(b)) => b.clone(),
         _ => Vec::new(),
     };
     println!("[+] BoringSSL RAND_bytes(16) = {:02x?}", rand_bytes);
@@ -213,10 +213,10 @@ fn test_conscrypt() -> Result<()> {
     let mut fields = std::collections::HashMap::new();
     fields.insert(
         "address".to_string(),
-        arm64_emu_tracer::jni::JValue::Long(md_ctx_ptr as i64),
+        runidbg_arm64_emu_tracer::jni::JValue::Long(md_ctx_ptr as i64),
     );
     let ctx_ref = emu.jni_mut().objects.add_local(
-        arm64_emu_tracer::jni::JObject::Custom {
+        runidbg_arm64_emu_tracer::jni::JObject::Custom {
             class_name: "org/conscrypt/NativeRef$EVP_MD_CTX".to_string(),
             fields,
         },
@@ -239,7 +239,7 @@ fn test_conscrypt() -> Result<()> {
     ensure!(digest_len == 32, "预期 SHA-256 长度 32，实际 {digest_len}");
 
     let digest_hex: String = match emu.jni().objects.get(out_arr) {
-        Some(arm64_emu_tracer::jni::JObject::ByteArray(b)) => {
+        Some(runidbg_arm64_emu_tracer::jni::JObject::ByteArray(b)) => {
             b.iter().map(|x| format!("{x:02x}")).collect()
         }
         _ => String::new(),

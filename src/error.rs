@@ -36,6 +36,18 @@ pub enum EmuError {
     #[error("模拟堆内存不足: requested=0x{requested:x}, available=0x{available:x}")]
     OutOfMemory { requested: u64, available: u64 },
 
+    /// 执行超时或超出指令数预算
+    #[error("执行超时或超出指令预算: pc=0x{pc:016x}, timeout_us={timeout_us}, max_instructions={max_instructions}")]
+    ExecutionTimeout {
+        pc: u64,
+        timeout_us: u64,
+        max_instructions: usize,
+    },
+
+    /// Guest 执行崩溃（附带完整 ARM64 寄存器、反汇编、调用栈与前因轨迹报告）
+    #[error("{0}")]
+    GuestCrash(Box<crate::crash::CrashReport>),
+
     /// 文件 I/O 或 mmap 落盘错误
     #[error("I/O 错误: {0}")]
     Io(#[from] std::io::Error),

@@ -2,6 +2,6 @@ pub mod syscall;
 pub mod task;
 pub mod vfs;
 
-pub use syscall::attach_syscall_hook;
+pub use syscall::{attach_syscall_hook, attach_syscall_hook_with_interceptor};
 pub use task::{Task, TaskScheduler, TaskState};
 pub use vfs::VirtualFs;

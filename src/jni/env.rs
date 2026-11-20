@@ -298,7 +298,7 @@ where
             }
         }
         _ => {
-            eprintln!("[JNI] 未实现的 JavaVM 槽位: slot={slot}");
+            tracing::warn!(target: "runidbg::jni", "[JNI] 未实现的 JavaVM 槽位: slot={slot}");
             JNI_ERR
         }
     };
@@ -404,7 +404,7 @@ where
             let msg = read_guest_cstr(uc, x2, 512);
             let (vm, _) = get_state(uc.get_data_mut());
             let cls = vm.resolve_class_name(JObjectRef(x1));
-            eprintln!("[JNI] ThrowNew({cls}, \"{msg}\")");
+            tracing::warn!(target: "runidbg::jni", "[JNI] ThrowNew({cls}, \"{msg}\")");
             let exc = vm.objects.add_string(format!("{cls}: {msg}"));
             vm.pending_exception = exc;
             JNI_OK as u64
@@ -423,7 +423,7 @@ where
                     .get_string(exc)
                     .unwrap_or("<exception>")
                     .to_string();
-                eprintln!("[JNI] ExceptionDescribe: {desc}");
+                tracing::warn!(target: "runidbg::jni", "[JNI] ExceptionDescribe: {desc}");
             }
             0
         }
@@ -437,7 +437,7 @@ where
         // 18: FatalError
         18 => {
             let msg = read_guest_cstr(uc, x1, 512);
-            eprintln!("[JNI FATAL] FatalError: {msg}");
+            tracing::error!(target: "runidbg::jni", "FatalError: {msg}");
             let _ = uc.emu_stop();
             0
         }
@@ -1206,7 +1206,7 @@ where
             .ref_type(JObjectRef(x1)),
 
         _ => {
-            eprintln!("[JNI] 未实现的 JNIEnv 槽位: slot={slot}");
+            tracing::warn!(target: "runidbg::jni", "[JNI] 未实现的 JNIEnv 槽位: slot={slot}");
             0
         }
     };

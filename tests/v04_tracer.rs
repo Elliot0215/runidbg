@@ -1,8 +1,8 @@
 use std::fs;
 
-use arm64_emu_tracer::cpu::{CpuContext, RET_MAGIC_ADDR};
-use arm64_emu_tracer::memory::{MemoryManager, PAGE_SIZE};
-use arm64_emu_tracer::tracer::{
+use runidbg_arm64_emu_tracer::cpu::{CpuContext, RET_MAGIC_ADDR};
+use runidbg_arm64_emu_tracer::memory::{MemoryManager, PAGE_SIZE};
+use runidbg_arm64_emu_tracer::tracer::{
     attach_code_hook, attach_mem_trace_hook, BinaryTracer, ExtKind, TraceLevel, TraceReader,
 };
 use unicorn_engine::unicorn_const::{Arch, Mode, Prot};

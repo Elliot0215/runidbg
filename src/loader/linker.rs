@@ -32,6 +32,7 @@ const MODULE_ALIGN: u64 = 0x0010_0000; // 1MB 模块间隔对齐
 /// 4. 按依赖顺序自动执行 `.init_array` / `DT_INIT` 构造器。
 pub struct DynamicLinker {
     search_paths: Vec<PathBuf>,
+    memory_libs: HashMap<String, Vec<u8>>,
     modules: HashMap<String, LoadedModule>,
     load_order: Vec<String>,
     next_sys_base: u64,
@@ -72,6 +73,7 @@ impl DynamicLinker {
 
         Self {
             search_paths: Vec::new(),
+            memory_libs: HashMap::new(),
             modules: HashMap::new(),
             load_order: Vec::new(),
             next_sys_base: SYS_MODULE_BASE,
@@ -84,6 +86,16 @@ impl DynamicLinker {
     /// 添加 `.so` 依赖搜索目录（例如 Android API 30 sysroot `/system/lib64`）
     pub fn add_search_path(&mut self, dir: impl AsRef<Path>) {
         self.search_paths.push(dir.as_ref().to_path_buf());
+    }
+
+    /// 注册内存中的 `.so` 字节流（供 APK 加载后自动解析 `DT_NEEDED` 依赖，无需写临时文件）
+    pub fn add_memory_library(&mut self, name: impl Into<String>, bytes: Vec<u8>) {
+        self.memory_libs.insert(name.into(), bytes);
+    }
+
+    /// 按库名读取已注册的内存 `.so` 字节流
+    pub fn get_memory_library(&self, name: &str) -> Option<&[u8]> {
+        self.memory_libs.get(name).map(Vec::as_slice)
     }
 
     /// 手动启用或取消某个符号的 HLE 劫持覆盖
@@ -154,13 +166,24 @@ impl DynamicLinker {
             )));
         }
 
-        // 1. 递归加载 DT_NEEDED 依赖（仅当在搜索路径中找到对应 .so 时加载；找不到则交给 HLE/Stub 兜底）
+        // 1. 递归加载 DT_NEEDED 依赖（优先查内存库如 APK 内置 .so，再查磁盘搜索路径；找不到则交给 HLE/Stub 兜底）
         let needed: Vec<String> = elf.libraries.iter().map(|s| s.to_string()).collect();
         for dep in &needed {
             if self.modules.contains_key(dep) {
                 continue;
             }
-            if let Some(dep_path) = self.find_in_search_paths(dep) {
+            if let Some(dep_bytes) = self.memory_libs.get(dep).cloned() {
+                let _ = self.load_bytes(
+                    uc,
+                    mem,
+                    cpu,
+                    trampolines,
+                    &dep_bytes,
+                    dep.clone(),
+                    false,
+                    run_init,
+                )?;
+            } else if let Some(dep_path) = self.find_in_search_paths(dep) {
                 let dep_bytes = fs::read(&dep_path)?;
                 let _ = self.load_bytes(
                     uc,

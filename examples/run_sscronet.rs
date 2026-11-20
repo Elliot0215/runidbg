@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{bail, ensure, Result};
-use arm64_emu_tracer::jni::{JObject, JObjectRef, JValue, JniContext, JniHandler, MethodDesc};
-use arm64_emu_tracer::memory::read_guest_cstr;
-use arm64_emu_tracer::AndroidEmulator;
+use runidbg_arm64_emu_tracer::jni::{JObject, JObjectRef, JValue, JniContext, JniHandler, MethodDesc};
+use runidbg_arm64_emu_tracer::memory::read_guest_cstr;
+use runidbg_arm64_emu_tracer::AndroidEmulator;
 
 struct SsCronetJniHandler;
 

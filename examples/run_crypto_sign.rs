@@ -1,9 +1,9 @@
 use std::time::Instant;
 
 use anyhow::Result;
-use arm64_emu_tracer::jni::{JObject, JObjectRef};
-use arm64_emu_tracer::tracer::{BinaryTracer, TraceLevel};
-use arm64_emu_tracer::AndroidEmulator;
+use runidbg_arm64_emu_tracer::jni::{JObject, JObjectRef};
+use runidbg_arm64_emu_tracer::tracer::{BinaryTracer, TraceLevel};
+use runidbg_arm64_emu_tracer::AndroidEmulator;
 
 fn main() -> Result<()> {
     let so_path = "samples/libcrypto_sign.so";
