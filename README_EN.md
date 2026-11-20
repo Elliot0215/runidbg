@@ -248,3 +248,14 @@ cargo clippy --no-default-features --all-targets -- -D warnings
 cargo clippy --no-default-features --features js --all-targets -- -D warnings
 cargo clippy --no-default-features --features mcp --all-targets -- -D warnings
 ```
+
+---
+
+## 🤝 Contributing & Incompatible Sample Reports
+
+`runidbg` is actively evolving — **incompatible Android ARM64 `.so` samples, bug reports, and pull requests are warmly welcomed!** Every real-world sample helps us expand HLE libc, syscall, VFS, and JNI coverage.
+
+When opening an Issue or PR, please redact any private credentials (cookies/tokens) and include:
+1. A **minimal reproduction script** (QuickJS or Rust) with sanitized test inputs;
+2. **`EnvDiag` output** (`JSON.stringify(emu.diag.report(), null, 2)` listing missing files, system properties, syscalls, and JNI methods);
+3. **Guest crash report** (if applicable, `emu.lastCrash()?.formatted` with ARM64 disassembly, registers, backtrace, and breadcrumbs).

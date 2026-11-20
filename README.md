@@ -332,3 +332,14 @@ cargo clippy --no-default-features --all-targets -- -D warnings
 cargo clippy --no-default-features --features js --all-targets -- -D warnings
 cargo clippy --no-default-features --features mcp --all-targets -- -D warnings
 ```
+
+---
+
+## 🤝 贡献与不兼容样本反馈
+
+`runidbg` 仍在快速演进中，**非常欢迎提交在仿真中遇到报错、缺失符号/系统调用/JNI 或结果不一致的 Android ARM64 `.so` 样本与复现脚本**，帮助我们持续完善兼容性与生态覆盖！
+
+提 Issue 或 PR 时，推荐附带以下信息（请务必先脱敏去除真实 Cookie / Token 等敏感凭据）：
+1. **最小复现脚本**（QuickJS 脚本或 Rust 用例）与脱敏测试输入；
+2. **`EnvDiag` 诊断输出**（`JSON.stringify(emu.diag.report(), null, 2)`，自动列出缺失文件、系统属性、Syscall 与 JNI）；
+3. **崩溃现场报告**（如发生异常，附 `emu.lastCrash()?.formatted` 输出的寄存器、反汇编、调用栈与面包屑）。
