@@ -289,6 +289,12 @@
         },
       };
       emuMemMap.set(emuId, memNs);
+      if (opts.device !== undefined) {
+        __native.vfsSetDevice(emuId, opts.device);
+      }
+      if (opts.realClock !== undefined) {
+        __native.vfsUseRealClock(emuId, Boolean(opts.realClock));
+      }
 
       return {
         load(path) {
@@ -526,6 +532,12 @@
           },
           useRealClock(enabled = true) {
             __native.vfsUseRealClock(emuId, Boolean(enabled));
+          },
+          setDevice(presetOrObj) {
+            __native.vfsSetDevice(emuId, presetOrObj);
+          },
+          deviceProfile() {
+            return __native.vfsDeviceProfile(emuId);
           },
         },
         trace: {

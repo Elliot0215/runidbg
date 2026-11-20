@@ -24,11 +24,49 @@ declare namespace rpc {
   let exports: Record<string, (...args: any[]) => any>;
 }
 
+type DevicePresetName = "pixel5" | "pixel8pro" | "s24ultra" | "xiaomi14";
+
+interface DeviceProfileConfig {
+  preset?: DevicePresetName;
+  brand?: string;
+  manufacturer?: string;
+  model?: string;
+  device?: string;
+  product?: string;
+  board?: string;
+  hardware?: string;
+  socPlatform?: string;
+  fingerprint?: string;
+  buildId?: string;
+  buildDisplay?: string;
+  incremental?: string;
+  securityPatch?: string;
+  androidRelease?: string;
+  sdkInt?: number;
+  abi?: string;
+  abiList?: string;
+  cpuCores?: number;
+  ramTotalKb?: number;
+  kernelRelease?: string;
+  kernelVersion?: string;
+  screenWidth?: number;
+  screenHeight?: number;
+  screenDpi?: number;
+  locale?: string;
+  timezone?: string;
+  carrierName?: string;
+  carrierMccMnc?: string;
+  serialNo?: string;
+  androidId?: string;
+}
+
 interface EmuOptions {
   packageName?: string;
   searchPaths?: string[];
   hleAccel?: boolean;
   heapSize?: number;
+  device?: DevicePresetName | DeviceProfileConfig;
+  realClock?: boolean;
 }
 
 interface TraceOptions {
@@ -179,6 +217,8 @@ interface VfsNamespace {
   mountOverlay(guestDir: string, hostDir: string): void;
   setTime(unixSecs: number): void;
   useRealClock(enabled?: boolean): void;
+  setDevice(presetOrConfig: DevicePresetName | DeviceProfileConfig): void;
+  deviceProfile(): Required<Omit<DeviceProfileConfig, "preset">>;
 }
 
 interface TraceNamespace {

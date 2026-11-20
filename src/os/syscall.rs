@@ -408,18 +408,24 @@ where
         SYS_UNAME => {
             // struct utsname: 6 个 65 字节字段 (sysname, nodename, release, version, machine, domainname)
             let buf_addr = args[0];
+            let (release, version) = {
+                let (_, vfs) = get_state(uc.get_data_mut());
+                let dp = vfs.device_profile();
+                (dp.kernel_release.clone(), dp.kernel_version.clone())
+            };
             let mut uts = [0u8; 65 * 6];
             let fields = [
                 "Linux",
                 "localhost",
-                "5.4.147-android12-9",
-                "#1 SMP PREEMPT",
+                release.as_str(),
+                version.as_str(),
                 "aarch64",
                 "(none)",
             ];
             for (i, f) in fields.iter().enumerate() {
                 let off = i * 65;
-                uts[off..off + f.len()].copy_from_slice(f.as_bytes());
+                let copy_len = f.len().min(64);
+                uts[off..off + copy_len].copy_from_slice(&f.as_bytes()[..copy_len]);
             }
             if uc.mem_write(buf_addr, &uts).is_err() {
                 return EINVAL;

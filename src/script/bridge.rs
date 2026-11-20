@@ -1192,6 +1192,134 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
+    // vfsSetDevice(emuId, presetOrObj)
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "vfsSetDevice",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize, val: Value<'js>| -> rquickjs::Result<()> {
+                    let mut profile = if let Some(s) = val.as_string() {
+                        let name = s.to_string()?;
+                        crate::os::DeviceProfile::from_preset(&name).ok_or_else(|| {
+                            throw_err(
+                                &ctx,
+                                format!("未知的设备预设: {name}（支持 pixel5 / pixel8pro / s24ultra / xiaomi14）"),
+                            )
+                        })?
+                    } else if let Some(obj) = val.as_object() {
+                        let mut base = if let Ok(Some(preset)) = obj.get::<_, Option<String>>("preset") {
+                            crate::os::DeviceProfile::from_preset(&preset).ok_or_else(|| {
+                                throw_err(&ctx, format!("未知的设备预设: {preset}"))
+                            })?
+                        } else {
+                            let h = host.borrow();
+                            let entry = h
+                                .emus
+                                .get(emu_id)
+                                .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                            entry.emu.vfs().device_profile().clone()
+                        };
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("brand") { base.brand = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("manufacturer") { base.manufacturer = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("model") { base.model = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("device") { base.device = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("product") { base.product = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("board") { base.board = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("hardware") { base.hardware = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("socPlatform") { base.soc_platform = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("fingerprint") { base.fingerprint = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("buildId") { base.build_id = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("buildDisplay") { base.build_display = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("incremental") { base.incremental = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("securityPatch") { base.security_patch = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("androidRelease") { base.android_release = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<u32>>("sdkInt") { base.sdk_int = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("abi") { base.abi = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("abiList") { base.abi_list = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<u32>>("cpuCores") { base.cpu_cores = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<f64>>("ramTotalKb") { base.ram_total_kb = v.max(0.0) as u64; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("kernelRelease") { base.kernel_release = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("kernelVersion") { base.kernel_version = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<u32>>("screenWidth") { base.screen_width = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<u32>>("screenHeight") { base.screen_height = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<u32>>("screenDpi") { base.screen_dpi = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("locale") { base.locale = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("timezone") { base.timezone = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("carrierName") { base.carrier_name = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("carrierMccMnc") { base.carrier_mcc_mnc = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("serialNo") { base.serial_no = v; }
+                        if let Ok(Some(v)) = obj.get::<_, Option<String>>("androidId") { base.android_id = v; }
+                        base
+                    } else {
+                        return Err(throw_err(&ctx, "vfs.setDevice 参数必须为预设名称字符串或配置对象"));
+                    };
+                    let mut h = host.borrow_mut();
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    // 保留用户自定义字段顺序并同步更新系统属性
+                    let _ = &mut profile;
+                    entry.emu.vfs_mut().apply_device_profile(profile);
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    // vfsDeviceProfile(emuId) -> DeviceProfile object
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "vfsDeviceProfile",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize| -> rquickjs::Result<Object<'js>> {
+                    let h = host.borrow();
+                    let entry = h
+                        .emus
+                        .get(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let dp = entry.emu.vfs().device_profile();
+                    let obj = Object::new(ctx.clone())?;
+                    obj.set("brand", dp.brand.as_str())?;
+                    obj.set("manufacturer", dp.manufacturer.as_str())?;
+                    obj.set("model", dp.model.as_str())?;
+                    obj.set("device", dp.device.as_str())?;
+                    obj.set("product", dp.product.as_str())?;
+                    obj.set("board", dp.board.as_str())?;
+                    obj.set("hardware", dp.hardware.as_str())?;
+                    obj.set("socPlatform", dp.soc_platform.as_str())?;
+                    obj.set("fingerprint", dp.fingerprint.as_str())?;
+                    obj.set("buildId", dp.build_id.as_str())?;
+                    obj.set("buildDisplay", dp.build_display.as_str())?;
+                    obj.set("incremental", dp.incremental.as_str())?;
+                    obj.set("securityPatch", dp.security_patch.as_str())?;
+                    obj.set("androidRelease", dp.android_release.as_str())?;
+                    obj.set("sdkInt", dp.sdk_int)?;
+                    obj.set("abi", dp.abi.as_str())?;
+                    obj.set("abiList", dp.abi_list.as_str())?;
+                    obj.set("cpuCores", dp.cpu_cores)?;
+                    obj.set("ramTotalKb", dp.ram_total_kb as f64)?;
+                    obj.set("kernelRelease", dp.kernel_release.as_str())?;
+                    obj.set("kernelVersion", dp.kernel_version.as_str())?;
+                    obj.set("screenWidth", dp.screen_width)?;
+                    obj.set("screenHeight", dp.screen_height)?;
+                    obj.set("screenDpi", dp.screen_dpi)?;
+                    obj.set("locale", dp.locale.as_str())?;
+                    obj.set("timezone", dp.timezone.as_str())?;
+                    obj.set("carrierName", dp.carrier_name.as_str())?;
+                    obj.set("carrierMccMnc", dp.carrier_mcc_mnc.as_str())?;
+                    obj.set("serialNo", dp.serial_no.as_str())?;
+                    obj.set("androidId", dp.android_id.as_str())?;
+                    Ok(obj)
+                },
+            )?,
+        )?;
+    }
+
     // ---- Trace & Snapshot APIs ----
     {
         let host = Rc::clone(host);

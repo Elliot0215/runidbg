@@ -12,7 +12,7 @@ use crate::jni::{attach_jni_hook, DefaultJniHandler, JObjectRef, JniHandler, Jni
 use crate::loader::ApkPackage;
 use crate::loader::{attach_trampoline_hook, DynamicLinker, LoadedModule, TrampolineTable};
 use crate::memory::MemoryManager;
-use crate::os::{attach_syscall_hook_with_interceptor, VirtualFs};
+use crate::os::{attach_syscall_hook_with_interceptor, DeviceProfile, VirtualFs};
 use crate::snapshot::EmuSnapshot;
 use crate::tracer::{attach_code_hook, attach_mem_trace_hook, BinaryTracer, TraceLevel};
 
@@ -43,6 +43,7 @@ pub struct AndroidEmulatorBuilder {
     sysroot_dirs: Vec<PathBuf>,
     enable_hle_accel: bool,
     jni_handler: Box<dyn JniHandler>,
+    device_profile: Option<DeviceProfile>,
     trace_capacity: usize,
     trace_level: TraceLevel,
     auto_attach_trace: bool,
@@ -63,6 +64,7 @@ impl AndroidEmulatorBuilder {
             sysroot_dirs: Vec::new(),
             enable_hle_accel: true,
             jni_handler: Box::new(DefaultJniHandler),
+            device_profile: None,
             trace_capacity: 65_536,
             trace_level: TraceLevel::RegDelta,
             auto_attach_trace: false,
@@ -100,6 +102,12 @@ impl AndroidEmulatorBuilder {
         self
     }
 
+    /// 配置模拟设备参数画像（自动同步系统属性、`/proc/*` 与 `uname`）
+    pub fn device_profile(mut self, profile: DeviceProfile) -> Self {
+        self.device_profile = Some(profile);
+        self
+    }
+
     /// 启用内存模式 Trace（指定预分配条数与分层级别）
     pub fn with_memory_trace(mut self, capacity: usize, level: TraceLevel) -> Self {
         self.trace_capacity = capacity;
@@ -112,6 +120,9 @@ impl AndroidEmulatorBuilder {
     pub fn build(self) -> EmuResult<AndroidEmulator> {
         let mut mem = MemoryManager::new(self.heap_base, self.heap_size);
         let mut vfs = VirtualFs::new(&self.package_name);
+        if let Some(profile) = self.device_profile {
+            vfs.apply_device_profile(profile);
+        }
         let mut trampolines = TrampolineTable::new();
         let mut jni = JniVm::new(self.jni_handler).with_package_name(&self.package_name);
         let tracer = BinaryTracer::new_in_memory_with_level(self.trace_capacity, self.trace_level);
@@ -484,6 +495,10 @@ impl AndroidEmulator {
 
     pub fn jni_mut(&mut self) -> &mut JniVm {
         &mut self.uc.get_data_mut().jni
+    }
+
+    pub fn vfs(&self) -> &VirtualFs {
+        &self.uc.get_data().vfs
     }
 
     pub fn vfs_mut(&mut self) -> &mut VirtualFs {

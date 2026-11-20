@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use crate::crash::BreadcrumbRing;
 use crate::diag::EnvDiag;
 use crate::memory::MemoryManager;
+use crate::os::device::DeviceProfile;
 
 /// 标准 Linux 负错误码
 pub const ENOENT: i64 = -2;
@@ -51,6 +52,8 @@ pub struct VirtualFs {
     pub tid: u32,
     /// Android 系统属性表（供 `__system_property_get` 与反调试查询）
     pub properties: HashMap<String, String>,
+    /// 当前设备参数画像（与系统属性、`/proc/*`、`uname` 保持同步）
+    device: DeviceProfile,
     /// 只读宿主机目录挂载点：(虚拟前缀, 宿主机路径)
     sysroot_mounts: Vec<(String, PathBuf)>,
     /// 内存 Overlay 文件表：虚拟绝对路径 -> 字节内容
@@ -81,17 +84,8 @@ impl Default for VirtualFs {
 impl VirtualFs {
     pub fn new(package_name: impl Into<String>) -> Self {
         let pkg = package_name.into();
-        let mut properties = HashMap::new();
-        // 默认 Android 11 (API 30) 设备属性模板
-        properties.insert("ro.build.version.sdk".into(), "30".into());
-        properties.insert("ro.build.version.release".into(), "11".into());
-        properties.insert("ro.product.cpu.abi".into(), "arm64-v8a".into());
-        properties.insert("ro.debuggable".into(), "0".into());
-        properties.insert("ro.secure".into(), "1".into());
-        properties.insert(
-            "ro.build.fingerprint".into(),
-            "google/redfin/redfin:11/RQ3A.211001.001/7641976:user/release-keys".into(),
-        );
+        let device = DeviceProfile::default();
+        let properties = device.to_properties();
 
         let mut overlay_dirs = HashSet::new();
         for dir in [
@@ -147,6 +141,7 @@ impl VirtualFs {
             uid: 10123,
             tid: 10420,
             properties,
+            device,
             sysroot_mounts: Vec::new(),
             overlay_files: HashMap::new(),
             overlay_dirs,
@@ -170,6 +165,19 @@ impl VirtualFs {
 
     pub fn breadcrumbs(&self) -> &BreadcrumbRing {
         &self.breadcrumbs
+    }
+
+    /// 获取当前设备参数画像
+    pub fn device_profile(&self) -> &DeviceProfile {
+        &self.device
+    }
+
+    /// 应用新的设备参数画像，并同步更新系统属性表
+    pub fn apply_device_profile(&mut self, profile: DeviceProfile) {
+        for (k, v) in profile.to_properties() {
+            self.properties.insert(k, v);
+        }
+        self.device = profile;
     }
 
     /// 切换是否使用宿主机真实时间戳（默认关闭，使用确定性虚拟时钟）
@@ -346,6 +354,22 @@ impl VirtualFs {
                     cursor: 0,
                 },
             );
+        }
+        if path == "/proc/cpuinfo" {
+            let data = self.device.render_proc_cpuinfo().into_bytes();
+            return self.alloc_fd(path, OpenFileKind::Buffer { data, cursor: 0 });
+        }
+        if path == "/proc/meminfo" {
+            let data = self.device.render_proc_meminfo().into_bytes();
+            return self.alloc_fd(path, OpenFileKind::Buffer { data, cursor: 0 });
+        }
+        if path == "/proc/version" {
+            let data = self.device.render_proc_version().into_bytes();
+            return self.alloc_fd(path, OpenFileKind::Buffer { data, cursor: 0 });
+        }
+        if path == "/sys/devices/system/cpu/online" || path == "/sys/devices/system/cpu/possible" {
+            let data = self.device.render_cpu_online().into_bytes();
+            return self.alloc_fd(path, OpenFileKind::Buffer { data, cursor: 0 });
         }
 
         // 3. 内存 Overlay 文件（支持 O_TRUNC 与直接读写共享）
@@ -596,7 +620,16 @@ impl VirtualFs {
         }
         if matches!(
             path.as_str(),
-            "/proc/self/status" | "/proc/self/cmdline" | "/dev/urandom" | "/dev/random" | "/dev/null"
+            "/proc/self/status"
+                | "/proc/self/cmdline"
+                | "/proc/cpuinfo"
+                | "/proc/meminfo"
+                | "/proc/version"
+                | "/sys/devices/system/cpu/online"
+                | "/sys/devices/system/cpu/possible"
+                | "/dev/urandom"
+                | "/dev/random"
+                | "/dev/null"
         ) {
             return Ok((0o100444, 0));
         }
