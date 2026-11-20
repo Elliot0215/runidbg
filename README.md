@@ -84,7 +84,7 @@ src/
 ├── snapshot.rs         # 内存 + 寄存器快照保存与恢复
 ├── error.rs            # 统一错误类型
 ├── loader/             # ELF 解析、动态链接器、APK 一键加载与 HLE Trampoline
-├── os/                 # SVC 系统调用、VFS 虚拟文件系统、协作调度
+├── os/                 # 设备画像（DeviceProfile）、SVC 系统调用、VFS 虚拟文件系统、协作调度
 ├── jni/                # JNI 1.6 Env、对象表、va_list 解析与 Hook 处理
 ├── tracer/             # 高速二进制追踪引擎、记录格式与离线 Reader
 ├── script/             # QuickJS 脚本引擎、RPC 与 MCP
@@ -177,6 +177,38 @@ cargo run --release --bin runidbg-cli -- debug samples/libstatic-webp.so WebPGet
 # 在 gdb-multiarch / pwndbg 中连接：
 # target remote 127.0.0.1:1234
 ```
+
+## 性能实测对比（vs Java unidbg）
+
+测试环境：Apple Silicon（10 核 ARM64 macOS）、JDK 21（`unidbg 0.9.9`）vs `runidbg-cli --release`，样本为同一份 2 MB stripped Android ARM64 安全签名 `.so`（含 `libc++_shared.so` 依赖）。以下三组均基于**两边 100% 产出相同有效签名结果**的同口径对齐实测：
+
+### 1. 冷启动与进程内热态调用
+
+| 指标 | Java `unidbg` | Rust `runidbg-cli` | 对比 |
+| --- | ---: | ---: | --- |
+| 环境初始化 + `.so` 加载 | 1,666 ms | **40 ms** | **41.7× 更快** |
+| `JNI_OnLoad` | 72 ms | **37 ms** | **1.9× 更快** |
+| **总冷启动耗时** | 1,738 ms | **77 ms** | **22.6× 更快** |
+| 进程内单核热态调用（50 次均值） | 3.80 ms/次（263.4 QPS） | **1.30 ms/次（769.2 QPS）** | **2.92× 更快** |
+
+### 2. HTTP RPC 并发服务（100% 返回值校验通过）
+
+> Java 侧使用 JDK 21 内置 `HttpServer` 封装单实例 `unidbg`，Rust 侧直接使用 `runidbg-cli serve`。
+
+| 服务配置 | 校验通过 | QPS | p50 延迟 | p95 延迟 | 常驻内存 (RSS) | 对比 |
+| --- | :---: | ---: | ---: | ---: | ---: | --- |
+| Java `unidbg`（1 worker） | 100/100 | 254.7 | 38.35 ms | 41.03 ms | 122.1 MB | 1×（基线） |
+| Rust `runidbg`（`--workers 1`） | 100/100 | **628.7** | **15.83 ms** | **15.99 ms** | **21.7 MB** | **2.47× QPS / 省 82% 内存** |
+| Rust `runidbg`（`--workers auto=10`） | 200/200 | **1,141.0** | **8.74 ms** | 35.94 ms | **127.5 MB** | **4.48× QPS（10 实例 ≈ Java 1 实例内存）** |
+
+### 3. 全模块指令级 Trace（`[base, base+size]`）
+
+| 引擎 / 模式 | 耗时 | 记录条数 | 归一化吞吐 | 单条落盘开销 | 吞吐倍率 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| Java `unidbg`（`traceCode` 文本流） | 1,851.1 ms | 275,381 | 0.149 M insns/s | ~118 B/条（31 MB） | 1×（基线） |
+| Rust `runidbg`（`fast` 二进制 mmap） | **64 ms** | 1,090,194 | **17.03 M insns/s** | 32 B/条（33 MB） | **114× 更快** |
+| Rust `runidbg`（`reg_delta` 二进制 mmap） | **212 ms** | 1,090,194 | **5.14 M insns/s** | 32 B/条（33 MB） | **34.5× 更快** |
+| Rust `runidbg`（`full` 双流 + 20.1 万内存事件） | **233 ms** | 1,090,194 + 201,209 ext | **4.68 M insns/s** | 32 B/条（33 MB + 6.1 MB） | **31.4× 更快** |
 
 ## 测试与校验
 
