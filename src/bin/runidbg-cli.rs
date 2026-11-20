@@ -27,8 +27,9 @@ fn print_usage() {
            runidbg-cli mcp [--script <init.js>] [--cwd <dir>] [--http 127.0.0.1:8090]         启动 MCP 服务端 (stdio / HTTP)\n\
            runidbg-cli debug <lib.so> <symbol|0xaddr> [--listen 127.0.0.1:1234] [--pkg PKG]   启动 GDB RSP 远程调试服务端\n\
            runidbg-cli init-types [dir]                                                       生成 runidbg.d.ts 类型声明\n\
-           runidbg-cli dump <trace.idx> [--ext <trace.ext>] [--skip N] [--limit N]\n\
-           runidbg-cli search <trace.idx> [--ext <trace.ext>] [--val <hex>] [--addr <hex>] [--pc <hex>]\n\
+           runidbg-cli dump <trace.idx> [--ext <trace.ext>] [--base <hex>] [--skip N] [--limit N]\n\
+           runidbg-cli search <trace.idx> [--ext <trace.ext>] [--base <hex>] [--val <hex>] [--addr <hex>] [--pc <hex>]\n\
+           runidbg-cli stats <trace.idx> [--base <hex>] [--top N]\n\
            runidbg-cli export-ida <trace.idx> --base <hex> [--out <script.py>]\n\
            runidbg-cli export-bn  <trace.idx> --base <hex> [--out <script.py>]"
     );
@@ -314,6 +315,7 @@ fn main() -> Result<()> {
     let mut addr_filter: Option<u64> = None;
     let mut pc_filter: Option<u64> = None;
     let mut base_addr: u64 = 0;
+    let mut top_n: usize = 20;
     let mut out_path: Option<PathBuf> = None;
 
     let mut i = 3;
@@ -347,6 +349,10 @@ fn main() -> Result<()> {
                 base_addr = parse_u64_hex_or_dec(&args[i + 1])?;
                 i += 2;
             }
+            "--top" if i + 1 < args.len() => {
+                top_n = args[i + 1].parse().context("无效的 --top 值")?;
+                i += 2;
+            }
             "--out" if i + 1 < args.len() => {
                 out_path = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
@@ -364,6 +370,14 @@ fn main() -> Result<()> {
 
     let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
 
+    let format_rel = |pc: u64| -> String {
+        if base_addr != 0 && pc >= base_addr {
+            format!(" [+0x{:x}]", pc - base_addr)
+        } else {
+            String::new()
+        }
+    };
+
     match cmd {
         "dump" => {
             println!(
@@ -375,7 +389,12 @@ fn main() -> Result<()> {
             for idx in skip..end {
                 if let Some(rec) = reader.get(idx) {
                     let seq = rec.seq_low32;
-                    println!("#{idx:06} {}", BinaryTracer::decode_record(&rec));
+                    let pc = rec.pc;
+                    println!(
+                        "#{idx:06}{} {}",
+                        format_rel(pc),
+                        BinaryTracer::decode_record(&rec)
+                    );
                     if ext_path.is_some() {
                         for ext in reader.ext_for_seq(seq) {
                             println!("{}", BinaryTracer::format_ext_record(&ext));
@@ -389,7 +408,12 @@ fn main() -> Result<()> {
                 let hits = reader.search_value(target);
                 println!("# 命中寄存器值 0x{target:016x}: {} 条", hits.len());
                 for (idx, rec) in hits {
-                    println!("#{idx:06} {}", BinaryTracer::decode_record(&rec));
+                    let pc = rec.pc;
+                    println!(
+                        "#{idx:06}{} {}",
+                        format_rel(pc),
+                        BinaryTracer::decode_record(&rec)
+                    );
                 }
             }
             if let Some(target_addr) = addr_filter {
@@ -399,7 +423,8 @@ fn main() -> Result<()> {
                     let seq = ext.seq_low32;
                     let pc = ext.pc;
                     println!(
-                        "seq={seq} pc=0x{pc:016x} {}",
+                        "seq={seq} pc=0x{pc:016x}{} {}",
+                        format_rel(pc),
                         BinaryTracer::format_ext_record(&ext).trim()
                     );
                 }
@@ -410,12 +435,53 @@ fn main() -> Result<()> {
                     if let Some(rec) = reader.get(idx) {
                         let pc = rec.pc;
                         if pc == target_pc {
-                            println!("#{idx:06} {}", BinaryTracer::decode_record(&rec));
+                            println!(
+                                "#{idx:06}{} {}",
+                                format_rel(pc),
+                                BinaryTracer::decode_record(&rec)
+                            );
                             count += 1;
                         }
                     }
                 }
                 println!("# 命中 PC 0x{target_pc:016x}: {count} 条");
+            }
+        }
+        "stats" => {
+            use std::collections::HashMap;
+            let mut pc_counts: HashMap<u64, u64> = HashMap::new();
+            let mut bl_targets: HashMap<u64, u64> = HashMap::new();
+            let total = reader.len();
+            for idx in 0..total {
+                if let Some(rec) = reader.get(idx) {
+                    let pc = rec.pc;
+                    let op = rec.opcode;
+                    *pc_counts.entry(pc).or_insert(0) += 1;
+                    // ARM64 `BL imm26` 编码: top 6 bits == 0b100101 (0x9400_0000..0x97ff_ffff)
+                    if (op & 0xFC00_0000) == 0x9400_0000 {
+                        let imm26 = ((op & 0x03FF_FFFF) as i32) << 6 >> 6;
+                        let target = pc.wrapping_add((imm26 as i64 * 4) as u64);
+                        *bl_targets.entry(target).or_insert(0) += 1;
+                    }
+                }
+            }
+            println!(
+                "# Trace 统计: 总指令={total} | 唯一 PC={} | 扩展事件={} | 唯一 BL 目标={}",
+                pc_counts.len(),
+                reader.ext_len(),
+                bl_targets.len()
+            );
+            let mut top_bl: Vec<(u64, u64)> = bl_targets.into_iter().collect();
+            top_bl.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            println!("\n=== Top {} 热点调用目标 (BL) ===", top_n.min(top_bl.len()));
+            for (addr, cnt) in top_bl.into_iter().take(top_n) {
+                println!("  0x{addr:016x}{}  x{cnt}", format_rel(addr));
+            }
+            let mut top_pcs: Vec<(u64, u64)> = pc_counts.into_iter().collect();
+            top_pcs.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            println!("\n=== Top {} 热点指令地址 (PC) ===", top_n.min(top_pcs.len()));
+            for (addr, cnt) in top_pcs.into_iter().take(top_n) {
+                println!("  0x{addr:016x}{}  x{cnt}", format_rel(addr));
             }
         }
         "export-ida" => {

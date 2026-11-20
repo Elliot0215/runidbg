@@ -308,7 +308,10 @@ impl VirtualFs {
         if path == "/dev/urandom" || path == "/dev/random" {
             return self.alloc_fd(path, OpenFileKind::Urandom);
         }
-        if path == "/dev/null" {
+        if path == "/dev/null"
+            || path == "/dev/ashmem"
+            || path.starts_with("/dev/log/")
+        {
             return self.alloc_fd(
                 path,
                 OpenFileKind::Buffer {
@@ -630,7 +633,9 @@ impl VirtualFs {
                 | "/dev/urandom"
                 | "/dev/random"
                 | "/dev/null"
-        ) {
+                | "/dev/ashmem"
+        ) || path.starts_with("/dev/log/")
+        {
             return Ok((0o100444, 0));
         }
         for (prefix, host_root) in &self.sysroot_mounts {

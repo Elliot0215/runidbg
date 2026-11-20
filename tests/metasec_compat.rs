@@ -98,3 +98,58 @@ fn tiktok_metasec_offline_cylons_and_gorgon_family() {
     assert_eq!(v["ladonLen"].as_u64(), Some(48));
     assert_eq!(v["missingJniCount"].as_u64(), Some(0));
 }
+
+#[test]
+fn native_hook_can_read_jni_objects_and_build_fields_match_device_profile() {
+    let script = r#"
+        const emu = Emu.create({
+            packageName: "com.example.test",
+            device: "pixel8pro",
+        });
+        emu.diag.enable();
+
+        // 1. 验证 Native code hook 中调用 emu.jni.getString 不会触发 RefCell panic
+        const mod = emu.load("samples/libstatic-webp.so");
+        const fnAddr = mod.symbol("WebPGetDecoderVersion");
+        const testStrRef = emu.jni.newString("hello_from_hook");
+        let observedInHook = null;
+        emu.hook.code(fnAddr, () => {
+            observedInHook = emu.jni.getString(testStrRef);
+        }, { once: true });
+        mod.call("WebPGetDecoderVersion");
+
+        // 2. 验证 android/os/Build 与 Build$VERSION 静态字段自动同步 DeviceProfile
+        const JNI_TRAMP = 0x18010000;
+        const slot = (n) => JNI_TRAMP + (16 + n) * 4;
+        const cstr = (s) => {
+            const p = emu.mem.alloc(s.length + 1);
+            emu.mem.writeCString(p, s);
+            return p;
+        };
+        const buildCls = emu.jni.findClass("android/os/Build");
+        const verCls = emu.jni.findClass("android/os/Build$VERSION");
+        const modelFid = emu.call(slot(144), emu.jni.envPtr, buildCls, cstr("MODEL"), cstr("Ljava/lang/String;"));
+        const modelRef = emu.call(slot(145), emu.jni.envPtr, buildCls, modelFid);
+        const sdkFid = emu.call(slot(144), emu.jni.envPtr, verCls, cstr("SDK_INT"), cstr("I"));
+        const sdkInt = emu.call(slot(150), emu.jni.envPtr, verCls, sdkFid);
+
+        rpc.exports = {
+            check() {
+                return {
+                    observedInHook,
+                    model: emu.jni.getString(modelRef),
+                    sdkInt,
+                };
+            },
+        };
+    "#;
+
+    let session = JsSession::new(&[], Path::new("."), true).expect("create JsSession");
+    session.eval_source(script).expect("eval hook+build test");
+    let raw = session.call_rpc_json("check", "[]").expect("call check");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("parse check json");
+
+    assert_eq!(v["observedInHook"].as_str(), Some("hello_from_hook"));
+    assert_eq!(v["model"].as_str(), Some("Pixel 8 Pro"));
+    assert_eq!(v["sdkInt"].as_u64(), Some(34));
+}

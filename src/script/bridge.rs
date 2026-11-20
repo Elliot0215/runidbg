@@ -1260,9 +1260,9 @@ pub(super) fn register_native_bridge<'js>(
                         .emus
                         .get_mut(emu_id)
                         .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                    // 保留用户自定义字段顺序并同步更新系统属性
+                    // 同步更新 VFS 与 JNI Build 字段
                     let _ = &mut profile;
-                    entry.emu.vfs_mut().apply_device_profile(profile);
+                    entry.emu.apply_device_profile(profile);
                     Ok(())
                 },
             )?,

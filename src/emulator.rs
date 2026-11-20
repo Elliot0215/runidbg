@@ -120,11 +120,12 @@ impl AndroidEmulatorBuilder {
     pub fn build(self) -> EmuResult<AndroidEmulator> {
         let mut mem = MemoryManager::new(self.heap_base, self.heap_size);
         let mut vfs = VirtualFs::new(&self.package_name);
-        if let Some(profile) = self.device_profile {
-            vfs.apply_device_profile(profile);
-        }
         let mut trampolines = TrampolineTable::new();
         let mut jni = JniVm::new(self.jni_handler).with_package_name(&self.package_name);
+        if let Some(profile) = self.device_profile {
+            vfs.apply_device_profile(profile.clone());
+            jni.set_device_profile(profile);
+        }
         let tracer = BinaryTracer::new_in_memory_with_level(self.trace_capacity, self.trace_level);
 
         for dir in &self.sysroot_dirs {
@@ -503,6 +504,13 @@ impl AndroidEmulator {
 
     pub fn vfs_mut(&mut self) -> &mut VirtualFs {
         &mut self.uc.get_data_mut().vfs
+    }
+
+    /// 统一应用设备画像，同步更新 VFS（系统属性、`/proc/*`、`uname`）与 JNI（`android/os/Build`）
+    pub fn apply_device_profile(&mut self, profile: DeviceProfile) {
+        let data = self.uc.get_data_mut();
+        data.vfs.apply_device_profile(profile.clone());
+        data.jni.set_device_profile(profile);
     }
 
     /// 获取缺环境自动诊断器（共享引用，可动态开启/关闭/导出补环境脚本）

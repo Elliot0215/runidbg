@@ -8,14 +8,14 @@
 **纯 Rust 实现的高性能 Android ARM64 `.so` 仿真器、零拷贝二进制 Tracer 与 QuickJS 脚本引擎**  
 内置异步多核 RPC 服务 · MCP AI 逆向闭环 · GDB RSP 远程调试 · 统一设备画像模拟
 
-**简体中文** | [English](./README_EN.md)
+**简体中文** | [English](./README_EN.md) | [完整使用指南](./docs/GUIDE.md) | [AI Agent Skill](./docs/SKILL.md)
 
 ![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
 ![Target](https://img.shields.io/badge/Target-Android%20ARM64-3DDC84?logo=android&logoColor=white)
 ![Engine](https://img.shields.io/badge/Unicorn-2.1-blueviolet)
 ![Script](https://img.shields.io/badge/QuickJS-TypeScript%20d.ts-F7DF1E?logo=javascript&logoColor=black)
 ![Protocol](https://img.shields.io/badge/RPC%20%7C%20MCP%20%7C%20GDB%20RSP-ready-0A66C2)
-![Tests](https://img.shields.io/badge/Tests-39%2F39%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-40%2F40%20passing-brightgreen)
 
 | 🚀 冷启动速度 | 🔥 全模块 Trace 吞吐 | 💾 单实例 RPC 内存 | ⚙️ 多核 RPC 吞吐 | 📦 单条 Trace 体积 |
 | :---: | :---: | :---: | :---: | :---: |

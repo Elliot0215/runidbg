@@ -62,14 +62,14 @@ impl Drop for ActiveObjectsGuard {
     }
 }
 
-/// 若当前正处于 JS JNI 回调内部，直接借用活跃 `ObjectTable` 执行闭包
+/// 若当前正处于 JS JNI 回调或 Unicorn 原生 Hook 回调内部，直接借用活跃 `ObjectTable` 执行闭包
 pub(crate) fn with_active_objects<R>(f: impl FnOnce(&mut ObjectTable) -> R) -> Option<R> {
-    ACTIVE_OBJECTS.with(|cell| {
-        let mut ptr = cell.get()?;
+    if let Some(mut ptr) = ACTIVE_OBJECTS.with(Cell::get) {
         // SAFETY: `ActiveObjectsGuard` 保证在单线程同步回调期间指针有效且无别名可变引用
         let obj_ref = unsafe { ptr.as_mut() };
-        Some(f(obj_ref))
-    })
+        return Some(f(obj_ref));
+    }
+    crate::script::hooks::with_active_uc(|uc| f(&mut uc.get_data_mut().jni.objects))
 }
 
 /// 存储每个模拟器实例注册的 JS JNI 回调表

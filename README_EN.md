@@ -8,14 +8,14 @@
 **High-Performance Android ARM64 `.so` Emulator, Zero-Copy Binary Tracer & QuickJS Scripting Engine in Pure Rust**  
 Built-in Async Multi-Core RPC Server · MCP AI Reverse-Engineering Loop · GDB RSP Debugger · Unified Device Profile
 
-[简体中文](./README.md) | **English**
+[简体中文](./README.md) | **English** | [Full Guide](./docs/GUIDE.md) | [AI Agent Skill](./docs/SKILL.md)
 
 ![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
 ![Target](https://img.shields.io/badge/Target-Android%20ARM64-3DDC84?logo=android&logoColor=white)
 ![Engine](https://img.shields.io/badge/Unicorn-2.1-blueviolet)
 ![Script](https://img.shields.io/badge/QuickJS-TypeScript%20d.ts-F7DF1E?logo=javascript&logoColor=black)
 ![Protocol](https://img.shields.io/badge/RPC%20%7C%20MCP%20%7C%20GDB%20RSP-ready-0A66C2)
-![Tests](https://img.shields.io/badge/Tests-39%2F39%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-40%2F40%20passing-brightgreen)
 
 | 🚀 Cold Start | 🔥 Full-Module Trace | 💾 Single-Worker RPC RAM | ⚙️ Multi-Core RPC | 📦 Trace Footprint |
 | :---: | :---: | :---: | :---: | :---: |

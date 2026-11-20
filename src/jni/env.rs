@@ -13,6 +13,7 @@ use crate::jni::va_list::{
     read_varargs_direct, read_varargs_jvalue_array, read_varargs_va_list,
 };
 use crate::memory::{read_guest_cstr, read_guest_u64, MemoryManager, PAGE_SIZE};
+use crate::os::DeviceProfile;
 
 /// `JavaVM` 指针与 `JNIInvokeInterface` 虚函数表基址
 pub const JNI_VM_BASE: u64 = 0x1800_0000;
@@ -37,6 +38,7 @@ pub struct JniVm {
     pub objects: ObjectTable,
     pub registered_natives: Vec<RegisteredNative>,
     pub package_name: String,
+    pub device_profile: DeviceProfile,
 
     methods: HashMap<u64, MethodDesc>,
     method_lookup: HashMap<(String, String, String, bool), u64>,
@@ -68,6 +70,7 @@ impl JniVm {
             objects: ObjectTable::new(),
             registered_natives: Vec::new(),
             package_name: "com.example.app".to_string(),
+            device_profile: DeviceProfile::default(),
             methods: HashMap::new(),
             method_lookup: HashMap::new(),
             next_method_id: 0x2000_0001,
@@ -85,6 +88,10 @@ impl JniVm {
     pub fn with_package_name(mut self, pkg: impl Into<String>) -> Self {
         self.package_name = pkg.into();
         self
+    }
+
+    pub fn set_device_profile(&mut self, profile: DeviceProfile) {
+        self.device_profile = profile;
     }
 
     /// 替换业务 `JniHandler` 实现
@@ -744,9 +751,32 @@ where
         }
 
         // 静态字段读取 (145..=153)
-        145 => dispatch_static_field(uc, x1, x2, get_state, |h, ctx, cls, f| {
-            h.get_static_object_field(ctx, cls, f).0
-        }),
+        145 => {
+            let (vm, _) = get_state(uc.get_data_mut());
+            let cls = vm.resolve_class_name(JObjectRef(x1));
+            if let Some(field) = vm.fields.get(&x2).cloned() {
+                let ret = {
+                    let mut ctx = JniContext {
+                        objects: &mut vm.objects,
+                        package_name: &vm.package_name,
+                    };
+                    vm.handler.get_static_object_field(&mut ctx, &cls, &field)
+                };
+                if !ret.is_null() {
+                    ret.0
+                } else {
+                    resolve_builtin_build_object_field(
+                        &mut vm.objects,
+                        &vm.device_profile,
+                        &cls,
+                        &field,
+                    )
+                    .0
+                }
+            } else {
+                0
+            }
+        }
         146 => dispatch_static_field(uc, x1, x2, get_state, |h, ctx, cls, f| {
             u64::from(h.get_static_boolean_field(ctx, cls, f))
         }),
@@ -759,9 +789,28 @@ where
         149 => dispatch_static_field(uc, x1, x2, get_state, |h, ctx, cls, f| {
             h.get_static_short_field(ctx, cls, f) as i64 as u64
         }),
-        150 => dispatch_static_field(uc, x1, x2, get_state, |h, ctx, cls, f| {
-            h.get_static_int_field(ctx, cls, f) as i64 as u64
-        }),
+        150 => {
+            let (vm, _) = get_state(uc.get_data_mut());
+            let cls = vm.resolve_class_name(JObjectRef(x1));
+            if let Some(field) = vm.fields.get(&x2).cloned() {
+                let val = {
+                    let mut ctx = JniContext {
+                        objects: &mut vm.objects,
+                        package_name: &vm.package_name,
+                    };
+                    vm.handler.get_static_int_field(&mut ctx, &cls, &field)
+                };
+                if val != 0 {
+                    val as i64 as u64
+                } else if cls == "android/os/Build$VERSION" && field.name == "SDK_INT" {
+                    (vm.device_profile.sdk_int as i32) as i64 as u64
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
         151 => dispatch_static_field(uc, x1, x2, get_state, |h, ctx, cls, f| {
             h.get_static_long_field(ctx, cls, f) as u64
         }),
@@ -1345,4 +1394,43 @@ where
         package_name: &vm.package_name,
     };
     invoke(vm.handler.as_mut(), &mut ctx, &cls, &field)
+}
+
+/// 将 `DeviceProfile` 自动映射到 `android/os/Build` 与 `android/os/Build$VERSION` 静态字段
+fn resolve_builtin_build_object_field(
+    objects: &mut ObjectTable,
+    dp: &DeviceProfile,
+    cls: &str,
+    field: &FieldDesc,
+) -> JObjectRef {
+    match (cls, field.name.as_str()) {
+        ("android/os/Build", "BRAND") => objects.add_string(&dp.brand),
+        ("android/os/Build", "MANUFACTURER") => objects.add_string(&dp.manufacturer),
+        ("android/os/Build", "MODEL") => objects.add_string(&dp.model),
+        ("android/os/Build", "DEVICE") => objects.add_string(&dp.device),
+        ("android/os/Build", "PRODUCT") => objects.add_string(&dp.product),
+        ("android/os/Build", "BOARD") => objects.add_string(&dp.board),
+        ("android/os/Build", "HARDWARE") => objects.add_string(&dp.hardware),
+        ("android/os/Build", "FINGERPRINT") => objects.add_string(&dp.fingerprint),
+        ("android/os/Build", "ID") => objects.add_string(&dp.build_id),
+        ("android/os/Build", "DISPLAY") => objects.add_string(&dp.build_display),
+        ("android/os/Build", "SERIAL") => objects.add_string(&dp.serial_no),
+        ("android/os/Build", "CPU_ABI") => objects.add_string(&dp.abi),
+        ("android/os/Build", "TYPE") => objects.add_string("user"),
+        ("android/os/Build", "TAGS") => objects.add_string("release-keys"),
+        ("android/os/Build", "SUPPORTED_ABIS") | ("android/os/Build", "SUPPORTED_64_BIT_ABIS") => {
+            let refs: Vec<JObjectRef> = dp
+                .abi_list
+                .split(',')
+                .filter(|s| !s.is_empty())
+                .map(|s| objects.add_string(s.trim()))
+                .collect();
+            objects.add_local(JObject::ObjectArray(refs))
+        }
+        ("android/os/Build$VERSION", "RELEASE") => objects.add_string(&dp.android_release),
+        ("android/os/Build$VERSION", "INCREMENTAL") => objects.add_string(&dp.incremental),
+        ("android/os/Build$VERSION", "SECURITY_PATCH") => objects.add_string(&dp.security_patch),
+        ("android/os/Build$VERSION", "CODENAME") => objects.add_string("REL"),
+        _ => JObjectRef::NULL,
+    }
 }
