@@ -346,3 +346,10 @@ cargo clippy --no-default-features --all-targets -- -D warnings
 cargo clippy --no-default-features --features js --all-targets -- -D warnings
 cargo clippy --no-default-features --features mcp --all-targets -- -D warnings
 ```
+
+---
+
+## 🙏 致谢
+
+- 特别致谢 [**unidbg**](https://github.com/zhkl0228/unidbg)（`zhkl0228`）：`runidbg`（`Rust + unidbg`）的设计理念、Android 沙箱思路与 JNI 桥接模型深受 `unidbg` 启发，致敬多年深耕移动安全开源生态的前辈工作。
+- 同时感谢 [Unicorn Engine](https://github.com/unicorn-engine/unicorn)、[QuickJS](https://bellard.org/quickjs/) / `rquickjs`、`goblin`、`bad64` 等优秀开源项目。
