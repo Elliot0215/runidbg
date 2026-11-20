@@ -355,6 +355,13 @@ fn main() -> Result<()> {
         }
     }
 
+    if ext_path.is_none() {
+        let sibling = idx_path.with_extension("ext");
+        if sibling != idx_path && sibling.is_file() {
+            ext_path = Some(sibling);
+        }
+    }
+
     let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
 
     match cmd {

@@ -80,6 +80,9 @@ interface TraceOptions {
 interface TraceStats {
   records: number;
   extRecords: number;
+  totalInsns: number;
+  droppedInsns: number;
+  droppedExt: number;
 }
 
 interface RegisteredNativeInfo {

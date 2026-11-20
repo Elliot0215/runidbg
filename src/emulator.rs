@@ -461,7 +461,7 @@ impl AndroidEmulator {
         if let Some(mh) = self.trace_mem_hook.take() {
             let _ = self.uc.remove_hook(mh);
         }
-        self.uc.get_data().tracer.flush()
+        self.uc.get_data_mut().tracer.finalize()
     }
 
     /// 捕获完整 CPU + 可写内存快照（供批量回放）

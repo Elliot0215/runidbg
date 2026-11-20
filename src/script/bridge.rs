@@ -1348,7 +1348,14 @@ pub(super) fn register_native_bridge<'js>(
                     let mut tracer = if output.is_empty() {
                         BinaryTracer::new_in_memory_with_level(capacity.max(1024), level)
                     } else if level == TraceLevel::Full {
-                        let ext = format!("{output}.ext");
+                        let ext = if output.ends_with(".idx") {
+                            Path::new(&output)
+                                .with_extension("ext")
+                                .to_string_lossy()
+                                .into_owned()
+                        } else {
+                            format!("{output}.ext")
+                        };
                         BinaryTracer::new_dual_mmap(
                             &output,
                             &ext,
@@ -1388,9 +1395,13 @@ pub(super) fn register_native_bridge<'js>(
                         .get_mut(emu_id)
                         .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
                     entry.emu.detach_tracer().map_err(|e| throw_err(&ctx, e))?;
+                    let stats = entry.emu.tracer().stats;
                     let obj = Object::new(ctx.clone())?;
-                    obj.set("records", entry.emu.tracer().records().len())?;
-                    obj.set("extRecords", entry.emu.tracer().ext_records().len())?;
+                    obj.set("records", stats.recorded_insns as f64)?;
+                    obj.set("extRecords", stats.recorded_ext as f64)?;
+                    obj.set("totalInsns", stats.total_insns as f64)?;
+                    obj.set("droppedInsns", stats.dropped_insns as f64)?;
+                    obj.set("droppedExt", stats.dropped_ext as f64)?;
                     Ok(obj)
                 },
             )?,

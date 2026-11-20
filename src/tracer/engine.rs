@@ -1,6 +1,6 @@
 use std::fs::OpenOptions;
 use std::mem::size_of;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 use memmap2::MmapMut;
@@ -53,6 +53,7 @@ const TRACKED_REGS: [RegisterARM64; 32] = [
 enum TraceSink {
     Memory(Vec<TraceRecord>),
     Mmap {
+        path: PathBuf,
         mmap: MmapMut,
         max_records: usize,
         written: usize,
@@ -64,6 +65,7 @@ enum ExtSink {
     Disabled,
     Memory(Vec<ExtRecord>),
     Mmap {
+        path: PathBuf,
         mmap: MmapMut,
         max_records: usize,
         written: usize,
@@ -115,9 +117,11 @@ impl BinaryTracer {
 
     /// 创建基于 `memmap2` 的单流零拷贝落盘 Tracer（`trace.idx`）
     pub fn new_mmap(path: impl AsRef<Path>, max_records: usize) -> EmuResult<Self> {
-        let mmap = create_mmap_file(path, max_records * size_of::<TraceRecord>())?;
+        let path_buf = path.as_ref().to_path_buf();
+        let mmap = create_mmap_file(&path_buf, max_records * size_of::<TraceRecord>())?;
         Ok(Self {
             sink: TraceSink::Mmap {
+                path: path_buf,
                 mmap,
                 max_records,
                 written: 0,
@@ -141,16 +145,20 @@ impl BinaryTracer {
         max_ext_records: usize,
         level: TraceLevel,
     ) -> EmuResult<Self> {
-        let idx_mmap = create_mmap_file(idx_path, max_idx_records * size_of::<TraceRecord>())?;
-        let ext_mmap = create_mmap_file(ext_path, max_ext_records * size_of::<ExtRecord>())?;
+        let idx_buf = idx_path.as_ref().to_path_buf();
+        let ext_buf = ext_path.as_ref().to_path_buf();
+        let idx_mmap = create_mmap_file(&idx_buf, max_idx_records * size_of::<TraceRecord>())?;
+        let ext_mmap = create_mmap_file(&ext_buf, max_ext_records * size_of::<ExtRecord>())?;
 
         Ok(Self {
             sink: TraceSink::Mmap {
+                path: idx_buf,
                 mmap: idx_mmap,
                 max_records: max_idx_records,
                 written: 0,
             },
             ext_sink: ExtSink::Mmap {
+                path: ext_buf,
                 mmap: ext_mmap,
                 max_records: max_ext_records,
                 written: 0,
@@ -289,6 +297,7 @@ impl BinaryTracer {
                 mmap,
                 max_records,
                 written,
+                ..
             } => {
                 if *written < *max_records {
                     let offset = *written * size_of::<TraceRecord>();
@@ -322,6 +331,7 @@ impl BinaryTracer {
                 mmap,
                 max_records,
                 written,
+                ..
             } => {
                 if *written < *max_records {
                     let offset = *written * size_of::<ExtRecord>();
@@ -350,6 +360,42 @@ impl BinaryTracer {
         Ok(())
     }
 
+    /// 刷盘、解除内存映射并将 `.idx` / `.ext` 文件精确截断至实际写入字节数（消除尾部零填充）
+    pub fn finalize(&mut self) -> EmuResult<()> {
+        self.flush()?;
+        if matches!(self.sink, TraceSink::Mmap { .. }) {
+            let old = std::mem::replace(&mut self.sink, TraceSink::Memory(Vec::new()));
+            if let TraceSink::Mmap {
+                path,
+                mmap,
+                written,
+                ..
+            } = old
+            {
+                drop(mmap);
+                let exact_len = (written * size_of::<TraceRecord>()) as u64;
+                let file = OpenOptions::new().write(true).open(&path)?;
+                file.set_len(exact_len)?;
+            }
+        }
+        if matches!(self.ext_sink, ExtSink::Mmap { .. }) {
+            let old = std::mem::replace(&mut self.ext_sink, ExtSink::Disabled);
+            if let ExtSink::Mmap {
+                path,
+                mmap,
+                written,
+                ..
+            } = old
+            {
+                drop(mmap);
+                let exact_len = (written * size_of::<ExtRecord>()) as u64;
+                let file = OpenOptions::new().write(true).open(&path)?;
+                file.set_len(exact_len)?;
+            }
+        }
+        Ok(())
+    }
+
     /// 获取已记录的内存主索引切片（仅 Memory 后端有效）
     pub fn records(&self) -> &[TraceRecord] {
         match &self.sink {
@@ -372,6 +418,12 @@ impl BinaryTracer {
 
     pub fn format_ext_record(ext: &ExtRecord) -> String {
         format_ext_record(ext)
+    }
+}
+
+impl Drop for BinaryTracer {
+    fn drop(&mut self) {
+        let _ = self.finalize();
     }
 }
 
