@@ -5,7 +5,7 @@
 
 # ⚡ runidbg (`runidbg-arm64-emu-tracer`)
 
-**纯 Rust 实现的高性能 Android ARM64 `.so` 仿真器、零拷贝二进制 Tracer 与 QuickJS 脚本引擎**  
+**`Rust + unidbg = runidbg` · 纯 Rust 实现的高性能 Android ARM64 `.so` 仿真器、零拷贝二进制 Tracer 与 QuickJS 脚本引擎**  
 内置异步多核 RPC 服务 · MCP AI 逆向闭环 · GDB RSP 远程调试 · 统一设备画像模拟
 
 **简体中文** | [English](./README_EN.md) | [完整使用指南](./docs/GUIDE.md) | [AI Agent Skill](./docs/SKILL.md)

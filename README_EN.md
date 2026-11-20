@@ -5,7 +5,7 @@
 
 # ⚡ runidbg (`runidbg-arm64-emu-tracer`)
 
-**High-Performance Android ARM64 `.so` Emulator, Zero-Copy Binary Tracer & QuickJS Scripting Engine in Pure Rust**  
+**`Rust + unidbg = runidbg` · High-Performance Android ARM64 `.so` Emulator, Zero-Copy Binary Tracer & QuickJS Scripting Engine in Pure Rust**  
 Built-in Async Multi-Core RPC Server · MCP AI Reverse-Engineering Loop · GDB RSP Debugger · Unified Device Profile
 
 [简体中文](./README.md) | **English** | [Full Guide](./docs/GUIDE.md) | [AI Agent Skill](./docs/SKILL.md)
