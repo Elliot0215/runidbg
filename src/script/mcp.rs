@@ -1,11 +1,11 @@
 use std::io::{self, BufRead, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 
 use crate::script::JsSession;
-use crate::tracer::{BinaryTracer, TraceReader};
+use crate::tracer::{decode_instruction_with_reg, format_ascii_hint, BinaryTracer, TraceReader};
 
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -306,19 +306,41 @@ impl McpServer {
                 Ok(json!({ "result": result, "logs": logs }))
             }
             "trace_inspect" => {
-                let idx_path = req_str(args, "idxPath")?;
-                let ext_path = args.get("extPath").and_then(Value::as_str);
+                let idx_path_str = req_str(args, "idxPath")?;
+                let idx_path = Path::new(idx_path_str);
+                let ext_path = resolve_ext_path(idx_path, args.get("extPath").and_then(Value::as_str));
                 let action = args.get("action").and_then(Value::as_str).unwrap_or("dump");
+                let base_addr = args
+                    .get("base")
+                    .map(|v| parse_addr_val(Some(v)))
+                    .transpose()?
+                    .unwrap_or(0);
                 let skip = args.get("skip").and_then(Value::as_u64).unwrap_or(0) as usize;
                 let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(50) as usize;
-                let reader = TraceReader::open(Path::new(idx_path), ext_path.map(Path::new))?;
+                let reader = TraceReader::open(idx_path, ext_path.as_deref())?;
+
+                let fmt_rel = |pc: u64| -> String {
+                    if base_addr != 0 && pc >= base_addr {
+                        format!(" [+0x{:x}]", pc - base_addr)
+                    } else {
+                        String::new()
+                    }
+                };
 
                 let mut lines = Vec::new();
                 match action {
                     "search_val" => {
                         let target = parse_addr_val(args.get("value"))?;
-                        for (idx, rec) in reader.search_value(target).into_iter().skip(skip).take(limit) {
-                            lines.push(format!("#{idx:06} {}", BinaryTracer::decode_record(&rec)));
+                        for (idx, rec, reg_id) in
+                            reader.search_value_attributed(target).into_iter().skip(skip).take(limit)
+                        {
+                            let pc = rec.pc;
+                            let op = rec.opcode;
+                            lines.push(format!(
+                                "#{idx:06}{} {}",
+                                fmt_rel(pc),
+                                decode_instruction_with_reg(pc, op, Some((reg_id, target)))
+                            ));
                         }
                     }
                     "search_addr" => {
@@ -327,8 +349,41 @@ impl McpServer {
                             let seq = ext.seq_low32;
                             let pc = ext.pc;
                             lines.push(format!(
-                                "seq={seq} pc=0x{pc:016x} {}",
+                                "seq={seq} pc=0x{pc:016x}{} {}",
+                                fmt_rel(pc),
                                 BinaryTracer::format_ext_record(&ext).trim()
+                            ));
+                        }
+                    }
+                    "search_ascii" => {
+                        let ascii = req_str(args, "ascii")?;
+                        for hit in reader
+                            .search_mem_bytes(ascii.as_bytes())
+                            .into_iter()
+                            .skip(skip)
+                            .take(limit)
+                        {
+                            lines.push(format!(
+                                "seq={} pc=0x{:016x}{} [MEM W] addr=0x{:016x} len={} (\"{ascii}\")",
+                                hit.seq_low32,
+                                hit.pc,
+                                fmt_rel(hit.pc),
+                                hit.addr,
+                                hit.matched_len
+                            ));
+                        }
+                    }
+                    "search_bytes" => {
+                        let hex_str = req_str(args, "bytes")?;
+                        let pat = decode_hex_bytes(hex_str)?;
+                        for hit in reader.search_mem_bytes(&pat).into_iter().skip(skip).take(limit) {
+                            lines.push(format!(
+                                "seq={} pc=0x{:016x}{} [MEM W] addr=0x{:016x} len={}",
+                                hit.seq_low32,
+                                hit.pc,
+                                fmt_rel(hit.pc),
+                                hit.addr,
+                                hit.matched_len
                             ));
                         }
                     }
@@ -336,7 +391,29 @@ impl McpServer {
                         let end = reader.len().min(skip.saturating_add(limit));
                         for idx in skip..end {
                             if let Some(rec) = reader.get(idx) {
-                                lines.push(format!("#{idx:06} {}", BinaryTracer::decode_record(&rec)));
+                                let pc = rec.pc;
+                                let op = rec.opcode;
+                                let deltas = reader.reg_deltas_for(idx);
+                                let primary = deltas.first().copied();
+                                lines.push(format!(
+                                    "#{idx:06}{} {}",
+                                    fmt_rel(pc),
+                                    decode_instruction_with_reg(pc, op, primary)
+                                ));
+                                for &(reg_id, reg_val) in deltas.iter().skip(1) {
+                                    let name = if reg_id == 31 {
+                                        "SP".to_string()
+                                    } else {
+                                        format!("X{reg_id}")
+                                    };
+                                    let hint = format_ascii_hint(reg_val, 8).unwrap_or_default();
+                                    lines.push(format!("    [REG] {name} <- 0x{reg_val:016x}{hint}"));
+                                }
+                                if ext_path.is_some() {
+                                    for ext in reader.mem_events_for(idx) {
+                                        lines.push(BinaryTracer::format_ext_record(&ext));
+                                    }
+                                }
                             }
                         }
                     }
@@ -346,6 +423,92 @@ impl McpServer {
                     "totalExtRecords": reader.ext_len(),
                     "returned": lines.len(),
                     "lines": lines,
+                }))
+            }
+            "trace_calltree" => {
+                let idx_path_str = req_str(args, "idxPath")?;
+                let base_addr = args
+                    .get("base")
+                    .map(|v| parse_addr_val(Some(v)))
+                    .transpose()?
+                    .unwrap_or(0);
+                let max_depth = args.get("maxDepth").and_then(Value::as_u64).unwrap_or(4) as usize;
+                let min_insns = args.get("minInsns").and_then(Value::as_u64).unwrap_or(1000) as usize;
+                let limit = args.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
+                let reader = TraceReader::open(Path::new(idx_path_str), None)?;
+                let total = reader.len().max(1);
+                let all_nodes = reader.build_calltree();
+                let nodes: Vec<Value> = all_nodes
+                    .iter()
+                    .filter(|n| n.depth <= max_depth && (n.depth == 0 || n.insn_count() >= min_insns))
+                    .take(limit)
+                    .map(|n| {
+                        let cnt = n.insn_count();
+                        let pct = ((cnt as f64) * 1000.0 / (total as f64)).round() / 10.0;
+                        let target_off = (base_addr != 0 && n.target_pc >= base_addr)
+                            .then(|| format!("+0x{:x}", n.target_pc - base_addr));
+                        let caller_off = (base_addr != 0 && n.caller_pc >= base_addr)
+                            .then(|| format!("+0x{:x}", n.caller_pc - base_addr));
+                        json!({
+                            "depth": n.depth,
+                            "startIdx": n.start_idx,
+                            "endIdx": n.end_idx,
+                            "insnCount": cnt,
+                            "percent": pct,
+                            "targetPc": n.target_pc,
+                            "targetHex": format!("0x{:016x}", n.target_pc),
+                            "targetOffset": target_off,
+                            "callerPc": n.caller_pc,
+                            "callerHex": format!("0x{:016x}", n.caller_pc),
+                            "callerOffset": caller_off,
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "totalRecords": reader.len(),
+                    "totalNodes": all_nodes.len(),
+                    "returned": nodes.len(),
+                    "nodes": nodes,
+                }))
+            }
+            "trace_crypto_scan" => {
+                let idx_path_str = req_str(args, "idxPath")?;
+                let idx_path = Path::new(idx_path_str);
+                let ext_path = resolve_ext_path(idx_path, args.get("extPath").and_then(Value::as_str));
+                let base_addr = args
+                    .get("base")
+                    .map(|v| parse_addr_val(Some(v)))
+                    .transpose()?
+                    .unwrap_or(0);
+                let reader = TraceReader::open(idx_path, ext_path.as_deref())?;
+                let groups: Vec<Value> = reader
+                    .scan_crypto()
+                    .into_iter()
+                    .map(|g| {
+                        let first_off = (base_addr != 0 && g.first_pc >= base_addr)
+                            .then(|| format!("+0x{:x}", g.first_pc - base_addr));
+                        let consts: Vec<String> = g
+                            .distinct_constants
+                            .iter()
+                            .map(|c| format!("0x{c:08x}"))
+                            .collect();
+                        json!({
+                            "algorithm": g.algorithm,
+                            "startIdx": g.start_idx,
+                            "endIdx": g.end_idx,
+                            "firstPc": g.first_pc,
+                            "firstPcHex": format!("0x{:016x}", g.first_pc),
+                            "firstPcOffset": first_off,
+                            "hitCount": g.hit_count,
+                            "distinctConstants": consts,
+                        })
+                    })
+                    .collect();
+                Ok(json!({
+                    "totalRecords": reader.len(),
+                    "totalExtRecords": reader.ext_len(),
+                    "hitGroupCount": groups.len(),
+                    "groups": groups,
                 }))
             }
             "emu_disasm" => {
@@ -503,6 +666,18 @@ impl McpServer {
             }
             _ => Err(anyhow!("未知的 MCP 工具: {name}")),
         }
+    }
+}
+
+fn resolve_ext_path(idx_path: &Path, explicit: Option<&str>) -> Option<PathBuf> {
+    if let Some(p) = explicit {
+        return Some(PathBuf::from(p));
+    }
+    let sibling = idx_path.with_extension("ext");
+    if sibling != idx_path && sibling.is_file() {
+        Some(sibling)
+    } else {
+        None
     }
 }
 
@@ -665,18 +840,49 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "trace_inspect",
-            "description": "Inspect offline binary trace files (trace.idx / trace.ext) via dump, search_val, or search_addr.",
+            "description": "Inspect offline binary trace files (trace.idx / trace.ext) via dump (with post-exec reg attribution & ASCII hints), search_val, search_addr, search_ascii, or search_bytes.",
             "inputSchema": {
                 "type": "object",
                 "required": ["idxPath"],
                 "properties": {
                     "idxPath": { "type": "string" },
-                    "extPath": { "type": "string" },
-                    "action": { "type": "string", "enum": ["dump", "search_val", "search_addr"], "default": "dump" },
+                    "extPath": { "type": "string", "description": "Optional trace.ext path (auto-detected if sibling .ext exists)" },
+                    "base": { "description": "Optional module base address for [+0x...] offset annotations (int or '0x...')" },
+                    "action": { "type": "string", "enum": ["dump", "search_val", "search_addr", "search_ascii", "search_bytes"], "default": "dump" },
                     "value": { "description": "Target register value for search_val (int or '0x...')" },
                     "addr": { "description": "Target memory address for search_addr (int or '0x...')" },
+                    "ascii": { "type": "string", "description": "Target ASCII substring in MemWrite stream for search_ascii" },
+                    "bytes": { "type": "string", "description": "Target hex byte sequence in MemWrite stream for search_bytes" },
                     "skip": { "type": "integer", "default": 0 },
                     "limit": { "type": "integer", "default": 50 }
+                }
+            }
+        },
+        {
+            "name": "trace_calltree",
+            "description": "Build a chronological BL/BLR/RET call tree from an offline trace.idx file (automatically folds external .plt calls) to identify major execution phases and instruction budgets.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["idxPath"],
+                "properties": {
+                    "idxPath": { "type": "string" },
+                    "base": { "description": "Optional module base address for [+0x...] offset annotations (int or '0x...')" },
+                    "maxDepth": { "type": "integer", "default": 4 },
+                    "minInsns": { "type": "integer", "default": 1000 },
+                    "limit": { "type": "integer", "default": 200 }
+                }
+            }
+        },
+        {
+            "name": "trace_crypto_scan",
+            "description": "Scan an offline binary trace (trace.idx + optional trace.ext) for standard cryptographic constants (MD5, SHA-1, SHA-256, SM3, SM4, AES, ChaCha20/Salsa20, CRC32, TEA/XTEA, MurmurHash3) and return grouped invocation windows.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["idxPath"],
+                "properties": {
+                    "idxPath": { "type": "string" },
+                    "extPath": { "type": "string", "description": "Optional trace.ext path (auto-detected if sibling .ext exists)" },
+                    "base": { "description": "Optional module base address for [+0x...] offset annotations (int or '0x...')" }
                 }
             }
         },

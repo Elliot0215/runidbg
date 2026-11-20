@@ -1,6 +1,6 @@
 ---
 name: runidbg
-description: Use runidbg (runidbg-cli) to emulate Android ARM64 .so libraries, write QuickJS JNI/Hook scripts, diagnose missing Android environments with EnvDiag, capture high-speed binary instruction traces (dump/search/stats/IDA/BN), launch multi-core HTTP/JSON-RPC signing services, connect via MCP (15 tools), or debug with GDB RSP.
+description: Use runidbg (runidbg-cli) to emulate Android ARM64 .so libraries, write QuickJS JNI/Hook scripts, diagnose missing Android environments with EnvDiag, capture high-speed binary instruction traces (dump/search/stats/calltree/crypto-scan/IDA/BN), launch multi-core HTTP/JSON-RPC signing services, connect via MCP (17 tools), or debug with GDB RSP.
 ---
 
 # runidbg Agent Skill
@@ -109,11 +109,14 @@ const stats = emu.trace.stop(); // { records, extRecords, totalInsns, droppedIns
 ```
 Analyze offline with `runidbg-cli`:
 ```bash
-runidbg-cli stats  run.idx --base 0x40000000 --top 20
-runidbg-cli dump   run.idx --base 0x40000000 --skip 0 --limit 50
-runidbg-cli search run.idx --base 0x40000000 --val 0x03000001
-runidbg-cli export-ida run.idx --base 0x40000000 --out ida_cov.py
-runidbg-cli export-bn  run.idx --base 0x40000000 --out bn_cov.py
+runidbg-cli stats       run.idx --base 0x40000000 --top 20
+runidbg-cli calltree    run.idx --base 0x40000000 --max-depth 4 --min-insns 1000
+runidbg-cli crypto-scan run.idx --base 0x40000000
+runidbg-cli dump        run.idx --base 0x40000000 --skip 0 --limit 50
+runidbg-cli search      run.idx --base 0x40000000 --val 0x03000001
+runidbg-cli search      run.idx --base 0x40000000 --ascii "8404" --limit 10
+runidbg-cli export-ida  run.idx --base 0x40000000 --out ida_cov.py
+runidbg-cli export-bn   run.idx --base 0x40000000 --out bn_cov.py
 ```
 
 ### Serving as Multi-Core HTTP/JSON-RPC 2.0 Service
@@ -124,10 +127,10 @@ runidbg-cli serve script.js --listen 127.0.0.1:8080 --workers auto --timeout-ms 
 ```
 
 ### Using MCP Tools (AI Agent Direct Control)
-Start MCP server via stdio (`runidbg-cli mcp --cwd .`) or Streamable HTTP (`runidbg-cli mcp --http 127.0.0.1:8090 --cwd .`). Available 15 tools:
+Start MCP server via stdio (`runidbg-cli mcp --cwd .`) or Streamable HTTP (`runidbg-cli mcp --http 127.0.0.1:8090 --cwd .`). Available 17 tools:
 - Lifecycle & Execution: `emu_create`, `emu_load`, `emu_jni_onload`, `emu_exports`, `emu_call`, `emu_eval_js`
 - Inspection & Memory: `emu_regs`, `emu_mem_read`, `emu_mem_scan`, `emu_disasm`
-- Tracing & Hooks: `emu_trace_call`, `trace_inspect`, `emu_hook_capture`
+- Tracing & Hooks: `emu_trace_call`, `trace_inspect` (`dump`/`search_val`/`search_addr`/`search_ascii`/`search_bytes`), `trace_calltree`, `trace_crypto_scan`, `emu_hook_capture`
 - Diagnostics: `emu_diag_missing`, `emu_last_crash`
 
 ## Guardrails & Best Practices

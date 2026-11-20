@@ -435,7 +435,9 @@ fn test_mcp_server_protocol_and_tools() {
         .expect("tools/list response");
     let list: Value = serde_json::from_str(&list_raw).unwrap();
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 15);
+    assert_eq!(tools.len(), 17);
+    assert!(tools.iter().any(|t| t["name"] == "trace_calltree"));
+    assert!(tools.iter().any(|t| t["name"] == "trace_crypto_scan"));
 
     // 5. emu_create -> emu_load -> emu_exports -> emu_call -> emu_mem_read -> emu_mem_scan -> emu_regs -> emu_eval_js
     let created = mcp_call(&mut server, 10, "emu_create", json!({}));
@@ -549,6 +551,57 @@ fn test_mcp_server_protocol_and_tools() {
         json!({ "emuId": emu_id, "action": "report" }),
     );
     assert!(diag_rep["patchJs"].is_string());
+
+    // 9.5. Phase 3: trace_calltree & trace_crypto_scan via offline trace file
+    let tmp_idx = std::env::temp_dir().join("runidbg_mcp_trace_test.idx");
+    let tmp_idx_str = tmp_idx.to_string_lossy().to_string();
+    let _ = mcp_call(
+        &mut server,
+        23,
+        "emu_eval_js",
+        json!({
+            "code": format!(
+                "(() => {{ \
+                    const e = __mcp.emus[{emu_id}]; \
+                    const m = __mcp.mods[{mod_id}].mod; \
+                    e.trace.start({{ output: {:?}, level: 'full', start: m.base, end: m.base + m.size, capacity: 4096 }}); \
+                    m.call('WebPGetDecoderVersion'); \
+                    return e.trace.stop(); \
+                }})()",
+                tmp_idx_str
+            )
+        }),
+    );
+
+    let calltree = mcp_call(
+        &mut server,
+        24,
+        "trace_calltree",
+        json!({ "idxPath": tmp_idx_str, "base": format!("0x{base:x}"), "maxDepth": 4, "minInsns": 1 }),
+    );
+    assert!(calltree["totalRecords"].as_u64().unwrap() >= 1);
+    assert!(calltree["returned"].as_u64().unwrap() >= 1);
+    assert!(calltree["nodes"][0]["targetOffset"].is_string());
+
+    let crypto = mcp_call(
+        &mut server,
+        25,
+        "trace_crypto_scan",
+        json!({ "idxPath": tmp_idx_str, "base": format!("0x{base:x}") }),
+    );
+    assert!(crypto["totalRecords"].as_u64().unwrap() >= 1);
+    assert!(crypto["groups"].is_array());
+
+    let inspected = mcp_call(
+        &mut server,
+        26,
+        "trace_inspect",
+        json!({ "idxPath": tmp_idx_str, "base": format!("0x{base:x}"), "action": "dump", "limit": 5 }),
+    );
+    assert!(inspected["returned"].as_u64().unwrap() >= 1);
+
+    let _ = std::fs::remove_file(&tmp_idx);
+    let _ = std::fs::remove_file(tmp_idx.with_extension("ext"));
 
     // 10. Phase 3: Streamable HTTP MCP
     let http_mcp = runidbg_arm64_emu_tracer::script::mcp::start_mcp_http_server("127.0.0.1:0", &root, None)
