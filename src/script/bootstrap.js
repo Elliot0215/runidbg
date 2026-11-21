@@ -227,6 +227,9 @@
         }
         return __native.emuCallAddr(emuId, toAddr(symOrAddr), rawArgs);
       },
+      runInit() {
+        __native.modRunInit(emuId, modId);
+      },
       _id: modId,
     };
   }
@@ -306,8 +309,9 @@
       }
 
       return {
-        load(path) {
-          const info = __native.emuLoad(emuId, String(path));
+        load(path, loadOpts = {}) {
+          const runInit = loadOpts && loadOpts.runInit === false ? false : true;
+          const info = __native.emuLoad(emuId, String(path), runInit);
           return makeModule(emuId, info);
         },
         loadApk(path) {
@@ -318,8 +322,9 @@
             libs: info.libs,
             assets: info.assets,
             signatureSize: info.signatureSize,
-            loadLib(libName) {
-              const modInfo = __native.emuLoadApkLib(emuId, String(libName));
+            loadLib(libName, loadOpts = {}) {
+              const runInit = loadOpts && loadOpts.runInit === false ? false : true;
+              const modInfo = __native.emuLoadApkLib(emuId, String(libName), runInit);
               return makeModule(emuId, modInfo);
             },
           };
@@ -485,6 +490,15 @@
             }
             return __native.jniNewByteArray(emuId, bytes);
           },
+          newCharArray(input) {
+            return __native.jniNewCharArray(emuId, input);
+          },
+          newIntArray(input) {
+            return __native.jniNewIntArray(emuId, input);
+          },
+          newLongArray(input) {
+            return __native.jniNewLongArray(emuId, input);
+          },
           newObject(className, fields) {
             return __native.jniNewObject(emuId, String(className), fields || null);
           },
@@ -514,6 +528,39 @@
           },
           getBytes(ref) {
             return __native.jniGetBytes(emuId, toAddr(ref)) ?? null;
+          },
+          getChars(ref) {
+            return __native.jniGetChars(emuId, toAddr(ref)) ?? null;
+          },
+          getInts(ref) {
+            return __native.jniGetInts(emuId, toAddr(ref)) ?? null;
+          },
+          getLongs(ref) {
+            return __native.jniGetLongs(emuId, toAddr(ref)) ?? null;
+          },
+          setField(objRef, fieldName, value, sig) {
+            __native.jniSetField(
+              emuId,
+              toAddr(objRef),
+              String(fieldName),
+              value,
+              sig !== undefined ? String(sig) : undefined
+            );
+          },
+          getField(objRef, fieldName) {
+            return __native.jniGetField(emuId, toAddr(objRef), String(fieldName));
+          },
+          setStaticField(className, fieldName, value, sig) {
+            __native.jniSetStaticField(
+              emuId,
+              String(className),
+              String(fieldName),
+              value,
+              sig !== undefined ? String(sig) : undefined
+            );
+          },
+          getStaticField(className, fieldName) {
+            return __native.jniGetStaticField(emuId, String(className), String(fieldName));
           },
           pushLocalFrame() {
             __native.jniPushLocalFrame(emuId);

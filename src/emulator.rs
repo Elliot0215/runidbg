@@ -222,13 +222,32 @@ impl AndroidEmulator {
 
     /// 从文件路径加载目标 `.so`（自动解析 `DT_NEEDED`、执行重定位与 `.init_array`）
     pub fn load_library(&mut self, path: impl AsRef<Path>) -> EmuResult<LoadedModule> {
+        self.load_library_with_init(path, true)
+    }
+
+    /// 从文件路径加载目标 `.so`（可选是否立即执行 `.init_array`，便于在构造器运行前挂 Hook）
+    pub fn load_library_with_init(
+        &mut self,
+        path: impl AsRef<Path>,
+        run_init_array: bool,
+    ) -> EmuResult<LoadedModule> {
         let path_ref = path.as_ref();
         let name = path_ref
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "target.so".to_string());
         let bytes = std::fs::read(path_ref)?;
-        self.load_library_bytes(&name, &bytes, true)
+        self.load_library_bytes(&name, &bytes, run_init_array)
+    }
+
+    /// 手动执行指定模块的 `DT_INIT` / `.init_array` 构造器（配合 `load_library_with_init(..., false)` 使用）
+    pub fn run_module_init_array(&mut self, module: &LoadedModule) -> EmuResult<()> {
+        for &init_fn in &module.init_array {
+            if init_fn != 0 {
+                let _ = self.call_address(init_fn, &[]);
+            }
+        }
+        Ok(())
     }
 
     /// 从内存字节流加载目标 `.so`（可选是否立即执行 `.init_array`）
@@ -557,12 +576,20 @@ impl AndroidEmulator {
     /// 加载先前通过 `load_apk` 注册到内存中的 `lib/arm64-v8a/<lib_name>`
     #[cfg(feature = "apk")]
     pub fn load_apk_library(&mut self, lib_name: &str) -> EmuResult<LoadedModule> {
+        self.load_apk_library_with_init(lib_name, true)
+    }
+
+    pub fn load_apk_library_with_init(
+        &mut self,
+        lib_name: &str,
+        run_init_array: bool,
+    ) -> EmuResult<LoadedModule> {
         let bytes = self
             .linker
             .get_memory_library(lib_name)
             .ok_or_else(|| EmuError::InvalidElf(format!("APK 中未找到 arm64-v8a 库: {lib_name}")))?
             .to_vec();
-        self.load_library_bytes(lib_name, &bytes, true)
+        self.load_library_bytes(lib_name, &bytes, run_init_array)
     }
 
     pub fn tracer(&self) -> &BinaryTracer {

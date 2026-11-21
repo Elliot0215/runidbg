@@ -156,6 +156,30 @@ pub enum HleBuiltin {
     Htonl,
     Getifaddrs,
     Freeifaddrs,
+    // C stdio (FILE*) 完整 HLE（直连 VirtualFs FD 表）
+    Fopen,
+    Fdopen,
+    Freopen,
+    Fclose,
+    Fread,
+    Fwrite,
+    Fgets,
+    FgetsChk,
+    Fputs,
+    Fgetc,
+    Fputc,
+    Ungetc,
+    Fseek,
+    Ftell,
+    Rewind,
+    Feof,
+    Ferror,
+    Clearerr,
+    Fflush,
+    Fileno,
+    Fscanf,
+    Getline,
+    Getdelim,
     // 未实现的外部符号占位桩（触发时打印告警并返回 0，避免直接跳空指针崩溃）
     UnimplementedStub(String),
 }
@@ -197,7 +221,7 @@ impl HleBuiltin {
             "__sprintf_chk" => Some(Self::SprintfChk),
             "asprintf" => Some(Self::Asprintf),
             "vasprintf" => Some(Self::Vasprintf),
-            "sscanf" => Some(Self::Sscanf),
+            "sscanf" | "__isoc99_sscanf" => Some(Self::Sscanf),
             "vsnprintf" => Some(Self::Vsnprintf),
             "__vsnprintf_chk" => Some(Self::VsnprintfChk),
             "atoi" => Some(Self::Atoi),
@@ -313,6 +337,29 @@ impl HleBuiltin {
             "htonl" | "ntohl" => Some(Self::Htonl),
             "getifaddrs" => Some(Self::Getifaddrs),
             "freeifaddrs" => Some(Self::Freeifaddrs),
+            "fopen" | "fopen64" => Some(Self::Fopen),
+            "fdopen" => Some(Self::Fdopen),
+            "freopen" | "freopen64" => Some(Self::Freopen),
+            "fclose" => Some(Self::Fclose),
+            "fread" | "__fread_chk" | "fread_unlocked" => Some(Self::Fread),
+            "fwrite" | "__fwrite_chk" | "fwrite_unlocked" => Some(Self::Fwrite),
+            "fgets" | "fgets_unlocked" => Some(Self::Fgets),
+            "__fgets_chk" => Some(Self::FgetsChk),
+            "fputs" | "fputs_unlocked" => Some(Self::Fputs),
+            "fgetc" | "getc" | "fgetc_unlocked" | "getc_unlocked" => Some(Self::Fgetc),
+            "fputc" | "putc" | "fputc_unlocked" | "putc_unlocked" => Some(Self::Fputc),
+            "ungetc" => Some(Self::Ungetc),
+            "fseek" | "fseeko" | "fseeko64" => Some(Self::Fseek),
+            "ftell" | "ftello" | "ftello64" => Some(Self::Ftell),
+            "rewind" => Some(Self::Rewind),
+            "feof" | "feof_unlocked" => Some(Self::Feof),
+            "ferror" | "ferror_unlocked" => Some(Self::Ferror),
+            "clearerr" | "clearerr_unlocked" => Some(Self::Clearerr),
+            "fflush" | "fflush_unlocked" | "setvbuf" | "setbuf" => Some(Self::Fflush),
+            "fileno" => Some(Self::Fileno),
+            "fscanf" | "__isoc99_fscanf" => Some(Self::Fscanf),
+            "getline" => Some(Self::Getline),
+            "getdelim" => Some(Self::Getdelim),
             "flock"
             | "fcntl"
             | "ioctl"
@@ -346,7 +393,6 @@ impl HleBuiltin {
             | "openlog"
             | "closelog"
             | "syslog"
-            | "fflush"
             | "pthread_create"
             | "pthread_detach"
             | "pthread_join"
@@ -383,6 +429,14 @@ impl HleBuiltin {
     }
 }
 
+#[derive(Debug, Clone)]
+struct StdioStream {
+    fd: i32,
+    eof: bool,
+    err: bool,
+    ungetc_buf: Option<u8>,
+}
+
 /// HLE 跳板表：将外部符号或热点函数映射到 `TRAMPOLINE_BASE + slot * 4`
 pub struct TrampolineTable {
     slots: Vec<HleBuiltin>,
@@ -390,6 +444,7 @@ pub struct TrampolineTable {
     pthread_keys: HashMap<u32, u64>,
     next_pthread_key: u32,
     mmap_backings: HashMap<u64, MmapFileBacking>,
+    stdio_streams: HashMap<u64, StdioStream>,
     pub errno_addr: u64,
     initialized: bool,
 }
@@ -419,6 +474,7 @@ impl TrampolineTable {
             pthread_keys: HashMap::new(),
             next_pthread_key: 1,
             mmap_backings: HashMap::new(),
+            stdio_streams: HashMap::new(),
             errno_addr: crate::cpu::TLS_BASE + 0x100,
             initialized: false,
         }
@@ -518,6 +574,10 @@ fn parse_c_i64(s: &str) -> i64 {
 
 /// 精简版 AAPCS64 `sscanf(input, fmt, ...)`（支持 `%d/%i/%u/%ld/%lu/%lld/%llu/%x/%X/%s/%c`）
 fn run_guest_sscanf<D>(uc: &mut Unicorn<'_, D>, input: &str, fmt: &str) -> i32 {
+    run_guest_scanf_core(uc, input, fmt).0
+}
+
+fn run_guest_scanf_core<D>(uc: &mut Unicorn<'_, D>, input: &str, fmt: &str) -> (i32, usize) {
     let mut in_pos = 0usize;
     let in_bytes = input.as_bytes();
     let fmt_bytes = fmt.as_bytes();
@@ -686,10 +746,106 @@ fn run_guest_sscanf<D>(uc: &mut Unicorn<'_, D>, input: &str, fmt: &str) -> i32 {
                 }
                 in_pos += count;
             }
+            b'[' => {
+                // 解析 scanset `%[...]` 或 `%[^...]`（常用于解析 `/proc/self/maps`、`/proc/cpuinfo` 等）
+                let negate = if fi < fmt_bytes.len() && fmt_bytes[fi] == b'^' {
+                    fi += 1;
+                    true
+                } else {
+                    false
+                };
+                let mut set = [false; 256];
+                let mut first = true;
+                while fi < fmt_bytes.len() {
+                    let b = fmt_bytes[fi];
+                    fi += 1;
+                    if b == b']' && !first {
+                        break;
+                    }
+                    first = false;
+                    if fi + 1 < fmt_bytes.len() && fmt_bytes[fi] == b'-' && fmt_bytes[fi + 1] != b']'
+                    {
+                        let end_b = fmt_bytes[fi + 1];
+                        fi += 2;
+                        for c in b..=end_b {
+                            set[c as usize] = true;
+                        }
+                    } else {
+                        set[b as usize] = true;
+                    }
+                }
+                let max_end = width
+                    .map(|w| in_pos.saturating_add(w).min(in_bytes.len()))
+                    .unwrap_or(in_bytes.len());
+                let start = in_pos;
+                while in_pos < max_end {
+                    let in_set = set[in_bytes[in_pos] as usize];
+                    if (negate && in_set) || (!negate && !in_set) {
+                        break;
+                    }
+                    in_pos += 1;
+                }
+                if in_pos == start {
+                    break;
+                }
+                if !suppress {
+                    let dst = read_arg_ptr(uc, arg_idx);
+                    arg_idx += 1;
+                    if dst != 0 {
+                        let mut out = in_bytes[start..in_pos].to_vec();
+                        out.push(0);
+                        let _ = uc.mem_write(dst, &out);
+                    }
+                    matched += 1;
+                }
+            }
+            b'f' | b'g' | b'e' => {
+                while in_pos < in_bytes.len() && in_bytes[in_pos].is_ascii_whitespace() {
+                    in_pos += 1;
+                }
+                let max_end = width
+                    .map(|w| in_pos.saturating_add(w).min(in_bytes.len()))
+                    .unwrap_or(in_bytes.len());
+                let start = in_pos;
+                if in_pos < max_end && matches!(in_bytes[in_pos], b'+' | b'-') {
+                    in_pos += 1;
+                }
+                while in_pos < max_end
+                    && (in_bytes[in_pos].is_ascii_digit()
+                        || matches!(in_bytes[in_pos], b'.' | b'e' | b'E' | b'+' | b'-'))
+                {
+                    in_pos += 1;
+                }
+                if in_pos == start {
+                    break;
+                }
+                let val: f64 = input[start..in_pos].parse().unwrap_or(0.0);
+                if !suppress {
+                    let dst = read_arg_ptr(uc, arg_idx);
+                    arg_idx += 1;
+                    if dst != 0 {
+                        if is_long {
+                            let _ = uc.mem_write(dst, &val.to_le_bytes());
+                        } else {
+                            let _ = uc.mem_write(dst, &(val as f32).to_le_bytes());
+                        }
+                    }
+                    matched += 1;
+                }
+            }
+            b'n' => {
+                if !suppress {
+                    let dst = read_arg_ptr(uc, arg_idx);
+                    arg_idx += 1;
+                    if dst != 0 {
+                        let _ = uc.mem_write(dst, &(in_pos as i32).to_le_bytes());
+                    }
+                }
+            }
             _ => break,
         }
     }
-    matched
+    (matched, in_pos)
 }
 
 /// 按 AAPCS64 规则解析 `snprintf`/`sprintf` 变参格式化字符串
@@ -1930,7 +2086,24 @@ where
         }
         HleBuiltin::Fprintf => {
             let fmt = read_guest_cstr(uc, x1, 512);
-            fmt.len() as u64
+            let rendered = format_guest_printf(uc, &fmt, 2);
+            let bytes = rendered.as_bytes();
+            let (table, _, vfs) = get_state(uc.get_data_mut());
+            if let Some(stream) = table.stdio_streams.get_mut(&x0) {
+                stream.ungetc_buf = None;
+                let fd = stream.fd;
+                let written = vfs.write(fd, bytes);
+                if written < 0 {
+                    if let Some(s) = table.stdio_streams.get_mut(&x0) {
+                        s.err = true;
+                    }
+                    (-1i64) as u64
+                } else {
+                    written as u64
+                }
+            } else {
+                bytes.len() as u64
+            }
         }
         HleBuiltin::Ctype(op) => {
             let c = (x0 & 0xFF) as u8;
@@ -2431,6 +2604,388 @@ where
             }
             0
         }
+        HleBuiltin::Fopen => {
+            let path = read_guest_cstr(uc, x0, 1024);
+            let mode = read_guest_cstr(uc, x1, 32);
+            let (flags, append) = stdio_mode_to_flags(&mode);
+            let fp = {
+                let (table, mem, vfs) = get_state(uc.get_data_mut());
+                let fd = vfs.open_with_flags(&path, flags, mem);
+                if fd < 0 {
+                    0
+                } else {
+                    if append {
+                        let _ = vfs.lseek(fd as i32, 0, 2);
+                    }
+                    let handle = mem.alloc_heap(16).unwrap_or(0);
+                    if handle != 0 {
+                        table.stdio_streams.insert(
+                            handle,
+                            StdioStream {
+                                fd: fd as i32,
+                                eof: false,
+                                err: false,
+                                ungetc_buf: None,
+                            },
+                        );
+                    }
+                    handle
+                }
+            };
+            if fp != 0 {
+                let fd_val = get_state(uc.get_data_mut())
+                    .0
+                    .stdio_streams
+                    .get(&fp)
+                    .map(|s| s.fd)
+                    .unwrap_or(-1);
+                let _ = uc.mem_write(fp, &fd_val.to_le_bytes());
+            }
+            fp
+        }
+        HleBuiltin::Fdopen => {
+            let fd = x0 as i32;
+            let fp = {
+                let (table, mem, _) = get_state(uc.get_data_mut());
+                if fd < 0 {
+                    0
+                } else {
+                    let handle = mem.alloc_heap(16).unwrap_or(0);
+                    if handle != 0 {
+                        table.stdio_streams.insert(
+                            handle,
+                            StdioStream {
+                                fd,
+                                eof: false,
+                                err: false,
+                                ungetc_buf: None,
+                            },
+                        );
+                    }
+                    handle
+                }
+            };
+            if fp != 0 {
+                let _ = uc.mem_write(fp, &fd.to_le_bytes());
+            }
+            fp
+        }
+        HleBuiltin::Freopen => {
+            let path = read_guest_cstr(uc, x0, 1024);
+            let mode = read_guest_cstr(uc, x1, 32);
+            let fp = x2;
+            let (flags, append) = stdio_mode_to_flags(&mode);
+            let (table, mem, vfs) = get_state(uc.get_data_mut());
+            if let Some(old) = table.stdio_streams.get(&fp).cloned() {
+                let _ = vfs.close(old.fd);
+            }
+            let fd = vfs.open_with_flags(&path, flags, mem);
+            if fd < 0 {
+                0
+            } else {
+                if append {
+                    let _ = vfs.lseek(fd as i32, 0, 2);
+                }
+                let target = if fp != 0 {
+                    fp
+                } else {
+                    mem.alloc_heap(16).unwrap_or(0)
+                };
+                if target != 0 {
+                    table.stdio_streams.insert(
+                        target,
+                        StdioStream {
+                            fd: fd as i32,
+                            eof: false,
+                            err: false,
+                            ungetc_buf: None,
+                        },
+                    );
+                }
+                target
+            }
+        }
+        HleBuiltin::Fclose => {
+            let (table, mem, vfs) = get_state(uc.get_data_mut());
+            if let Some(st) = table.stdio_streams.remove(&x0) {
+                let _ = vfs.close(st.fd);
+                mem.free_heap(x0);
+                0
+            } else {
+                0
+            }
+        }
+        HleBuiltin::Fread => {
+            // size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
+            let dst = x0;
+            let elem_size = x1 as usize;
+            let nmemb = x2 as usize;
+            let fp = x3;
+            let total = elem_size.saturating_mul(nmemb).min(16 * 1024 * 1024);
+            if elem_size == 0 || total == 0 || dst == 0 {
+                0
+            } else {
+                let data = {
+                    let (table, _, vfs) = get_state(uc.get_data_mut());
+                    stdio_read_chunk(table, vfs, fp, total)
+                };
+                match data {
+                    Some(bytes) => {
+                        if !bytes.is_empty() {
+                            let _ = uc.mem_write(dst, &bytes);
+                        }
+                        (bytes.len() / elem_size) as u64
+                    }
+                    None => 0,
+                }
+            }
+        }
+        HleBuiltin::Fwrite => {
+            let src = x0;
+            let elem_size = x1 as usize;
+            let nmemb = x2 as usize;
+            let fp = x3;
+            let total = elem_size.saturating_mul(nmemb).min(16 * 1024 * 1024);
+            if elem_size == 0 || total == 0 || src == 0 {
+                0
+            } else {
+                let mut buf = vec![0u8; total];
+                if uc.mem_read(src, &mut buf).is_err() {
+                    0
+                } else {
+                    let (table, _, vfs) = get_state(uc.get_data_mut());
+                    let fd = table.stdio_streams.get(&fp).map(|s| s.fd).unwrap_or(1);
+                    let written = vfs.write(fd, &buf);
+                    if written <= 0 {
+                        0
+                    } else {
+                        (written as usize / elem_size) as u64
+                    }
+                }
+            }
+        }
+        HleBuiltin::Fgets | HleBuiltin::FgetsChk => {
+            // fgets(buf, size, fp)
+            // Bionic: __fgets_chk(buf, size, fp, dst_len)
+            // glibc:  __fgets_chk(buf, dst_len, size, fp)
+            let dst = x0;
+            let (max_size, fp) = if matches!(builtin, HleBuiltin::FgetsChk) {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                if table.stdio_streams.contains_key(&x2) {
+                    ((x1 as i32).max(0) as usize, x2)
+                } else {
+                    ((x2 as i32).max(0) as usize, x3)
+                }
+            } else {
+                ((x1 as i32).max(0) as usize, x2)
+            };
+            if dst == 0 || max_size == 0 {
+                0
+            } else if max_size == 1 {
+                let _ = uc.mem_write(dst, &[0u8]);
+                dst
+            } else {
+                let line = {
+                    let (table, _, vfs) = get_state(uc.get_data_mut());
+                    stdio_read_line(table, vfs, fp, max_size - 1, b'\n')
+                };
+                match line {
+                    Some(mut bytes) if !bytes.is_empty() => {
+                        bytes.push(0);
+                        let _ = uc.mem_write(dst, &bytes);
+                        dst
+                    }
+                    _ => 0,
+                }
+            }
+        }
+        HleBuiltin::Getline | HleBuiltin::Getdelim => {
+            // ssize_t getline(char **lineptr, size_t *n, FILE *stream)
+            // ssize_t getdelim(char **lineptr, size_t *n, int delim, FILE *stream)
+            let lineptr_ptr = x0;
+            let n_ptr = x1;
+            let (delim, fp) = if matches!(builtin, HleBuiltin::Getdelim) {
+                (x2 as u8, x3)
+            } else {
+                (b'\n', x2)
+            };
+            let line = {
+                let (table, _, vfs) = get_state(uc.get_data_mut());
+                stdio_read_line(table, vfs, fp, 64 * 1024, delim)
+            };
+            match line {
+                Some(mut bytes) if !bytes.is_empty() => {
+                    let len = bytes.len();
+                    bytes.push(0);
+                    let cur_buf = if lineptr_ptr != 0 {
+                        read_guest_u64(uc, lineptr_ptr)
+                    } else {
+                        0
+                    };
+                    let cur_cap = if n_ptr != 0 {
+                        read_guest_u64(uc, n_ptr) as usize
+                    } else {
+                        0
+                    };
+                    let buf_ptr = if cur_buf != 0 && cur_cap >= bytes.len() {
+                        cur_buf
+                    } else {
+                        let new_cap = bytes.len().max(128) as u64;
+                        let new_ptr = {
+                            let (_, mem, _) = get_state(uc.get_data_mut());
+                            mem.alloc_heap(new_cap).unwrap_or(0)
+                        };
+                        if new_ptr != 0 {
+                            if lineptr_ptr != 0 {
+                                let _ = uc.mem_write(lineptr_ptr, &new_ptr.to_le_bytes());
+                            }
+                            if n_ptr != 0 {
+                                let _ = uc.mem_write(n_ptr, &new_cap.to_le_bytes());
+                            }
+                        }
+                        new_ptr
+                    };
+                    if buf_ptr != 0 {
+                        let _ = uc.mem_write(buf_ptr, &bytes);
+                        len as u64
+                    } else {
+                        (-1i64) as u64
+                    }
+                }
+                _ => (-1i64) as u64,
+            }
+        }
+        HleBuiltin::Fputs => {
+            let s = read_guest_cstr(uc, x0, 65536);
+            let fp = x1;
+            let (table, _, vfs) = get_state(uc.get_data_mut());
+            let fd = table.stdio_streams.get(&fp).map(|st| st.fd).unwrap_or(1);
+            let w = vfs.write(fd, s.as_bytes());
+            if w < 0 { (-1i64) as u64 } else { w as u64 }
+        }
+        HleBuiltin::Fgetc => {
+            let (table, _, vfs) = get_state(uc.get_data_mut());
+            match stdio_read_chunk(table, vfs, x0, 1) {
+                Some(b) if !b.is_empty() => b[0] as u64,
+                _ => (-1i64) as u64,
+            }
+        }
+        HleBuiltin::Fputc => {
+            let ch = x0 as u8;
+            let fp = x1;
+            let (table, _, vfs) = get_state(uc.get_data_mut());
+            let fd = table.stdio_streams.get(&fp).map(|st| st.fd).unwrap_or(1);
+            if vfs.write(fd, &[ch]) == 1 {
+                ch as u64
+            } else {
+                (-1i64) as u64
+            }
+        }
+        HleBuiltin::Ungetc => {
+            let ch = x0 as i32;
+            let fp = x1;
+            if ch < 0 {
+                (-1i64) as u64
+            } else {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                if let Some(st) = table.stdio_streams.get_mut(&fp) {
+                    st.ungetc_buf = Some(ch as u8);
+                    st.eof = false;
+                    (ch as u8) as u64
+                } else {
+                    (-1i64) as u64
+                }
+            }
+        }
+        HleBuiltin::Fseek => {
+            let fp = x0;
+            let offset = x1 as i64;
+            let whence = x2 as i32;
+            let (table, _, vfs) = get_state(uc.get_data_mut());
+            if let Some(st) = table.stdio_streams.get_mut(&fp) {
+                st.ungetc_buf = None;
+                st.eof = false;
+                if vfs.lseek(st.fd, offset, whence) >= 0 {
+                    0
+                } else {
+                    (-1i64) as u64
+                }
+            } else {
+                (-1i64) as u64
+            }
+        }
+        HleBuiltin::Ftell => {
+            let (table, _, vfs) = get_state(uc.get_data_mut());
+            if let Some(st) = table.stdio_streams.get(&x0) {
+                let pos = vfs.lseek(st.fd, 0, 1);
+                if pos < 0 {
+                    (-1i64) as u64
+                } else if st.ungetc_buf.is_some() && pos > 0 {
+                    (pos - 1) as u64
+                } else {
+                    pos as u64
+                }
+            } else {
+                (-1i64) as u64
+            }
+        }
+        HleBuiltin::Rewind => {
+            let (table, _, vfs) = get_state(uc.get_data_mut());
+            if let Some(st) = table.stdio_streams.get_mut(&x0) {
+                st.ungetc_buf = None;
+                st.eof = false;
+                st.err = false;
+                let _ = vfs.lseek(st.fd, 0, 0);
+            }
+            0
+        }
+        HleBuiltin::Feof => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            u64::from(table.stdio_streams.get(&x0).is_some_and(|s| s.eof))
+        }
+        HleBuiltin::Ferror => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            u64::from(table.stdio_streams.get(&x0).is_some_and(|s| s.err))
+        }
+        HleBuiltin::Clearerr => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            if let Some(st) = table.stdio_streams.get_mut(&x0) {
+                st.eof = false;
+                st.err = false;
+            }
+            0
+        }
+        HleBuiltin::Fflush => 0,
+        HleBuiltin::Fileno => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            table
+                .stdio_streams
+                .get(&x0)
+                .map(|s| s.fd as i64 as u64)
+                .unwrap_or((-1i64) as u64)
+        }
+        HleBuiltin::Fscanf => {
+            // int fscanf(FILE *stream, const char *format, ...)
+            let fp = x0;
+            let fmt = read_guest_cstr(uc, x1, 1024);
+            let chunk = {
+                let (table, _, vfs) = get_state(uc.get_data_mut());
+                stdio_read_chunk(table, vfs, fp, 4096)
+            };
+            match chunk {
+                Some(bytes) if !bytes.is_empty() => {
+                    let text = String::from_utf8_lossy(&bytes);
+                    let (matched, consumed) = run_guest_scanf_core(uc, &text, &fmt);
+                    let excess = bytes.len().saturating_sub(consumed);
+                    if excess > 0 {
+                        let (table, _, vfs) = get_state(uc.get_data_mut());
+                        stdio_seek_back(table, vfs, fp, excess);
+                    }
+                    matched as i64 as u64
+                }
+                _ => (-1i64) as u64, // EOF
+            }
+        }
         HleBuiltin::UnimplementedStub(sym) => {
             let (_, _, vfs) = get_state(uc.get_data_mut());
             vfs.breadcrumbs()
@@ -2447,4 +3002,80 @@ where
     };
 
     let _ = uc.reg_write(RegisterARM64::X0, ret);
+}
+
+fn stdio_mode_to_flags(mode: &str) -> (u32, bool) {
+    let m = mode.trim();
+    if m.starts_with('w') {
+        (crate::os::vfs::O_CREAT | crate::os::vfs::O_TRUNC, false)
+    } else if m.starts_with('a') {
+        (crate::os::vfs::O_CREAT, true)
+    } else {
+        (0, false)
+    }
+}
+
+fn stdio_read_chunk(
+    table: &mut TrampolineTable,
+    vfs: &mut VirtualFs,
+    fp: u64,
+    max_len: usize,
+) -> Option<Vec<u8>> {
+    let st = table.stdio_streams.get_mut(&fp)?;
+    if max_len == 0 {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity(max_len.min(4096));
+    if let Some(b) = st.ungetc_buf.take() {
+        out.push(b);
+    }
+    let rem = max_len.saturating_sub(out.len());
+    if rem > 0 {
+        match vfs.read(st.fd, rem) {
+            Ok(bytes) => {
+                if bytes.len() < rem {
+                    st.eof = true;
+                }
+                out.extend_from_slice(&bytes);
+            }
+            Err(_) => {
+                st.err = true;
+                return None;
+            }
+        }
+    }
+    Some(out)
+}
+
+fn stdio_seek_back(table: &mut TrampolineTable, vfs: &mut VirtualFs, fp: u64, back_bytes: usize) {
+    if back_bytes == 0 {
+        return;
+    }
+    if let Some(st) = table.stdio_streams.get_mut(&fp) {
+        let _ = vfs.lseek(st.fd, -(back_bytes as i64), 1);
+        st.eof = false;
+    }
+}
+
+fn stdio_read_line(
+    table: &mut TrampolineTable,
+    vfs: &mut VirtualFs,
+    fp: u64,
+    max_bytes: usize,
+    delim: u8,
+) -> Option<Vec<u8>> {
+    let chunk = stdio_read_chunk(table, vfs, fp, max_bytes)?;
+    if chunk.is_empty() {
+        return None;
+    }
+    if let Some(pos) = chunk.iter().position(|&b| b == delim) {
+        let keep = pos + 1;
+        let excess = chunk.len() - keep;
+        if excess > 0 {
+            stdio_seek_back(table, vfs, fp, excess);
+        }
+        Some(chunk[..keep].to_vec())
+    } else {
+        Some(chunk)
+    }
 }

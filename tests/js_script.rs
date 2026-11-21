@@ -446,3 +446,204 @@ fn js_v2_syscall_hook_fs_and_require() {
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
 
+#[test]
+fn js_reentrant_hook_attach_and_detach_inside_callback() {
+    let script = r#"
+        const emu = Emu.create({ packageName: "com.test.reentrant", hleAccel: true });
+        // 使用已映射的 r-xp cpu_init 页尾部放置两段测试用 ARM64 代码
+        const codeBase = 0xdead1100;
+
+        // outer(cb_addr, val): stp x29,x30,[sp,#-16]!; mov x2,x0; mov x0,x1; blr x2; ldp x29,x30,[sp],#16; ret
+        const outer = codeBase;
+        const outerInsns = [
+            0xA9BF7BFD,
+            0xAA0003E2,
+            0xAA0103E0,
+            0xD63F0040,
+            0xA8C17BFD,
+            0xD65F03C0,
+        ];
+        for (let i = 0; i < outerInsns.length; i++) {
+            emu.mem.writeU32(outer + i * 4, outerInsns[i]);
+        }
+
+        // inner(val): add x0, x0, #10; ret
+        const inner = codeBase + 0x40;
+        emu.mem.writeU32(inner, 0x91002800);
+        emu.mem.writeU32(inner + 4, 0xD65F03C0);
+
+        let innerEnterHits = 0;
+        let innerLeaveHits = 0;
+        let innerHandle = null;
+
+        const outerHandle = emu.hook.attach(outer, {
+            onEnter(ctx) {
+                const cbAddr = ctx.x0;
+                // 关键回归测试：在 Hook 回调内再次调用 emu.hook.attach（原 bug 触发 RefCell already borrowed）
+                innerHandle = emu.hook.attach(cbAddr, {
+                    onEnter(c) {
+                        innerEnterHits++;
+                        if (c.x0 !== 32) {
+                            throw new Error("expected inner arg 32, got " + c.x0);
+                        }
+                    },
+                    onLeave(c) {
+                        innerLeaveHits++;
+                        // 32 + 10 = 42 -> 改写为 84，并验证回调内 detach 也不 panic
+                        c.x0 = c.x0 * 2;
+                        if (innerHandle) {
+                            innerHandle.detach();
+                            innerHandle = null;
+                        }
+                    },
+                });
+            },
+        });
+
+        const r1 = emu.call(outer, inner, 32);
+        if (r1 !== 84 || innerEnterHits !== 1 || innerLeaveHits !== 1) {
+            throw new Error(`reentrant attach failed: r1=${r1}, enter=${innerEnterHits}, leave=${innerLeaveHits}`);
+        }
+
+        outerHandle.detach();
+        const r2 = emu.call(outer, inner, 32);
+        if (r2 !== 42) {
+            throw new Error(`after detach expected 42, got ${r2}`);
+        }
+    "#;
+
+    JsRunner::run_source_with_args(script, &[])
+        .expect("reentrant hook attach/detach inside callback failed");
+
+    // 顺带验证 emu.load(path, { runInit: false }) + mod.runInit()
+    if Path::new("samples/libstatic-webp.so").exists() {
+        let init_script = r#"
+            const emu = Emu.create({ packageName: "com.test.deferred_init" });
+            const mod = emu.load("samples/libstatic-webp.so", { runInit: false });
+            const verAddr = mod.symbol("WebPGetDecoderVersion");
+            if (!verAddr) throw new Error("symbol missing before runInit");
+            mod.runInit();
+            if (mod.call("WebPGetDecoderVersion") === 0) {
+                throw new Error("WebPGetDecoderVersion failed after deferred runInit");
+            }
+        "#;
+        JsRunner::run_source_with_args(init_script, &[])
+            .expect("deferred runInit test failed");
+    }
+}
+
+#[test]
+fn js_static_fields_and_char_array() {
+    let script = r#"
+        const emu = Emu.create({ packageName: "com.test.staticfields", hleAccel: true });
+
+        // 1. newCharArray + getChars (UTF-16 [C)
+        const arrRef = emu.jni.newCharArray("AB中");
+        if (!arrRef) throw new Error("newCharArray returned 0");
+        const chars = emu.jni.getChars(arrRef);
+        if (!chars || chars.length !== 3 || chars[0] !== 0x41 || chars[1] !== 0x42 || chars[2] !== 0x4e2d) {
+            throw new Error("getChars mismatch: " + JSON.stringify(Array.from(chars || [])));
+        }
+
+        // 2. setStaticField with [C (char[]) & int, plus dynamic hook for [C
+        const secretRef = emu.jni.newCharArray("XYZ");
+        emu.jni.setStaticField("com/example/Config", "SECRET", secretRef);
+        emu.jni.setStaticField("com/example/Config", "VERSION", 77);
+        if (emu.jni.getStaticField("com/example/Config", "VERSION") !== 77) {
+            throw new Error("getStaticField VERSION mismatch");
+        }
+
+        emu.jni.hook("com/example/Dynamic", {
+            DYN_CHARS() {
+                return "OK";
+            },
+        });
+
+        // 3. 通过真实 JNIEnv vtable 槽位调用 FindClass(6) / GetStaticFieldID(144) / GetStaticObjectField(145) / GetArrayLength(171) / GetCharArrayElements(185) / SetStaticIntField(159)
+        const envPtr = emu.jni.envPtr;
+        const vtable = Number(emu.mem.readU64(envPtr));
+        const fnFindClass = Number(emu.mem.readU64(vtable + 6 * 8));
+        const fnGetStaticFieldID = Number(emu.mem.readU64(vtable + 144 * 8));
+        const fnGetStaticObjectField = Number(emu.mem.readU64(vtable + 145 * 8));
+        const fnGetStaticIntField = Number(emu.mem.readU64(vtable + 150 * 8));
+        const fnSetStaticIntField = Number(emu.mem.readU64(vtable + 159 * 8));
+        const fnGetArrayLength = Number(emu.mem.readU64(vtable + 171 * 8));
+        const fnGetCharArrayElements = Number(emu.mem.readU64(vtable + 185 * 8));
+
+        const sBuf = emu.mem.alloc(256);
+        const writeStr = (off, s) => { emu.mem.writeCString(sBuf + off, s); return sBuf + off; };
+        const pClsCfg = writeStr(0, "com/example/Config");
+        const pFieldSec = writeStr(32, "SECRET");
+        const pSigCharArr = writeStr(48, "[C");
+        const pFieldVer = writeStr(64, "VERSION");
+        const pSigInt = writeStr(80, "I");
+        const pClsDyn = writeStr(96, "com/example/Dynamic");
+        const pFieldDyn = writeStr(128, "DYN_CHARS");
+
+        const clsCfg = emu.call(fnFindClass, envPtr, pClsCfg);
+        const fidSec = emu.call(fnGetStaticFieldID, envPtr, clsCfg, pFieldSec, pSigCharArr);
+        const gotSecRef = emu.call(fnGetStaticObjectField, envPtr, clsCfg, fidSec);
+        if (gotSecRef !== secretRef) {
+            throw new Error(`GetStaticObjectField SECRET mismatch: got=${gotSecRef} expected=${secretRef}`);
+        }
+        const secLen = emu.call(fnGetArrayLength, envPtr, gotSecRef);
+        if (secLen !== 3) throw new Error("expected [C length 3, got " + secLen);
+        const elemPtr = emu.call(fnGetCharArrayElements, envPtr, gotSecRef, 0);
+        const rawChars = emu.mem.readBytes(elemPtr, 6);
+        if (hex(rawChars) !== "580059005a00") {
+            throw new Error(`GetCharArrayElements mismatch: ${hex(rawChars)}`);
+        }
+
+        // GetStaticIntField + SetStaticIntField roundtrip
+        const fidVer = emu.call(fnGetStaticFieldID, envPtr, clsCfg, pFieldVer, pSigInt);
+        if (emu.call(fnGetStaticIntField, envPtr, clsCfg, fidVer) !== 77) {
+            throw new Error("GetStaticIntField VERSION expected 77");
+        }
+        emu.call(fnSetStaticIntField, envPtr, clsCfg, fidVer, 99);
+        if (emu.call(fnGetStaticIntField, envPtr, clsCfg, fidVer) !== 99) {
+            throw new Error("SetStaticIntField roundtrip expected 99");
+        }
+        if (emu.jni.getStaticField("com/example/Config", "VERSION") !== 99) {
+            throw new Error("JS getStaticField expected 99 after SetStaticIntField");
+        }
+
+        // Dynamic JS hook returning string for [C static field -> auto-converted to jcharArray
+        const clsDyn = emu.call(fnFindClass, envPtr, pClsDyn);
+        const fidDyn = emu.call(fnGetStaticFieldID, envPtr, clsDyn, pFieldDyn, pSigCharArr);
+        const gotDynRef = emu.call(fnGetStaticObjectField, envPtr, clsDyn, fidDyn);
+        const dynChars = emu.jni.getChars(gotDynRef);
+        if (!dynChars || dynChars.length !== 2 || dynChars[0] !== 0x4f || dynChars[1] !== 0x4b) {
+            throw new Error("dynamic [C hook failed: " + JSON.stringify(Array.from(dynChars || [])));
+        }
+
+        // 4. 对称测试：[I (int[]) / [J (long[]) + 实例字段 setField/getField & GetIntField/SetIntField
+        const intArrRef = emu.jni.newIntArray([10, -20, 30]);
+        const gotInts = emu.jni.getInts(intArrRef);
+        if (!gotInts || gotInts.length !== 3 || gotInts[0] !== 10 || gotInts[1] !== -20 || gotInts[2] !== 30) {
+            throw new Error("int[] roundtrip failed");
+        }
+        const longArrRef = emu.jni.newLongArray([1000n, 9007199254740993n]);
+        const gotLongs = emu.jni.getLongs(longArrRef);
+        if (!gotLongs || gotLongs.length !== 2 || gotLongs[0] !== 1000n || gotLongs[1] !== 9007199254740993n) {
+            throw new Error("long[] roundtrip failed");
+        }
+
+        const fnGetFieldID = Number(emu.mem.readU64(vtable + 94 * 8));
+        const fnGetIntField = Number(emu.mem.readU64(vtable + 100 * 8));
+        const fnSetIntField = Number(emu.mem.readU64(vtable + 109 * 8));
+        const obj = emu.jni.newObject("com/example/Config");
+        emu.jni.setField(obj, "VERSION", 123);
+        const fidInstVer = emu.call(fnGetFieldID, envPtr, clsCfg, pFieldVer, pSigInt);
+        if (emu.call(fnGetIntField, envPtr, obj, fidInstVer) !== 123) {
+            throw new Error("GetIntField expected 123");
+        }
+        emu.call(fnSetIntField, envPtr, obj, fidInstVer, 456);
+        if (emu.jni.getField(obj, "VERSION") !== 456) {
+            throw new Error("SetIntField / getField roundtrip expected 456");
+        }
+    "#;
+
+    JsRunner::run_source_with_args(script, &[])
+        .expect("static fields and [C char[] test failed");
+}
+

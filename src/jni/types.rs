@@ -24,7 +24,7 @@ impl JObjectRef {
 }
 
 /// JNI 方法参数与返回值统一封装（对应 C 侧 `jvalue` union）
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum JValue {
     Void,
     Boolean(bool),
@@ -415,6 +415,21 @@ impl ObjectTable {
         self.add_local(JObject::ByteArray(bytes.into()))
     }
 
+    /// 便捷创建 `jcharArray` (`[C`, UTF-16) LocalRef
+    pub fn add_char_array(&mut self, chars: impl Into<Vec<u16>>) -> JObjectRef {
+        self.add_local(JObject::CharArray(chars.into()))
+    }
+
+    /// 便捷创建 `jintArray` (`[I`) LocalRef
+    pub fn add_int_array(&mut self, ints: impl Into<Vec<i32>>) -> JObjectRef {
+        self.add_local(JObject::IntArray(ints.into()))
+    }
+
+    /// 便捷创建 `jlongArray` (`[J`) LocalRef
+    pub fn add_long_array(&mut self, longs: impl Into<Vec<i64>>) -> JObjectRef {
+        self.add_local(JObject::LongArray(longs.into()))
+    }
+
     /// 查找或缓存 `jclass` 句柄（类名统一归一化为斜杠格式，如 `com/test/Native`）
     pub fn find_or_create_class(&mut self, name: &str) -> JObjectRef {
         let normalized = name.replace('.', "/");
@@ -501,6 +516,27 @@ impl ObjectTable {
     pub fn get_bytes(&self, r: JObjectRef) -> Option<&[u8]> {
         match self.get(r)? {
             JObject::ByteArray(b) => Some(b.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn get_chars(&self, r: JObjectRef) -> Option<&[u16]> {
+        match self.get(r)? {
+            JObject::CharArray(c) => Some(c.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn get_ints(&self, r: JObjectRef) -> Option<&[i32]> {
+        match self.get(r)? {
+            JObject::IntArray(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    pub fn get_longs(&self, r: JObjectRef) -> Option<&[i64]> {
+        match self.get(r)? {
+            JObject::LongArray(v) => Some(v.as_slice()),
             _ => None,
         }
     }

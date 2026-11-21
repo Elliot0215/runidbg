@@ -30,8 +30,8 @@ const BOOTSTRAP_JS: &str = include_str!("bootstrap.js");
 pub(super) struct EmuEntry {
     pub(super) emu: AndroidEmulator,
     pub(super) hooks: Rc<RefCell<JsHookTable>>,
-    pub(super) native_hooks: JsNativeHookTable,
-    pub(super) modules: Vec<LoadedModule>,
+    pub(super) native_hooks: Rc<RefCell<JsNativeHookTable>>,
+    pub(super) modules: Rc<RefCell<Vec<LoadedModule>>>,
     pub(super) snapshots: Vec<EmuSnapshot>,
 }
 
@@ -204,7 +204,7 @@ impl Drop for JsSession {
         for entry in &mut h.emus {
             entry.hooks.borrow_mut().hooks.clear();
             entry.hooks.borrow_mut().unhandled = None;
-            entry.native_hooks.clear_all(entry.emu.uc_mut());
+            entry.native_hooks.borrow_mut().clear_all(entry.emu.uc_mut());
         }
     }
 }

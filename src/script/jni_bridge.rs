@@ -13,7 +13,9 @@ use crate::jni::handler::{
     default_call_boolean_method, default_call_int_method, default_call_object_method,
     default_call_static_object_method,
 };
-use crate::jni::{JObjectRef, JValue, JniContext, JniHandler, MethodDesc, ObjectTable};
+use crate::jni::{
+    FieldDesc, JObjectRef, JValue, JniContext, JniHandler, MethodDesc, ObjectTable,
+};
 
 thread_local! {
     pub(crate) static CURRENT_JS_CTX: Cell<Option<NonNull<JSContext>>> = const { Cell::new(None) };
@@ -292,6 +294,39 @@ fn js_to_jobject<'js>(val: Value<'js>, objects: &mut ObjectTable) -> JObjectRef 
     if let Ok(ta) = TypedArray::<u8>::from_value(val.clone()) {
         if let Some(slice) = ta.as_bytes() {
             return objects.add_byte_array(slice.to_vec());
+        }
+    }
+    if let Ok(ta) = TypedArray::<u16>::from_value(val.clone()) {
+        if let Some(raw) = ta.as_bytes() {
+            let chars: Vec<u16> = raw
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&c| u16::from_le_bytes(c))
+                .collect();
+            return objects.add_char_array(chars);
+        }
+    }
+    if let Ok(ta) = TypedArray::<i32>::from_value(val.clone()) {
+        if let Some(raw) = ta.as_bytes() {
+            let ints: Vec<i32> = raw
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| i32::from_le_bytes(c))
+                .collect();
+            return objects.add_int_array(ints);
+        }
+    }
+    if let Ok(ta) = TypedArray::<i64>::from_value(val.clone()) {
+        if let Some(raw) = ta.as_bytes() {
+            let longs: Vec<i64> = raw
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|&c| i64::from_le_bytes(c))
+                .collect();
+            return objects.add_long_array(longs);
         }
     }
     if let Some(arr) = val.as_array() {
@@ -692,5 +727,487 @@ impl JniHandler for JsJniHandler {
             return out;
         }
         crate::jni::handler::default_new_object(ctx, class_name, method, args)
+    }
+
+    fn get_object_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        field: &FieldDesc,
+    ) -> JObjectRef {
+        let cls = ctx
+            .objects
+            .get(obj)
+            .map(|o| o.class_name().to_string())
+            .unwrap_or_else(|| field.class_name.clone());
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: false,
+        };
+        let mut out = JObjectRef::NULL;
+        let is_char_array = field.sig == "[C";
+        if self.invoke_hook(ctx, &cls, Some(obj), &pseudo, &[], |_, v, objs| {
+            if is_char_array {
+                if let Some(s) = v.as_string() {
+                    if let Ok(rust_s) = s.to_string() {
+                        out = objs.add_char_array(rust_s.encode_utf16().collect::<Vec<u16>>());
+                        return;
+                    }
+                }
+            }
+            out = js_to_jobject(v, objs);
+        }) {
+            return out;
+        }
+        let default_ret = crate::jni::handler::default_get_object_field(ctx, obj, field);
+        if !default_ret.is_null() {
+            return default_ret;
+        }
+        if self.invoke_unhandled(ctx, "GetObjectField", &cls, &pseudo, &[], |_, v, objs| {
+            if is_char_array {
+                if let Some(s) = v.as_string() {
+                    if let Ok(rust_s) = s.to_string() {
+                        out = objs.add_char_array(rust_s.encode_utf16().collect::<Vec<u16>>());
+                        return;
+                    }
+                }
+            }
+            out = js_to_jobject(v, objs);
+        }) {
+            return out;
+        }
+        JObjectRef::NULL
+    }
+
+    fn get_boolean_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        field: &FieldDesc,
+    ) -> bool {
+        let cls = ctx
+            .objects
+            .get(obj)
+            .map(|o| o.class_name().to_string())
+            .unwrap_or_else(|| field.class_name.clone());
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: false,
+        };
+        let mut out = false;
+        self.invoke_js(ctx, "GetBooleanField", &cls, Some(obj), &pseudo, &[], |_, v, _| {
+            out = js_to_bool(&v);
+        });
+        out
+    }
+
+    fn get_byte_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        field: &FieldDesc,
+    ) -> i8 {
+        let cls = ctx
+            .objects
+            .get(obj)
+            .map(|o| o.class_name().to_string())
+            .unwrap_or_else(|| field.class_name.clone());
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: false,
+        };
+        let mut out = 0i8;
+        self.invoke_js(ctx, "GetByteField", &cls, Some(obj), &pseudo, &[], |_, v, _| {
+            out = js_to_i64(&v) as i8;
+        });
+        out
+    }
+
+    fn get_char_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        field: &FieldDesc,
+    ) -> u16 {
+        let cls = ctx
+            .objects
+            .get(obj)
+            .map(|o| o.class_name().to_string())
+            .unwrap_or_else(|| field.class_name.clone());
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: false,
+        };
+        let mut out = 0u16;
+        self.invoke_js(ctx, "GetCharField", &cls, Some(obj), &pseudo, &[], |_, v, _| {
+            out = js_to_i64(&v) as u16;
+        });
+        out
+    }
+
+    fn get_short_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        field: &FieldDesc,
+    ) -> i16 {
+        let cls = ctx
+            .objects
+            .get(obj)
+            .map(|o| o.class_name().to_string())
+            .unwrap_or_else(|| field.class_name.clone());
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: false,
+        };
+        let mut out = 0i16;
+        self.invoke_js(ctx, "GetShortField", &cls, Some(obj), &pseudo, &[], |_, v, _| {
+            out = js_to_i64(&v) as i16;
+        });
+        out
+    }
+
+    fn get_int_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        field: &FieldDesc,
+    ) -> i32 {
+        let cls = ctx
+            .objects
+            .get(obj)
+            .map(|o| o.class_name().to_string())
+            .unwrap_or_else(|| field.class_name.clone());
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: false,
+        };
+        let mut out = 0i32;
+        self.invoke_js(ctx, "GetIntField", &cls, Some(obj), &pseudo, &[], |_, v, _| {
+            out = js_to_i64(&v) as i32;
+        });
+        out
+    }
+
+    fn get_long_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        field: &FieldDesc,
+    ) -> i64 {
+        let cls = ctx
+            .objects
+            .get(obj)
+            .map(|o| o.class_name().to_string())
+            .unwrap_or_else(|| field.class_name.clone());
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: false,
+        };
+        let mut out = 0i64;
+        self.invoke_js(ctx, "GetLongField", &cls, Some(obj), &pseudo, &[], |_, v, _| {
+            out = js_to_i64(&v);
+        });
+        out
+    }
+
+    fn get_float_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        field: &FieldDesc,
+    ) -> f32 {
+        let cls = ctx
+            .objects
+            .get(obj)
+            .map(|o| o.class_name().to_string())
+            .unwrap_or_else(|| field.class_name.clone());
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: false,
+        };
+        let mut out = 0.0f32;
+        self.invoke_js(ctx, "GetFloatField", &cls, Some(obj), &pseudo, &[], |_, v, _| {
+            out = js_to_f64(&v) as f32;
+        });
+        out
+    }
+
+    fn get_double_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        field: &FieldDesc,
+    ) -> f64 {
+        let cls = ctx
+            .objects
+            .get(obj)
+            .map(|o| o.class_name().to_string())
+            .unwrap_or_else(|| field.class_name.clone());
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: false,
+        };
+        let mut out = 0.0f64;
+        self.invoke_js(ctx, "GetDoubleField", &cls, Some(obj), &pseudo, &[], |_, v, _| {
+            out = js_to_f64(&v);
+        });
+        out
+    }
+
+    fn get_static_object_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        class_name: &str,
+        field: &FieldDesc,
+    ) -> JObjectRef {
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: true,
+        };
+        let mut out = JObjectRef::NULL;
+        let is_char_array = field.sig == "[C";
+        if self.invoke_js(
+            ctx,
+            "GetStaticObjectField",
+            class_name,
+            None,
+            &pseudo,
+            &[],
+            |_, v, objs| {
+                if is_char_array {
+                    if let Some(s) = v.as_string() {
+                        if let Ok(rust_s) = s.to_string() {
+                            out = objs.add_char_array(rust_s.encode_utf16().collect::<Vec<u16>>());
+                            return;
+                        }
+                    }
+                }
+                out = js_to_jobject(v, objs);
+            },
+        ) {
+            return out;
+        }
+        JObjectRef::NULL
+    }
+
+    fn get_static_boolean_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        class_name: &str,
+        field: &FieldDesc,
+    ) -> bool {
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: true,
+        };
+        let mut out = false;
+        self.invoke_js(
+            ctx,
+            "GetStaticBooleanField",
+            class_name,
+            None,
+            &pseudo,
+            &[],
+            |_, v, _| out = js_to_bool(&v),
+        );
+        out
+    }
+
+    fn get_static_byte_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        class_name: &str,
+        field: &FieldDesc,
+    ) -> i8 {
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: true,
+        };
+        let mut out = 0i8;
+        self.invoke_js(
+            ctx,
+            "GetStaticByteField",
+            class_name,
+            None,
+            &pseudo,
+            &[],
+            |_, v, _| out = js_to_i64(&v) as i8,
+        );
+        out
+    }
+
+    fn get_static_char_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        class_name: &str,
+        field: &FieldDesc,
+    ) -> u16 {
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: true,
+        };
+        let mut out = 0u16;
+        self.invoke_js(
+            ctx,
+            "GetStaticCharField",
+            class_name,
+            None,
+            &pseudo,
+            &[],
+            |_, v, _| out = js_to_i64(&v) as u16,
+        );
+        out
+    }
+
+    fn get_static_short_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        class_name: &str,
+        field: &FieldDesc,
+    ) -> i16 {
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: true,
+        };
+        let mut out = 0i16;
+        self.invoke_js(
+            ctx,
+            "GetStaticShortField",
+            class_name,
+            None,
+            &pseudo,
+            &[],
+            |_, v, _| out = js_to_i64(&v) as i16,
+        );
+        out
+    }
+
+    fn get_static_int_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        class_name: &str,
+        field: &FieldDesc,
+    ) -> i32 {
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: true,
+        };
+        let mut out = 0i32;
+        self.invoke_js(
+            ctx,
+            "GetStaticIntField",
+            class_name,
+            None,
+            &pseudo,
+            &[],
+            |_, v, _| out = js_to_i64(&v) as i32,
+        );
+        out
+    }
+
+    fn get_static_long_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        class_name: &str,
+        field: &FieldDesc,
+    ) -> i64 {
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: true,
+        };
+        let mut out = 0i64;
+        self.invoke_js(
+            ctx,
+            "GetStaticLongField",
+            class_name,
+            None,
+            &pseudo,
+            &[],
+            |_, v, _| out = js_to_i64(&v),
+        );
+        out
+    }
+
+    fn get_static_float_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        class_name: &str,
+        field: &FieldDesc,
+    ) -> f32 {
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: true,
+        };
+        let mut out = 0.0f32;
+        self.invoke_js(
+            ctx,
+            "GetStaticFloatField",
+            class_name,
+            None,
+            &pseudo,
+            &[],
+            |_, v, _| out = js_to_f64(&v) as f32,
+        );
+        out
+    }
+
+    fn get_static_double_field(
+        &mut self,
+        ctx: &mut JniContext<'_>,
+        class_name: &str,
+        field: &FieldDesc,
+    ) -> f64 {
+        let pseudo = MethodDesc {
+            class_name: field.class_name.clone(),
+            name: field.name.clone(),
+            sig: field.sig.clone(),
+            is_static: true,
+        };
+        let mut out = 0.0f64;
+        self.invoke_js(
+            ctx,
+            "GetStaticDoubleField",
+            class_name,
+            None,
+            &pseudo,
+            &[],
+            |_, v, _| out = js_to_f64(&v),
+        );
+        out
     }
 }

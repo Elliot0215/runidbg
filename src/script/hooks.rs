@@ -594,9 +594,10 @@ impl JsNativeHookTable {
     }
 
     /// 触发所有返回地址为 `RET_MAGIC_ADDR` 的顶层 `attach` `onLeave` 回调
-    /// （因为 `emu_start(..., RET_MAGIC_ADDR)` 会在执行该地址前停机），并同步最新 `X0`
+    /// （因为 `emu_start(..., RET_MAGIC_ADDR)` 会在执行该地址前停机），并同步最新 `X0`。
+    /// 接收 `&Rc<RefCell<Self>>` 并在调用 JS 回调前释放借用，确保 `onLeave` 内部可安全重入增删 Hook。
     pub fn flush_ret_magic_leaves(
-        &self,
+        table: &Rc<RefCell<Self>>,
         emu_id: usize,
         uc: &mut Unicorn<'static, EmuState>,
     ) {
@@ -604,15 +605,18 @@ impl JsNativeHookTable {
             return;
         };
         let mut pending = Vec::new();
-        for rec in self.attach_hooks.values() {
-            let mut st = rec.state.borrow_mut();
-            let mut idx = st.frames.len();
-            while idx > 0 {
-                idx -= 1;
-                if st.frames[idx].lr == crate::cpu::RET_MAGIC_ADDR {
-                    let frame = st.frames.remove(idx);
-                    if let Some(leave_fn) = st.on_leave.clone() {
-                        pending.push((frame, leave_fn));
+        {
+            let tbl = table.borrow();
+            for rec in tbl.attach_hooks.values() {
+                let mut st = rec.state.borrow_mut();
+                let mut idx = st.frames.len();
+                while idx > 0 {
+                    idx -= 1;
+                    if st.frames[idx].lr == crate::cpu::RET_MAGIC_ADDR {
+                        let frame = st.frames.remove(idx);
+                        if let Some(leave_fn) = st.on_leave.clone() {
+                            pending.push((frame, leave_fn));
+                        }
                     }
                 }
             }

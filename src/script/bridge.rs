@@ -12,6 +12,7 @@ use unicorn_engine::Unicorn;
 
 use crate::emulator::{EmuState, DEFAULT_HEAP_BASE};
 use crate::jni::{JObject, JObjectRef, JValue};
+use crate::loader::LoadedModule;
 use crate::memory::read_guest_cstr;
 use crate::tracer::{BinaryTracer, TraceLevel};
 use crate::AndroidEmulator;
@@ -61,6 +62,109 @@ fn js_val_to_jvalue(v: &Value<'_>) -> JValue {
     }
 }
 
+fn js_field_val_to_jvalue<'js>(
+    val: Value<'js>,
+    sig_str: &str,
+    vm: &mut crate::jni::JniVm,
+) -> rquickjs::Result<JValue> {
+    if val.is_null() || val.is_undefined() {
+        Ok(JValue::Object(JObjectRef::NULL))
+    } else if let Some(b) = val.as_bool() {
+        Ok(JValue::Boolean(b))
+    } else if let Some(s) = val.as_string() {
+        let rust_s = s.to_string()?;
+        let r = if sig_str == "[C" {
+            vm.objects
+                .add_char_array(rust_s.encode_utf16().collect::<Vec<u16>>())
+        } else {
+            vm.objects.add_string(rust_s)
+        };
+        Ok(JValue::Object(r))
+    } else if let Ok(ta) = TypedArray::<u8>::from_value(val.clone()) {
+        let r = vm
+            .objects
+            .add_byte_array(ta.as_bytes().unwrap_or(&[]).to_vec());
+        Ok(JValue::Object(r))
+    } else if let Ok(ta) = TypedArray::<u16>::from_value(val.clone()) {
+        let chars: Vec<u16> = ta
+            .as_bytes()
+            .unwrap_or(&[])
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&c| u16::from_le_bytes(c))
+            .collect();
+        let r = vm.objects.add_char_array(chars);
+        Ok(JValue::Object(r))
+    } else if let Ok(ta) = TypedArray::<i32>::from_value(val.clone()) {
+        let ints: Vec<i32> = ta
+            .as_bytes()
+            .unwrap_or(&[])
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| i32::from_le_bytes(c))
+            .collect();
+        let r = vm.objects.add_int_array(ints);
+        Ok(JValue::Object(r))
+    } else if let Ok(ta) = TypedArray::<i64>::from_value(val.clone()) {
+        let longs: Vec<i64> = ta
+            .as_bytes()
+            .unwrap_or(&[])
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&c| i64::from_le_bytes(c))
+            .collect();
+        let r = vm.objects.add_long_array(longs);
+        Ok(JValue::Object(r))
+    } else if let Some(bi) = val.as_big_int() {
+        Ok(JValue::Long(bi.clone().to_i64().unwrap_or(0)))
+    } else if let Some(n) = val.as_number() {
+        Ok(match sig_str {
+            "Z" => JValue::Boolean(n != 0.0),
+            "B" => JValue::Byte(n as i8),
+            "C" => JValue::Char(n as u16),
+            "S" => JValue::Short(n as i16),
+            "I" => JValue::Int(n as i32),
+            "J" => JValue::Long(n as i64),
+            "F" => JValue::Float(n as f32),
+            "D" => JValue::Double(n),
+            _ => {
+                let cand = JObjectRef(n as u64);
+                if vm.objects.get(cand).is_some() {
+                    JValue::Object(cand)
+                } else {
+                    JValue::Int(n as i32)
+                }
+            }
+        })
+    } else {
+        Ok(JValue::Object(JObjectRef::NULL))
+    }
+}
+
+fn jvalue_opt_to_js<'js>(ctx: &Ctx<'js>, stored: Option<JValue>) -> rquickjs::Result<Value<'js>> {
+    match stored {
+        None | Some(JValue::Void) => Ok(Value::new_undefined(ctx.clone())),
+        Some(JValue::Boolean(b)) => Ok(Value::new_bool(ctx.clone(), b)),
+        Some(JValue::Byte(v)) => Ok(Value::new_int(ctx.clone(), i32::from(v))),
+        Some(JValue::Char(v)) => Ok(Value::new_int(ctx.clone(), i32::from(v))),
+        Some(JValue::Short(v)) => Ok(Value::new_int(ctx.clone(), i32::from(v))),
+        Some(JValue::Int(v)) => Ok(Value::new_int(ctx.clone(), v)),
+        Some(JValue::Long(v)) => Ok(Value::new_number(ctx.clone(), v as f64)),
+        Some(JValue::Float(v)) => Ok(Value::new_float(ctx.clone(), f64::from(v))),
+        Some(JValue::Double(v)) => Ok(Value::new_float(ctx.clone(), v)),
+        Some(JValue::Object(r)) => {
+            if r.is_null() {
+                Ok(Value::new_null(ctx.clone()))
+            } else {
+                Ok(Value::new_number(ctx.clone(), r.0 as f64))
+            }
+        }
+    }
+}
+
 fn js_val_to_u64(ctx: &Ctx<'_>, v: &Value<'_>) -> rquickjs::Result<u64> {
     if let Some(i) = v.as_int() {
         Ok(i as i64 as u64)
@@ -78,6 +182,27 @@ fn js_val_to_u64(ctx: &Ctx<'_>, v: &Value<'_>) -> rquickjs::Result<u64> {
     }
 }
 
+#[derive(Clone)]
+struct EmuSharedHandles {
+    jni_hooks: Rc<RefCell<JsHookTable>>,
+    native_hooks: Rc<RefCell<JsNativeHookTable>>,
+    modules: Rc<RefCell<Vec<LoadedModule>>>,
+}
+
+type SharedHandlesTable = Rc<RefCell<Vec<EmuSharedHandles>>>;
+
+fn get_emu_handles(
+    ctx: &Ctx<'_>,
+    handles: &SharedHandlesTable,
+    emu_id: usize,
+) -> rquickjs::Result<EmuSharedHandles> {
+    handles
+        .borrow()
+        .get(emu_id)
+        .cloned()
+        .ok_or_else(|| throw_err(ctx, "无效的 emuId"))
+}
+
 pub(super) fn register_native_bridge<'js>(
     ctx: &Ctx<'js>,
     host: &SharedHost,
@@ -86,6 +211,7 @@ pub(super) fn register_native_bridge<'js>(
 ) -> rquickjs::Result<()> {
     let globals = ctx.globals();
     let native = Object::new(ctx.clone())?;
+    let handles_table: SharedHandlesTable = Rc::new(RefCell::new(Vec::new()));
 
     // 全局 args 数组
     let js_args = Array::new(ctx.clone())?;
@@ -115,6 +241,7 @@ pub(super) fn register_native_bridge<'js>(
     // emuCreate(packageName, searchPaths, hleAccel, heapSize) -> emuId
     {
         let host = Rc::clone(host);
+        let handles_table = Rc::clone(&handles_table);
         native.set(
             "emuCreate",
             Function::new(
@@ -126,6 +253,8 @@ pub(super) fn register_native_bridge<'js>(
                       heap_size: f64|
                       -> rquickjs::Result<usize> {
                     let hooks = Rc::new(RefCell::new(JsHookTable::default()));
+                    let native_hooks = Rc::new(RefCell::new(JsNativeHookTable::default()));
+                    let modules = Rc::new(RefCell::new(Vec::new()));
                     let mut builder = AndroidEmulator::builder()
                         .package_name(pkg)
                         .hle_accel(hle_accel)
@@ -142,11 +271,16 @@ pub(super) fn register_native_bridge<'js>(
                     }
                     let mut h = host.borrow_mut();
                     let id = h.emus.len();
+                    handles_table.borrow_mut().push(EmuSharedHandles {
+                        jni_hooks: Rc::clone(&hooks),
+                        native_hooks: Rc::clone(&native_hooks),
+                        modules: Rc::clone(&modules),
+                    });
                     h.emus.push(EmuEntry {
                         emu,
                         hooks,
-                        native_hooks: JsNativeHookTable::default(),
-                        modules: Vec::new(),
+                        native_hooks,
+                        modules,
                         snapshots: Vec::new(),
                     });
                     Ok(id)
@@ -155,14 +289,18 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
-    // emuLoad(emuId, path) -> { id, name, base, size }
+    // emuLoad(emuId, path, runInit) -> { id, name, base, size }
     {
         let host = Rc::clone(host);
         native.set(
             "emuLoad",
             Function::new(
                 ctx.clone(),
-                move |ctx: Ctx<'js>, emu_id: usize, path: String| -> rquickjs::Result<Object<'js>> {
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      path: String,
+                      run_init: bool|
+                      -> rquickjs::Result<Object<'js>> {
                     let _guard = JsCtxGuard::enter(&ctx);
                     let mut h = host.borrow_mut();
                     let entry = h
@@ -171,16 +309,49 @@ pub(super) fn register_native_bridge<'js>(
                         .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
                     let module = entry
                         .emu
-                        .load_library(&path)
+                        .load_library_with_init(&path, run_init)
                         .map_err(|e| throw_err(&ctx, e))?;
-                    let mod_id = entry.modules.len();
+                    let mut mods = entry.modules.borrow_mut();
+                    let mod_id = mods.len();
                     let obj = Object::new(ctx.clone())?;
                     obj.set("id", mod_id)?;
                     obj.set("name", module.name.as_str())?;
                     obj.set("base", module.base_addr as f64)?;
                     obj.set("size", module.image_size as f64)?;
-                    entry.modules.push(module);
+                    mods.push(module);
                     Ok(obj)
+                },
+            )?,
+        )?;
+    }
+
+    // modRunInit(emuId, modId) -> void
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "modRunInit",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, mod_id: usize| -> rquickjs::Result<()> {
+                    let _guard = JsCtxGuard::enter(&ctx);
+                    let mut h = host.borrow_mut();
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let module = entry
+                        .modules
+                        .borrow()
+                        .get(mod_id)
+                        .cloned()
+                        .ok_or_else(|| throw_err(&ctx, "无效的 modId"))?;
+                    entry
+                        .emu
+                        .run_module_init_array(&module)
+                        .map_err(|e| throw_err(&ctx, e))?;
+                    let nh = Rc::clone(&entry.native_hooks);
+                    JsNativeHookTable::flush_ret_magic_leaves(&nh, emu_id, entry.emu.uc_mut());
+                    Ok(())
                 },
             )?,
         )?;
@@ -202,6 +373,7 @@ pub(super) fn register_native_bridge<'js>(
                         .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
                     let module = entry
                         .modules
+                        .borrow()
                         .get(mod_id)
                         .cloned()
                         .ok_or_else(|| throw_err(&ctx, "无效的 modId"))?;
@@ -217,7 +389,7 @@ pub(super) fn register_native_bridge<'js>(
 
     // modSymbol(emuId, modId, name) -> addr or 0
     {
-        let host = Rc::clone(host);
+        let handles_table = Rc::clone(&handles_table);
         native.set(
             "modSymbol",
             Function::new(
@@ -227,13 +399,9 @@ pub(super) fn register_native_bridge<'js>(
                       mod_id: usize,
                       name: String|
                       -> rquickjs::Result<f64> {
-                    let h = host.borrow();
-                    let entry = h
-                        .emus
-                        .get(emu_id)
-                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                    let module = entry
-                        .modules
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
+                    let mods = handles.modules.borrow();
+                    let module = mods
                         .get(mod_id)
                         .ok_or_else(|| throw_err(&ctx, "无效的 modId"))?;
                     Ok(module.find_symbol(&name).unwrap_or(0) as f64)
@@ -244,19 +412,15 @@ pub(super) fn register_native_bridge<'js>(
 
     // modExports(emuId, modId) -> string[]
     {
-        let host = Rc::clone(host);
+        let handles_table = Rc::clone(&handles_table);
         native.set(
             "modExports",
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, emu_id: usize, mod_id: usize| -> rquickjs::Result<Vec<String>> {
-                    let h = host.borrow();
-                    let entry = h
-                        .emus
-                        .get(emu_id)
-                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                    let module = entry
-                        .modules
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
+                    let mods = handles.modules.borrow();
+                    let module = mods
                         .get(mod_id)
                         .ok_or_else(|| throw_err(&ctx, "无效的 modId"))?;
                     let mut names: Vec<String> = module.symbols.keys().cloned().collect();
@@ -288,6 +452,7 @@ pub(super) fn register_native_bridge<'js>(
                         .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
                     let module = entry
                         .modules
+                        .borrow()
                         .get(mod_id)
                         .cloned()
                         .ok_or_else(|| throw_err(&ctx, "无效的 modId"))?;
@@ -296,9 +461,8 @@ pub(super) fn register_native_bridge<'js>(
                         .emu
                         .call_symbol(&module, &sym, &args_u64)
                         .map_err(|e| throw_err(&ctx, e))?;
-                    entry
-                        .native_hooks
-                        .flush_ret_magic_leaves(emu_id, entry.emu.uc_mut());
+                    let nh = Rc::clone(&entry.native_hooks);
+                    JsNativeHookTable::flush_ret_magic_leaves(&nh, emu_id, entry.emu.uc_mut());
                     let final_ret = entry
                         .emu
                         .uc()
@@ -333,9 +497,8 @@ pub(super) fn register_native_bridge<'js>(
                         .emu
                         .call_address(addr as u64, &args_u64)
                         .map_err(|e| throw_err(&ctx, e))?;
-                    entry
-                        .native_hooks
-                        .flush_ret_magic_leaves(emu_id, entry.emu.uc_mut());
+                    let nh = Rc::clone(&entry.native_hooks);
+                    JsNativeHookTable::flush_ret_magic_leaves(&nh, emu_id, entry.emu.uc_mut());
                     let final_ret = entry
                         .emu
                         .uc()
@@ -349,7 +512,7 @@ pub(super) fn register_native_bridge<'js>(
 
     // jniHook(emuId, className, methodName, fn)
     {
-        let host = Rc::clone(host);
+        let handles_table = Rc::clone(&handles_table);
         native.set(
             "jniHook",
             Function::new(
@@ -360,13 +523,9 @@ pub(super) fn register_native_bridge<'js>(
                       method: String,
                       func: Function<'js>|
                       -> rquickjs::Result<()> {
-                    let h = host.borrow();
-                    let entry = h
-                        .emus
-                        .get(emu_id)
-                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
                     let pfn = Persistent::save(&ctx, func);
-                    entry.hooks.borrow_mut().insert_hook(&cls, &method, pfn);
+                    handles.jni_hooks.borrow_mut().insert_hook(&cls, &method, pfn);
                     Ok(())
                 },
             )?,
@@ -375,19 +534,15 @@ pub(super) fn register_native_bridge<'js>(
 
     // jniOnUnhandled(emuId, fn)
     {
-        let host = Rc::clone(host);
+        let handles_table = Rc::clone(&handles_table);
         native.set(
             "jniOnUnhandled",
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'js>, emu_id: usize, func: Function<'js>| -> rquickjs::Result<()> {
-                    let h = host.borrow();
-                    let entry = h
-                        .emus
-                        .get(emu_id)
-                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
                     let pfn = Persistent::save(&ctx, func);
-                    entry.hooks.borrow_mut().set_unhandled(pfn);
+                    handles.jni_hooks.borrow_mut().set_unhandled(pfn);
                     Ok(())
                 },
             )?,
@@ -489,12 +644,136 @@ pub(super) fn register_native_bridge<'js>(
                     if let Some(r) = with_active_objects(|objs| objs.add_byte_array(vec.clone())) {
                         return Ok(r.0 as f64);
                     }
-                    let mut h = host.borrow_mut();
-                    let entry = h
-                        .emus
-                        .get_mut(emu_id)
-                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                    Ok(entry.emu.new_jbyte_array(vec).0 as f64)
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc.get_data_mut().jni.objects.add_byte_array(vec).0 as f64)
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    // jniNewCharArray(emuId, string | Uint16Array | number[]) -> handle
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniNewCharArray",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize, input: Value<'js>| -> rquickjs::Result<f64> {
+                    let chars: Vec<u16> = if let Some(s) = input.as_string() {
+                        s.to_string()?.encode_utf16().collect()
+                    } else if let Ok(ta) = TypedArray::<u16>::from_value(input.clone()) {
+                        ta.as_bytes()
+                            .unwrap_or(&[])
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .map(|&c| u16::from_le_bytes(c))
+                            .collect()
+                    } else if let Some(arr) = input.as_array() {
+                        let mut v = Vec::with_capacity(arr.len());
+                        for i in 0..arr.len() {
+                            let n = arr.get::<f64>(i).unwrap_or(0.0);
+                            v.push(n as u16);
+                        }
+                        v
+                    } else {
+                        return Err(throw_err(
+                            &ctx,
+                            "newCharArray 需要 string、Uint16Array 或 number[]",
+                        ));
+                    };
+                    if let Some(r) = with_active_objects(|objs| objs.add_char_array(chars.clone()))
+                    {
+                        return Ok(r.0 as f64);
+                    }
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc.get_data_mut().jni.objects.add_char_array(chars).0 as f64)
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    // jniNewIntArray(emuId, Int32Array | number[]) -> handle
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniNewIntArray",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize, input: Value<'js>| -> rquickjs::Result<f64> {
+                    let ints: Vec<i32> = if let Ok(ta) = TypedArray::<i32>::from_value(input.clone())
+                    {
+                        ta.as_bytes()
+                            .unwrap_or(&[])
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|&c| i32::from_le_bytes(c))
+                            .collect()
+                    } else if let Some(arr) = input.as_array() {
+                        let mut v = Vec::with_capacity(arr.len());
+                        for i in 0..arr.len() {
+                            v.push(arr.get::<f64>(i).unwrap_or(0.0) as i32);
+                        }
+                        v
+                    } else {
+                        return Err(throw_err(&ctx, "newIntArray 需要 Int32Array 或 number[]"));
+                    };
+                    if let Some(r) = with_active_objects(|objs| objs.add_int_array(ints.clone())) {
+                        return Ok(r.0 as f64);
+                    }
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc.get_data_mut().jni.objects.add_int_array(ints).0 as f64)
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    // jniNewLongArray(emuId, BigInt64Array | Array<number | bigint>) -> handle
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniNewLongArray",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize, input: Value<'js>| -> rquickjs::Result<f64> {
+                    let longs: Vec<i64> =
+                        if let Ok(ta) = TypedArray::<i64>::from_value(input.clone()) {
+                            ta.as_bytes()
+                                .unwrap_or(&[])
+                                .as_chunks::<8>()
+                                .0
+                                .iter()
+                                .map(|&c| i64::from_le_bytes(c))
+                                .collect()
+                        } else if let Some(arr) = input.as_array() {
+                            let mut v = Vec::with_capacity(arr.len());
+                            for i in 0..arr.len() {
+                                let item = arr.get::<Value<'js>>(i)?;
+                                let n = if let Some(bi) = item.as_big_int() {
+                                    bi.clone().to_i64().unwrap_or(0)
+                                } else {
+                                    item.as_number().unwrap_or(0.0) as i64
+                                };
+                                v.push(n);
+                            }
+                            v
+                        } else {
+                            return Err(throw_err(
+                                &ctx,
+                                "newLongArray 需要 BigInt64Array 或 Array<number|bigint>",
+                            ));
+                        };
+                    if let Some(r) = with_active_objects(|objs| objs.add_long_array(longs.clone()))
+                    {
+                        return Ok(r.0 as f64);
+                    }
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc.get_data_mut().jni.objects.add_long_array(longs).0 as f64)
+                    })
                 },
             )?,
         )?;
@@ -731,17 +1010,223 @@ pub(super) fn register_native_bridge<'js>(
                     {
                         res
                     } else {
-                        let h = host.borrow();
-                        let entry = h
-                            .emus
-                            .get(emu_id)
-                            .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                        entry.emu.jni().objects.get_bytes(jref).map(|b| b.to_vec())
+                        with_uc(&ctx, &host, emu_id, |uc| {
+                            Ok(uc
+                                .get_data()
+                                .jni
+                                .objects
+                                .get_bytes(jref)
+                                .map(|b| b.to_vec()))
+                        })?
                     };
                     match bytes {
                         Some(v) => Ok(Some(TypedArray::new(ctx.clone(), v)?)),
                         None => Ok(None),
                     }
+                },
+            )?,
+        )?;
+    }
+
+    // jniGetChars(emuId, ref) -> Uint16Array | null
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniGetChars",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      r: f64|
+                      -> rquickjs::Result<Option<TypedArray<'js, u16>>> {
+                    let jref = JObjectRef(r as u64);
+                    let chars = if let Some(res) =
+                        with_active_objects(|objs| objs.get_chars(jref).map(|c| c.to_vec()))
+                    {
+                        res
+                    } else {
+                        with_uc(&ctx, &host, emu_id, |uc| {
+                            Ok(uc
+                                .get_data()
+                                .jni
+                                .objects
+                                .get_chars(jref)
+                                .map(|c| c.to_vec()))
+                        })?
+                    };
+                    match chars {
+                        Some(v) => Ok(Some(TypedArray::new(ctx.clone(), v)?)),
+                        None => Ok(None),
+                    }
+                },
+            )?,
+        )?;
+    }
+
+    // jniGetInts(emuId, ref) -> Int32Array | null
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniGetInts",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      r: f64|
+                      -> rquickjs::Result<Option<TypedArray<'js, i32>>> {
+                    let jref = JObjectRef(r as u64);
+                    let ints = if let Some(res) =
+                        with_active_objects(|objs| objs.get_ints(jref).map(|v| v.to_vec()))
+                    {
+                        res
+                    } else {
+                        with_uc(&ctx, &host, emu_id, |uc| {
+                            Ok(uc
+                                .get_data()
+                                .jni
+                                .objects
+                                .get_ints(jref)
+                                .map(|v| v.to_vec()))
+                        })?
+                    };
+                    match ints {
+                        Some(v) => Ok(Some(TypedArray::new(ctx.clone(), v)?)),
+                        None => Ok(None),
+                    }
+                },
+            )?,
+        )?;
+    }
+
+    // jniGetLongs(emuId, ref) -> BigInt64Array | null
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniGetLongs",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      r: f64|
+                      -> rquickjs::Result<Option<TypedArray<'js, i64>>> {
+                    let jref = JObjectRef(r as u64);
+                    let longs = if let Some(res) =
+                        with_active_objects(|objs| objs.get_longs(jref).map(|v| v.to_vec()))
+                    {
+                        res
+                    } else {
+                        with_uc(&ctx, &host, emu_id, |uc| {
+                            Ok(uc
+                                .get_data()
+                                .jni
+                                .objects
+                                .get_longs(jref)
+                                .map(|v| v.to_vec()))
+                        })?
+                    };
+                    match longs {
+                        Some(v) => Ok(Some(TypedArray::new(ctx.clone(), v)?)),
+                        None => Ok(None),
+                    }
+                },
+            )?,
+        )?;
+    }
+
+    // jniSetField(emuId, objRef, fieldName, val, sig?) -> void
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniSetField",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      obj_ref: f64,
+                      field_name: String,
+                      val: Value<'js>,
+                      sig: Option<String>|
+                      -> rquickjs::Result<()> {
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        let vm = &mut uc.get_data_mut().jni;
+                        let jval = js_field_val_to_jvalue(val, sig.as_deref().unwrap_or(""), vm)?;
+                        vm.set_instance_field(JObjectRef(obj_ref as u64), &field_name, jval);
+                        Ok(())
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    // jniGetField(emuId, objRef, fieldName) -> Value
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniGetField",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      obj_ref: f64,
+                      field_name: String|
+                      -> rquickjs::Result<Value<'js>> {
+                    let stored = with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc
+                            .get_data()
+                            .jni
+                            .get_instance_field(JObjectRef(obj_ref as u64), &field_name))
+                    })?;
+                    jvalue_opt_to_js(&ctx, stored)
+                },
+            )?,
+        )?;
+    }
+
+    // jniSetStaticField(emuId, className, fieldName, val, sig?) -> void
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniSetStaticField",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      cls: String,
+                      field_name: String,
+                      val: Value<'js>,
+                      sig: Option<String>|
+                      -> rquickjs::Result<()> {
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        let vm = &mut uc.get_data_mut().jni;
+                        let jval = js_field_val_to_jvalue(val, sig.as_deref().unwrap_or(""), vm)?;
+                        vm.set_static_field(&cls, &field_name, jval);
+                        Ok(())
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    // jniGetStaticField(emuId, className, fieldName) -> Value
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniGetStaticField",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      cls: String,
+                      field_name: String|
+                      -> rquickjs::Result<Value<'js>> {
+                    let stored = with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc
+                            .get_data()
+                            .jni
+                            .get_static_field(&cls, &field_name)
+                            .copied())
+                    })?;
+                    jvalue_opt_to_js(&ctx, stored)
                 },
             )?,
         )?;
@@ -2090,7 +2575,8 @@ pub(super) fn register_native_bridge<'js>(
                 ctx.clone(),
                 move |ctx: Ctx<'js>,
                       emu_id: usize,
-                      lib_name: String|
+                      lib_name: String,
+                      run_init: bool|
                       -> rquickjs::Result<Object<'js>> {
                     #[cfg(feature = "apk")]
                     {
@@ -2102,13 +2588,14 @@ pub(super) fn register_native_bridge<'js>(
                             .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
                         let module = entry
                             .emu
-                            .load_apk_library(&lib_name)
+                            .load_apk_library_with_init(&lib_name, run_init)
                             .map_err(|e| throw_err(&ctx, e))?;
-                        let mod_id = entry.modules.len();
+                        let mut mods = entry.modules.borrow_mut();
+                        let mod_id = mods.len();
                         let name = module.name.clone();
                         let base = module.base_addr;
                         let size = module.image_size;
-                        entry.modules.push(module);
+                        mods.push(module);
                         let obj = Object::new(ctx.clone())?;
                         obj.set("id", mod_id)?;
                         obj.set("name", name)?;
@@ -2118,7 +2605,7 @@ pub(super) fn register_native_bridge<'js>(
                     }
                     #[cfg(not(feature = "apk"))]
                     {
-                        let _ = (&host, emu_id, lib_name);
+                        let _ = (&host, emu_id, lib_name, run_init);
                         Err(throw_err(
                             &ctx,
                             "当前构建未启用 `apk` feature，无法调用 loadApkLib",
@@ -2130,8 +2617,10 @@ pub(super) fn register_native_bridge<'js>(
     }
 
     // ---- V2: Native Hooks (code / mem / replace / attach / syscall / detach) ----
+    // 全部使用 handles_table + with_uc，允许在 Hook 回调内安全重入增删 Hook（不会触发 RefCell already borrowed）
     {
         let host = Rc::clone(host);
+        let handles_table = Rc::clone(&handles_table);
         native.set(
             "hookCode",
             Function::new(
@@ -2149,22 +2638,14 @@ pub(super) fn register_native_bridge<'js>(
                     } else {
                         Some(max_hits as u64)
                     };
-                    let mut h = host.borrow_mut();
-                    let entry = h
-                        .emus
-                        .get_mut(emu_id)
-                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                    entry
-                        .native_hooks
-                        .add_code_hook(
-                            emu_id,
-                            entry.emu.uc_mut(),
-                            begin as u64,
-                            end as u64,
-                            limit,
-                            persistent,
-                        )
-                        .map_err(|e| throw_err(&ctx, e))
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        handles
+                            .native_hooks
+                            .borrow_mut()
+                            .add_code_hook(emu_id, uc, begin as u64, end as u64, limit, persistent)
+                            .map_err(|e| throw_err(&ctx, e))
+                    })
                 },
             )?,
         )?;
@@ -2172,6 +2653,7 @@ pub(super) fn register_native_bridge<'js>(
 
     {
         let host = Rc::clone(host);
+        let handles_table = Rc::clone(&handles_table);
         native.set(
             "hookMem",
             Function::new(
@@ -2185,23 +2667,22 @@ pub(super) fn register_native_bridge<'js>(
                       func: Function<'js>|
                       -> rquickjs::Result<usize> {
                     let persistent = Persistent::save(&ctx, func);
-                    let mut h = host.borrow_mut();
-                    let entry = h
-                        .emus
-                        .get_mut(emu_id)
-                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                    entry
-                        .native_hooks
-                        .add_mem_hook(
-                            emu_id,
-                            entry.emu.uc_mut(),
-                            begin as u64,
-                            end as u64,
-                            read,
-                            write,
-                            persistent,
-                        )
-                        .map_err(|e| throw_err(&ctx, e))
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        handles
+                            .native_hooks
+                            .borrow_mut()
+                            .add_mem_hook(
+                                emu_id,
+                                uc,
+                                begin as u64,
+                                end as u64,
+                                read,
+                                write,
+                                persistent,
+                            )
+                            .map_err(|e| throw_err(&ctx, e))
+                    })
                 },
             )?,
         )?;
@@ -2209,6 +2690,7 @@ pub(super) fn register_native_bridge<'js>(
 
     {
         let host = Rc::clone(host);
+        let handles_table = Rc::clone(&handles_table);
         native.set(
             "hookReplace",
             Function::new(
@@ -2219,15 +2701,14 @@ pub(super) fn register_native_bridge<'js>(
                       func: Function<'js>|
                       -> rquickjs::Result<usize> {
                     let persistent = Persistent::save(&ctx, func);
-                    let mut h = host.borrow_mut();
-                    let entry = h
-                        .emus
-                        .get_mut(emu_id)
-                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                    entry
-                        .native_hooks
-                        .add_replace_hook(emu_id, entry.emu.uc_mut(), addr as u64, persistent)
-                        .map_err(|e| throw_err(&ctx, e))
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        handles
+                            .native_hooks
+                            .borrow_mut()
+                            .add_replace_hook(emu_id, uc, addr as u64, persistent)
+                            .map_err(|e| throw_err(&ctx, e))
+                    })
                 },
             )?,
         )?;
@@ -2235,6 +2716,7 @@ pub(super) fn register_native_bridge<'js>(
 
     {
         let host = Rc::clone(host);
+        let handles_table = Rc::clone(&handles_table);
         native.set(
             "hookAttach",
             Function::new(
@@ -2265,21 +2747,14 @@ pub(super) fn register_native_bridge<'js>(
                     } else {
                         None
                     };
-                    let mut h = host.borrow_mut();
-                    let entry = h
-                        .emus
-                        .get_mut(emu_id)
-                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                    entry
-                        .native_hooks
-                        .add_attach_hook(
-                            emu_id,
-                            entry.emu.uc_mut(),
-                            addr as u64,
-                            enter_fn,
-                            leave_fn,
-                        )
-                        .map_err(|e| throw_err(&ctx, e))
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        handles
+                            .native_hooks
+                            .borrow_mut()
+                            .add_attach_hook(emu_id, uc, addr as u64, enter_fn, leave_fn)
+                            .map_err(|e| throw_err(&ctx, e))
+                    })
                 },
             )?,
         )?;
@@ -2287,6 +2762,7 @@ pub(super) fn register_native_bridge<'js>(
 
     {
         let host = Rc::clone(host);
+        let handles_table = Rc::clone(&handles_table);
         native.set(
             "hookSyscall",
             Function::new(
@@ -2298,14 +2774,13 @@ pub(super) fn register_native_bridge<'js>(
                       -> rquickjs::Result<usize> {
                     let persistent = Persistent::save(&ctx, func);
                     let key = if nr < 0.0 { SYSCALL_WILDCARD } else { nr as u64 };
-                    let mut h = host.borrow_mut();
-                    let entry = h
-                        .emus
-                        .get_mut(emu_id)
-                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                    Ok(entry
-                        .native_hooks
-                        .add_syscall_hook(emu_id, entry.emu.uc_mut(), key, persistent))
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(handles
+                            .native_hooks
+                            .borrow_mut()
+                            .add_syscall_hook(emu_id, uc, key, persistent))
+                    })
                 },
             )?,
         )?;
@@ -2313,17 +2788,16 @@ pub(super) fn register_native_bridge<'js>(
 
     {
         let host = Rc::clone(host);
+        let handles_table = Rc::clone(&handles_table);
         native.set(
             "hookDetach",
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, emu_id: usize, hook_id: usize| -> rquickjs::Result<bool> {
-                    let mut h = host.borrow_mut();
-                    let entry = h
-                        .emus
-                        .get_mut(emu_id)
-                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                    Ok(entry.native_hooks.detach(hook_id, entry.emu.uc_mut()))
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(handles.native_hooks.borrow_mut().detach(hook_id, uc))
+                    })
                 },
             )?,
         )?;

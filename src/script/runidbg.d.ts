@@ -171,6 +171,11 @@ interface HookNamespace {
   ): HookHandle;
 }
 
+interface LoadOptions {
+  /** 是否在加载后立即执行 DT_INIT / .init_array 构造器（默认 true；设为 false 可先挂 Hook 再手动调用 mod.runInit()） */
+  runInit?: boolean;
+}
+
 interface ModuleHandle {
   readonly name: string;
   readonly base: number;
@@ -178,6 +183,8 @@ interface ModuleHandle {
   symbol(name: string): number | null;
   exports(): string[];
   call(symOrAddr: string | number | bigint, ...args: Array<number | bigint>): number;
+  /** 手动执行该模块的 DT_INIT / .init_array 构造器（配合 `load(path, { runInit: false })` 使用） */
+  runInit(): void;
 }
 
 interface JniNamespace {
@@ -189,6 +196,12 @@ interface JniNamespace {
   findClass(className: string): number;
   newString(value: string): number;
   newByteArray(bytes: Uint8Array): number;
+  /** 创建 `[C` (`jcharArray`, UTF-16) 对象 */
+  newCharArray(input: string | Uint16Array | number[]): number;
+  /** 创建 `[I` (`jintArray`) 对象 */
+  newIntArray(input: Int32Array | number[]): number;
+  /** 创建 `[J` (`jlongArray`) 对象 */
+  newLongArray(input: BigInt64Array | Array<number | bigint>): number;
   newObject(className: string, fields?: Record<string, unknown>): number;
   newStringArray(items: string[]): number;
   getStringArray(ref: number | bigint): Array<string | null> | null;
@@ -196,6 +209,20 @@ interface JniNamespace {
   getObjectArray(ref: number | bigint): number[] | null;
   getString(ref: number | bigint): string | null;
   getBytes(ref: number | bigint): Uint8Array | null;
+  /** 读取 `[C` (`jcharArray`, UTF-16) 内容 */
+  getChars(ref: number | bigint): Uint16Array | null;
+  /** 读取 `[I` (`jintArray`) 内容 */
+  getInts(ref: number | bigint): Int32Array | null;
+  /** 读取 `[J` (`jlongArray`) 内容 */
+  getLongs(ref: number | bigint): BigInt64Array | null;
+  /** 设置实例对象字段（支持基本类型、string、TypedArray、jobject 句柄及可选 JNI 签名 `sig`） */
+  setField(objRef: number | bigint, fieldName: string, value: unknown, sig?: string): void;
+  /** 查询实例对象字段值 */
+  getField(objRef: number | bigint, fieldName: string): unknown;
+  /** 设置类静态字段（支持基本类型、string、Uint8Array(`[B`)、Uint16Array(`[C`)、jobject 句柄及可选 JNI 签名 `sig`） */
+  setStaticField(className: string, fieldName: string, value: unknown, sig?: string): void;
+  /** 查询已设置的类静态字段值 */
+  getStaticField(className: string, fieldName: string): unknown;
   pushLocalFrame(): void;
   popLocalFrame(keepRef?: number | bigint): number;
   withLocalFrame<T>(fn: () => T): T;
@@ -300,7 +327,7 @@ interface ApkHandle {
   readonly libs: string[];
   readonly assets: string[];
   readonly signatureSize: number;
-  loadLib(libName: string): ModuleHandle;
+  loadLib(libName: string, opts?: LoadOptions): ModuleHandle;
 }
 
 interface CrashReport {
@@ -319,7 +346,7 @@ interface CrashReport {
 }
 
 interface EmuHandle {
-  load(path: string): ModuleHandle;
+  load(path: string, opts?: LoadOptions): ModuleHandle;
   loadApk(path: string): ApkHandle;
   jniOnLoad(mod: ModuleHandle): number | null;
   call(addr: number | bigint, ...args: Array<number | bigint>): number;

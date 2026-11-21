@@ -40,6 +40,7 @@ pub struct JniSnapshot {
     pub pending_exception: JObjectRef,
     pub utf_buffers: HashMap<u64, JObjectRef>,
     pub array_buffers: HashMap<u64, (JObjectRef, usize)>,
+    pub static_fields: HashMap<(String, String), JValue>,
 }
 
 /// 纯 Rust 伪造的 Dalvik/ART JNI 虚拟机桥接层
@@ -56,6 +57,9 @@ pub struct JniVm {
     fields: HashMap<u64, FieldDesc>,
     field_lookup: HashMap<(String, String, String, bool), u64>,
     next_field_id: u64,
+
+    /// 类静态字段表：`(normalized_class_name, field_name) -> JValue`
+    static_fields: HashMap<(String, String), JValue>,
 
     pending_exception: JObjectRef,
     /// 记录 `GetStringUTFChars` 分配的缓冲区，供 `ReleaseStringUTFChars` 追踪
@@ -86,11 +90,50 @@ impl JniVm {
             fields: HashMap::new(),
             field_lookup: HashMap::new(),
             next_field_id: 0x3000_0001,
+            static_fields: HashMap::new(),
             pending_exception: JObjectRef::NULL,
             utf_buffers: HashMap::new(),
             array_buffers: HashMap::new(),
             handler,
             initialized: false,
+        }
+    }
+
+    /// 设置类静态字段（类名自动归一化 `.` -> `/`；对象引用自动持有 GlobalRef 避免被 PopLocalFrame 回收）
+    pub fn set_static_field(&mut self, class_name: &str, field_name: &str, val: JValue) {
+        let cls = class_name.replace('.', "/");
+        if let JValue::Object(r) = val {
+            if !r.is_null() {
+                self.objects.new_global(r);
+            }
+        }
+        self.static_fields.insert((cls, field_name.to_string()), val);
+    }
+
+    /// 查询类静态字段
+    pub fn get_static_field(&self, class_name: &str, field_name: &str) -> Option<&JValue> {
+        let cls = class_name.replace('.', "/");
+        self.static_fields.get(&(cls, field_name.to_string()))
+    }
+
+    /// 设置实例对象（`JObject::Custom`）字段（对象引用自动升级 GlobalRef 避免被 PopLocalFrame 回收）
+    pub fn set_instance_field(&mut self, obj: JObjectRef, field_name: &str, val: JValue) {
+        if let JValue::Object(r) = val {
+            if !r.is_null() {
+                self.objects.new_global(r);
+            }
+        }
+        if let Some(JObject::Custom { fields, .. }) = self.objects.get_mut(obj) {
+            fields.insert(field_name.to_string(), val);
+        }
+    }
+
+    /// 查询实例对象（`JObject::Custom`）字段
+    pub fn get_instance_field(&self, obj: JObjectRef, field_name: &str) -> Option<JValue> {
+        if let Some(JObject::Custom { fields, .. }) = self.objects.get(obj) {
+            fields.get(field_name).copied()
+        } else {
+            None
         }
     }
 
@@ -101,6 +144,7 @@ impl JniVm {
             pending_exception: self.pending_exception,
             utf_buffers: self.utf_buffers.clone(),
             array_buffers: self.array_buffers.clone(),
+            static_fields: self.static_fields.clone(),
         }
     }
 
@@ -110,6 +154,7 @@ impl JniVm {
         self.pending_exception = snap.pending_exception;
         self.utf_buffers = snap.utf_buffers.clone();
         self.array_buffers = snap.array_buffers.clone();
+        self.static_fields = snap.static_fields.clone();
     }
 
     /// 弹出 JNI 局部引用帧，并顺带回收帧内已销毁 `jstring`/`jarray` 遗留的未释放 guest 缓冲区
@@ -699,28 +744,68 @@ where
 
         // 实例字段读取 (95..=103)
         95 => dispatch_instance_field(uc, x1, x2, get_state, |h, ctx, o, f| {
+            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(o) {
+                if let Some(JValue::Object(r)) = fields.get(&f.name).copied() {
+                    return r.0;
+                }
+            }
             h.get_object_field(ctx, o, f).0
         }),
         96 => dispatch_instance_field(uc, x1, x2, get_state, |h, ctx, o, f| {
+            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(o) {
+                if let Some(JValue::Boolean(b)) = fields.get(&f.name).copied() {
+                    return u64::from(b);
+                }
+            }
             u64::from(h.get_boolean_field(ctx, o, f))
         }),
         97 => dispatch_instance_field(uc, x1, x2, get_state, |h, ctx, o, f| {
+            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(o) {
+                if let Some(JValue::Byte(v)) = fields.get(&f.name).copied() {
+                    return v as i64 as u64;
+                }
+            }
             h.get_byte_field(ctx, o, f) as i64 as u64
         }),
         98 => dispatch_instance_field(uc, x1, x2, get_state, |h, ctx, o, f| {
+            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(o) {
+                if let Some(JValue::Char(v)) = fields.get(&f.name).copied() {
+                    return u64::from(v);
+                }
+            }
             u64::from(h.get_char_field(ctx, o, f))
         }),
         99 => dispatch_instance_field(uc, x1, x2, get_state, |h, ctx, o, f| {
+            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(o) {
+                if let Some(JValue::Short(v)) = fields.get(&f.name).copied() {
+                    return v as i64 as u64;
+                }
+            }
             h.get_short_field(ctx, o, f) as i64 as u64
         }),
         100 => dispatch_instance_field(uc, x1, x2, get_state, |h, ctx, o, f| {
+            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(o) {
+                if let Some(JValue::Int(v)) = fields.get(&f.name).copied() {
+                    return v as i64 as u64;
+                }
+            }
             h.get_int_field(ctx, o, f) as i64 as u64
         }),
         101 => dispatch_instance_field(uc, x1, x2, get_state, |h, ctx, o, f| {
+            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(o) {
+                if let Some(JValue::Long(v)) = fields.get(&f.name).copied() {
+                    return v as u64;
+                }
+            }
             h.get_long_field(ctx, o, f) as u64
         }),
         102 => {
             let bits = dispatch_instance_field(uc, x1, x2, get_state, |h, ctx, o, f| {
+                if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(o) {
+                    if let Some(JValue::Float(v)) = fields.get(&f.name).copied() {
+                        return u64::from(v.to_bits());
+                    }
+                }
                 u64::from(h.get_float_field(ctx, o, f).to_bits())
             });
             let _ = uc.reg_write(RegisterARM64::S0, bits);
@@ -728,6 +813,11 @@ where
         }
         103 => {
             let bits = dispatch_instance_field(uc, x1, x2, get_state, |h, ctx, o, f| {
+                if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(o) {
+                    if let Some(JValue::Double(v)) = fields.get(&f.name).copied() {
+                        return v.to_bits();
+                    }
+                }
                 h.get_double_field(ctx, o, f).to_bits()
             });
             let _ = uc.reg_write(RegisterARM64::D0, bits);
@@ -753,10 +843,17 @@ where
                     JValue::Double(f64::from_bits(bits))
                 }
             };
-            dispatch_instance_field(uc, x1, x2, get_state, |h, ctx, o, f| {
-                h.set_field(ctx, o, f, val);
-                0
-            })
+            let (vm, _) = get_state(uc.get_data_mut());
+            if let Some(field) = vm.fields.get(&x2).cloned() {
+                let obj = JObjectRef(x1);
+                vm.set_instance_field(obj, &field.name, val);
+                let mut ctx = JniContext {
+                    objects: &mut vm.objects,
+                    package_name: &vm.package_name,
+                };
+                vm.handler.set_field(&mut ctx, obj, &field, val);
+            }
+            0
         }
 
         // 静态方法三联调用 (114..=143)
@@ -823,76 +920,187 @@ where
             let (vm, _) = get_state(uc.get_data_mut());
             let cls = vm.resolve_class_name(JObjectRef(x1));
             if let Some(field) = vm.fields.get(&x2).cloned() {
-                let ret = {
-                    let mut ctx = JniContext {
-                        objects: &mut vm.objects,
-                        package_name: &vm.package_name,
-                    };
-                    vm.handler.get_static_object_field(&mut ctx, &cls, &field)
-                };
-                if !ret.is_null() {
-                    ret.0
+                if let Some(JValue::Object(r)) = vm.get_static_field(&cls, &field.name).copied() {
+                    r.0
                 } else {
-                    resolve_builtin_build_object_field(
-                        &mut vm.objects,
-                        &vm.device_profile,
-                        &cls,
-                        &field,
-                    )
-                    .0
+                    let ret = {
+                        let mut ctx = JniContext {
+                            objects: &mut vm.objects,
+                            package_name: &vm.package_name,
+                        };
+                        vm.handler.get_static_object_field(&mut ctx, &cls, &field)
+                    };
+                    if !ret.is_null() {
+                        ret.0
+                    } else {
+                        resolve_builtin_build_object_field(
+                            &mut vm.objects,
+                            &vm.device_profile,
+                            &cls,
+                            &field,
+                        )
+                        .0
+                    }
                 }
             } else {
                 0
             }
         }
-        146 => dispatch_static_field(uc, x1, x2, get_state, |h, ctx, cls, f| {
-            u64::from(h.get_static_boolean_field(ctx, cls, f))
-        }),
-        147 => dispatch_static_field(uc, x1, x2, get_state, |h, ctx, cls, f| {
-            h.get_static_byte_field(ctx, cls, f) as i64 as u64
-        }),
-        148 => dispatch_static_field(uc, x1, x2, get_state, |h, ctx, cls, f| {
-            u64::from(h.get_static_char_field(ctx, cls, f))
-        }),
-        149 => dispatch_static_field(uc, x1, x2, get_state, |h, ctx, cls, f| {
-            h.get_static_short_field(ctx, cls, f) as i64 as u64
-        }),
+        146 => {
+            let (vm, _) = get_state(uc.get_data_mut());
+            let cls = vm.resolve_class_name(JObjectRef(x1));
+            if let Some(field) = vm.fields.get(&x2).cloned() {
+                if let Some(JValue::Boolean(b)) = vm.get_static_field(&cls, &field.name).copied() {
+                    u64::from(b)
+                } else {
+                    let mut ctx = JniContext {
+                        objects: &mut vm.objects,
+                        package_name: &vm.package_name,
+                    };
+                    u64::from(vm.handler.get_static_boolean_field(&mut ctx, &cls, &field))
+                }
+            } else {
+                0
+            }
+        }
+        147 => {
+            let (vm, _) = get_state(uc.get_data_mut());
+            let cls = vm.resolve_class_name(JObjectRef(x1));
+            if let Some(field) = vm.fields.get(&x2).cloned() {
+                if let Some(JValue::Byte(v)) = vm.get_static_field(&cls, &field.name).copied() {
+                    v as i64 as u64
+                } else {
+                    let mut ctx = JniContext {
+                        objects: &mut vm.objects,
+                        package_name: &vm.package_name,
+                    };
+                    vm.handler.get_static_byte_field(&mut ctx, &cls, &field) as i64 as u64
+                }
+            } else {
+                0
+            }
+        }
+        148 => {
+            let (vm, _) = get_state(uc.get_data_mut());
+            let cls = vm.resolve_class_name(JObjectRef(x1));
+            if let Some(field) = vm.fields.get(&x2).cloned() {
+                if let Some(JValue::Char(v)) = vm.get_static_field(&cls, &field.name).copied() {
+                    u64::from(v)
+                } else {
+                    let mut ctx = JniContext {
+                        objects: &mut vm.objects,
+                        package_name: &vm.package_name,
+                    };
+                    u64::from(vm.handler.get_static_char_field(&mut ctx, &cls, &field))
+                }
+            } else {
+                0
+            }
+        }
+        149 => {
+            let (vm, _) = get_state(uc.get_data_mut());
+            let cls = vm.resolve_class_name(JObjectRef(x1));
+            if let Some(field) = vm.fields.get(&x2).cloned() {
+                if let Some(JValue::Short(v)) = vm.get_static_field(&cls, &field.name).copied() {
+                    v as i64 as u64
+                } else {
+                    let mut ctx = JniContext {
+                        objects: &mut vm.objects,
+                        package_name: &vm.package_name,
+                    };
+                    vm.handler.get_static_short_field(&mut ctx, &cls, &field) as i64 as u64
+                }
+            } else {
+                0
+            }
+        }
         150 => {
             let (vm, _) = get_state(uc.get_data_mut());
             let cls = vm.resolve_class_name(JObjectRef(x1));
             if let Some(field) = vm.fields.get(&x2).cloned() {
-                let val = {
-                    let mut ctx = JniContext {
-                        objects: &mut vm.objects,
-                        package_name: &vm.package_name,
-                    };
-                    vm.handler.get_static_int_field(&mut ctx, &cls, &field)
-                };
-                if val != 0 {
-                    val as i64 as u64
-                } else if cls == "android/os/Build$VERSION" && field.name == "SDK_INT" {
-                    (vm.device_profile.sdk_int as i32) as i64 as u64
+                if let Some(JValue::Int(v)) = vm.get_static_field(&cls, &field.name).copied() {
+                    v as i64 as u64
                 } else {
-                    0
+                    let val = {
+                        let mut ctx = JniContext {
+                            objects: &mut vm.objects,
+                            package_name: &vm.package_name,
+                        };
+                        vm.handler.get_static_int_field(&mut ctx, &cls, &field)
+                    };
+                    if val != 0 {
+                        val as i64 as u64
+                    } else if cls == "android/os/Build$VERSION" && field.name == "SDK_INT" {
+                        (vm.device_profile.sdk_int as i32) as i64 as u64
+                    } else {
+                        0
+                    }
                 }
             } else {
                 0
             }
         }
-        151 => dispatch_static_field(uc, x1, x2, get_state, |h, ctx, cls, f| {
-            h.get_static_long_field(ctx, cls, f) as u64
-        }),
+        151 => {
+            let (vm, _) = get_state(uc.get_data_mut());
+            let cls = vm.resolve_class_name(JObjectRef(x1));
+            if let Some(field) = vm.fields.get(&x2).cloned() {
+                if let Some(JValue::Long(v)) = vm.get_static_field(&cls, &field.name).copied() {
+                    v as u64
+                } else {
+                    let mut ctx = JniContext {
+                        objects: &mut vm.objects,
+                        package_name: &vm.package_name,
+                    };
+                    vm.handler.get_static_long_field(&mut ctx, &cls, &field) as u64
+                }
+            } else {
+                0
+            }
+        }
         152 => {
-            let bits = dispatch_static_field(uc, x1, x2, get_state, |h, ctx, cls, f| {
-                u64::from(h.get_static_float_field(ctx, cls, f).to_bits())
-            });
+            let bits = {
+                let (vm, _) = get_state(uc.get_data_mut());
+                let cls = vm.resolve_class_name(JObjectRef(x1));
+                if let Some(field) = vm.fields.get(&x2).cloned() {
+                    if let Some(JValue::Float(v)) = vm.get_static_field(&cls, &field.name).copied()
+                    {
+                        u64::from(v.to_bits())
+                    } else {
+                        let mut ctx = JniContext {
+                            objects: &mut vm.objects,
+                            package_name: &vm.package_name,
+                        };
+                        u64::from(vm.handler.get_static_float_field(&mut ctx, &cls, &field).to_bits())
+                    }
+                } else {
+                    0
+                }
+            };
             let _ = uc.reg_write(RegisterARM64::S0, bits);
             bits
         }
         153 => {
-            let bits = dispatch_static_field(uc, x1, x2, get_state, |h, ctx, cls, f| {
-                h.get_static_double_field(ctx, cls, f).to_bits()
-            });
+            let bits = {
+                let (vm, _) = get_state(uc.get_data_mut());
+                let cls = vm.resolve_class_name(JObjectRef(x1));
+                if let Some(field) = vm.fields.get(&x2).cloned() {
+                    if let Some(JValue::Double(v)) =
+                        vm.get_static_field(&cls, &field.name).copied()
+                    {
+                        v.to_bits()
+                    } else {
+                        let mut ctx = JniContext {
+                            objects: &mut vm.objects,
+                            package_name: &vm.package_name,
+                        };
+                        vm.handler
+                            .get_static_double_field(&mut ctx, &cls, &field)
+                            .to_bits()
+                    }
+                } else {
+                    0
+                }
+            };
             let _ = uc.reg_write(RegisterARM64::D0, bits);
             bits
         }
@@ -916,10 +1124,17 @@ where
                     JValue::Double(f64::from_bits(bits))
                 }
             };
-            dispatch_static_field(uc, x1, x2, get_state, |h, ctx, cls, f| {
-                h.set_static_field(ctx, cls, f, val);
-                0
-            })
+            let (vm, _) = get_state(uc.get_data_mut());
+            let cls = vm.resolve_class_name(JObjectRef(x1));
+            if let Some(field) = vm.fields.get(&x2).cloned() {
+                vm.set_static_field(&cls, &field.name, val);
+                let mut ctx = JniContext {
+                    objects: &mut vm.objects,
+                    package_name: &vm.package_name,
+                };
+                vm.handler.set_static_field(&mut ctx, &cls, &field, val);
+            }
+            0
         }
 
         // 163: NewString (UTF-16)
@@ -1443,29 +1658,6 @@ where
         package_name: &vm.package_name,
     };
     invoke(vm.handler.as_mut(), &mut ctx, JObjectRef(obj_raw), &field)
-}
-
-fn dispatch_static_field<D, F, H>(
-    uc: &mut Unicorn<'_, D>,
-    cls_raw: u64,
-    fid_raw: u64,
-    get_state: &mut F,
-    invoke: H,
-) -> u64
-where
-    F: FnMut(&mut D) -> (&mut JniVm, &mut MemoryManager),
-    H: FnOnce(&mut dyn JniHandler, &mut JniContext<'_>, &str, &FieldDesc) -> u64,
-{
-    let (vm, _) = get_state(uc.get_data_mut());
-    let cls = vm.resolve_class_name(JObjectRef(cls_raw));
-    let Some(field) = vm.fields.get(&fid_raw).cloned() else {
-        return 0;
-    };
-    let mut ctx = JniContext {
-        objects: &mut vm.objects,
-        package_name: &vm.package_name,
-    };
-    invoke(vm.handler.as_mut(), &mut ctx, &cls, &field)
 }
 
 /// 将 `DeviceProfile` 自动映射到 `android/os/Build` 与 `android/os/Build$VERSION` 静态字段
