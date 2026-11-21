@@ -121,12 +121,56 @@ pub enum HleBuiltin {
     Ctype(&'static str),
     MathUnaryF64(&'static str),
     MathBinaryF64(&'static str),
-    // Pthread 单线程安全实现
+    // Pthread 协作式线程与 TLS
     PthreadSelf,
     PthreadOnce,
     PthreadKeyCreate,
     PthreadSetSpecific,
     PthreadGetSpecific,
+    PthreadCreate,
+    PthreadJoin,
+    PthreadDetach,
+    PthreadExit,
+    // 非局部跳转与信号处理
+    Setjmp,
+    Longjmp,
+    Sigaction,
+    Signal,
+    Sigprocmask,
+    Sigemptyset,
+    Sigfillset,
+    Sigaddset,
+    Sigdelset,
+    Sigismember,
+    // Android NDK AAssetManager (libandroid.so)
+    AAssetManagerFromJava,
+    AAssetManagerOpen,
+    AAssetManagerOpenDir,
+    AAssetRead,
+    AAssetSeek,
+    AAssetGetLength,
+    AAssetGetRemainingLength,
+    AAssetGetBuffer,
+    AAssetClose,
+    AAssetDirGetNextFileName,
+    AAssetDirRewind,
+    AAssetDirClose,
+    // zlib (libz.so)
+    Adler32,
+    CompressBound,
+    Compress,
+    Compress2,
+    Uncompress,
+    DeflateInit,
+    DeflateInit2,
+    Deflate,
+    DeflateEnd,
+    DeflateReset,
+    InflateInit,
+    InflateInit2,
+    Inflate,
+    InflateEnd,
+    InflateReset,
     // POSIX Socket / EventLoop / DNS / 虚拟网卡 HLE
     Socket,
     Bind,
@@ -329,6 +373,49 @@ impl HleBuiltin {
             "pthread_key_create" => Some(Self::PthreadKeyCreate),
             "pthread_setspecific" => Some(Self::PthreadSetSpecific),
             "pthread_getspecific" => Some(Self::PthreadGetSpecific),
+            "pthread_create" => Some(Self::PthreadCreate),
+            "pthread_join" => Some(Self::PthreadJoin),
+            "pthread_detach" => Some(Self::PthreadDetach),
+            "pthread_exit" => Some(Self::PthreadExit),
+            "setjmp" | "_setjmp" | "sigsetjmp" => Some(Self::Setjmp),
+            "longjmp" | "_longjmp" | "siglongjmp" => Some(Self::Longjmp),
+            "sigaction" => Some(Self::Sigaction),
+            "signal" | "bsd_signal" => Some(Self::Signal),
+            "sigprocmask" | "pthread_sigmask" => Some(Self::Sigprocmask),
+            "sigemptyset" => Some(Self::Sigemptyset),
+            "sigfillset" => Some(Self::Sigfillset),
+            "sigaddset" => Some(Self::Sigaddset),
+            "sigdelset" => Some(Self::Sigdelset),
+            "sigismember" => Some(Self::Sigismember),
+            "AAssetManager_fromJava" => Some(Self::AAssetManagerFromJava),
+            "AAssetManager_open" => Some(Self::AAssetManagerOpen),
+            "AAssetManager_openDir" => Some(Self::AAssetManagerOpenDir),
+            "AAsset_read" => Some(Self::AAssetRead),
+            "AAsset_seek" | "AAsset_seek64" => Some(Self::AAssetSeek),
+            "AAsset_getLength" | "AAsset_getLength64" => Some(Self::AAssetGetLength),
+            "AAsset_getRemainingLength" | "AAsset_getRemainingLength64" => {
+                Some(Self::AAssetGetRemainingLength)
+            }
+            "AAsset_getBuffer" => Some(Self::AAssetGetBuffer),
+            "AAsset_close" => Some(Self::AAssetClose),
+            "AAssetDir_getNextFileName" => Some(Self::AAssetDirGetNextFileName),
+            "AAssetDir_rewind" => Some(Self::AAssetDirRewind),
+            "AAssetDir_close" => Some(Self::AAssetDirClose),
+            "adler32" => Some(Self::Adler32),
+            "compressBound" => Some(Self::CompressBound),
+            "compress" => Some(Self::Compress),
+            "compress2" => Some(Self::Compress2),
+            "uncompress" | "uncompress2" => Some(Self::Uncompress),
+            "deflateInit_" => Some(Self::DeflateInit),
+            "deflateInit2_" => Some(Self::DeflateInit2),
+            "deflate" => Some(Self::Deflate),
+            "deflateEnd" => Some(Self::DeflateEnd),
+            "deflateReset" => Some(Self::DeflateReset),
+            "inflateInit_" => Some(Self::InflateInit),
+            "inflateInit2_" => Some(Self::InflateInit2),
+            "inflate" => Some(Self::Inflate),
+            "inflateEnd" => Some(Self::InflateEnd),
+            "inflateReset" => Some(Self::InflateReset),
             "socket" => Some(Self::Socket),
             "bind" => Some(Self::Bind),
             "listen" => Some(Self::Listen),
@@ -413,13 +500,6 @@ impl HleBuiltin {
             | "fdatasync"
             | "getenv"
             | "srand"
-            | "sigaction"
-            | "sigfillset"
-            | "sigemptyset"
-            | "sigaddset"
-            | "sigdelset"
-            | "sigprocmask"
-            | "signal"
             | "alarm"
             | "prctl"
             | "eglGetProcAddress"
@@ -427,9 +507,6 @@ impl HleBuiltin {
             | "openlog"
             | "closelog"
             | "syslog"
-            | "pthread_create"
-            | "pthread_detach"
-            | "pthread_join"
             | "pthread_attr_init"
             | "pthread_attr_destroy"
             | "pthread_attr_setdetachstate"
@@ -484,6 +561,31 @@ struct PropInfoEntry {
     value_ptr: u64,
 }
 
+struct AssetStream {
+    data: Vec<u8>,
+    pos: usize,
+    guest_buf: Option<u64>,
+}
+
+struct AssetDirStream {
+    files: Vec<String>,
+    cursor: usize,
+    name_buf: u64,
+}
+
+enum ZlibStreamState {
+    Deflate {
+        compress: flate2::Compress,
+        level: u32,
+        zlib_header: bool,
+    },
+    Inflate {
+        decompress: flate2::Decompress,
+        window_bits: i32,
+        gzip_header_pending: bool,
+    },
+}
+
 /// 供 `dlopen`/`dlsym`/`dladdr`/`dl_iterate_phdr` 使用的已加载模块镜像信息
 #[derive(Debug, Clone)]
 pub struct DlModuleEntry {
@@ -499,9 +601,17 @@ pub struct TrampolineTable {
     name_to_addr: HashMap<String, u64>,
     pthread_keys: HashMap<u32, u64>,
     next_pthread_key: u32,
+    next_pthread_tid: u64,
+    pending_threads: HashMap<u64, (u64, u64)>,
+    pthread_exit_stack: Vec<(u64, u64)>,
+    sigactions: HashMap<i32, [u8; 32]>,
+    sigmask: u64,
     mmap_backings: HashMap<u64, MmapFileBacking>,
     stdio_streams: HashMap<u64, StdioStream>,
     dir_streams: HashMap<u64, DirStream>,
+    asset_streams: HashMap<u64, AssetStream>,
+    asset_dirs: HashMap<u64, AssetDirStream>,
+    zlib_streams: HashMap<u64, ZlibStreamState>,
     prop_infos: HashMap<u64, PropInfoEntry>,
     loaded_modules: Vec<DlModuleEntry>,
     last_dlerror: Option<String>,
@@ -517,6 +627,10 @@ impl Default for TrampolineTable {
     }
 }
 
+/// 协作式 `pthread_create` 跳板地址（执行 `start_routine(arg)` 并把返回值写入 `*retval_slot`）
+/// 入口约定：X0 = arg, X1 = start_routine, X2 = retval_slot, X30 = caller LR
+/// 偏移 +16 (`str x0, [x19]`) 同时作为 `pthread_exit(retval)` 的退栈恢复点
+const PTHREAD_CREATE_STUB_ADDR: u64 = TRAMPOLINE_BASE + PAGE_SIZE * 16 - 0x140;
 /// `pthread_once` 回调执行跳板地址（位于 64KB 跳板区末尾，不占用符号槽位）
 /// 指令序列：
 /// ```asm
@@ -537,9 +651,17 @@ impl TrampolineTable {
             name_to_addr: HashMap::new(),
             pthread_keys: HashMap::new(),
             next_pthread_key: 1,
+            next_pthread_tid: 0x1001,
+            pending_threads: HashMap::new(),
+            pthread_exit_stack: Vec::new(),
+            sigactions: HashMap::new(),
+            sigmask: 0,
             mmap_backings: HashMap::new(),
             stdio_streams: HashMap::new(),
             dir_streams: HashMap::new(),
+            asset_streams: HashMap::new(),
+            asset_dirs: HashMap::new(),
+            zlib_streams: HashMap::new(),
             prop_infos: HashMap::new(),
             loaded_modules: Vec::new(),
             last_dlerror: None,
@@ -601,6 +723,20 @@ impl TrampolineTable {
             "[emu:hle_trampoline]",
             0,
         )?;
+        let pthread_create_insns: [u32; 9] = [
+            0xA9BE_7BFD, // stp x29, x30, [sp, #-32]!
+            0xF900_0BF3, // str x19, [sp, #16]
+            0xAA02_03F3, // mov x19, x2 (retval_slot)
+            0xD63F_0020, // blr x1 (start_routine(x0=arg))
+            0xF900_0260, // str x0, [x19]  <-- pthread_exit resume point (+16)
+            0xD280_0000, // mov x0, #0
+            0xF940_0BF3, // ldr x19, [sp, #16]
+            0xA8C2_7BFD, // ldp x29, x30, [sp], #32
+            ARM64_RET_INSN,
+        ];
+        for (i, insn) in pthread_create_insns.iter().enumerate() {
+            mem.write_u32(uc, PTHREAD_CREATE_STUB_ADDR + (i as u64) * 4, *insn)?;
+        }
         let stub_insns: [u32; 5] = [
             0xA9BF_7BFD, // stp x29, x30, [sp, #-16]!
             0xD63F_0020, // blr x1
@@ -3572,6 +3708,780 @@ where
                 0
             }
         }
+        HleBuiltin::PthreadCreate => {
+            // int pthread_create(pthread_t *thread, const pthread_attr_t *attr, void *(*start_routine)(void *), void *arg)
+            // 延迟到 pthread_join 时协作执行：
+            // 1) 后台守护线程（while(1) sleep 心跳/反调试线程，永不 join）不会阻塞主线程导致死循环；
+            // 2) 需要取回结果的工作线程在 pthread_join(tid, &retval) 时执行 start_routine(arg) 并写回 retval。
+            let tid_ptr = x0;
+            let start_routine = x2;
+            let arg = x3;
+            let tid = {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                let tid = table.next_pthread_tid;
+                table.next_pthread_tid += 1;
+                if start_routine != 0 {
+                    table.pending_threads.insert(tid, (start_routine, arg));
+                }
+                tid
+            };
+            if tid_ptr != 0 {
+                let _ = uc.mem_write(tid_ptr, &tid.to_le_bytes());
+            }
+            0
+        }
+        HleBuiltin::PthreadJoin => {
+            // int pthread_join(pthread_t thread, void **retval)
+            let cur_sp = uc.reg_read(RegisterARM64::SP).unwrap_or(0);
+            let pending = {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                while let Some(&(frame_sp, _)) = table.pthread_exit_stack.last() {
+                    if frame_sp < cur_sp {
+                        table.pthread_exit_stack.pop();
+                    } else {
+                        break;
+                    }
+                }
+                let dummy_slot = table.errno_addr + 8;
+                let retval_slot = if x1 != 0 { x1 } else { dummy_slot };
+                if let Some((start_routine, arg)) = table.pending_threads.remove(&x0) {
+                    table
+                        .pthread_exit_stack
+                        .push((cur_sp.wrapping_sub(32), retval_slot));
+                    Some((start_routine, arg, retval_slot))
+                } else {
+                    None
+                }
+            };
+            if let Some((start_routine, arg, retval_slot)) = pending {
+                let _ = uc.reg_write(RegisterARM64::X0, arg);
+                let _ = uc.reg_write(RegisterARM64::X1, start_routine);
+                let _ = uc.reg_write(RegisterARM64::X2, retval_slot);
+                let _ = uc.reg_write(RegisterARM64::PC, PTHREAD_CREATE_STUB_ADDR);
+                return;
+            }
+            if x1 != 0 {
+                let _ = uc.mem_write(x1, &0u64.to_le_bytes());
+            }
+            0
+        }
+        HleBuiltin::PthreadDetach => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            table.pending_threads.remove(&x0);
+            0
+        }
+        HleBuiltin::PthreadExit => {
+            // void pthread_exit(void *retval)
+            let cur_sp = uc.reg_read(RegisterARM64::SP).unwrap_or(0);
+            let frame = {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                if let Some(&(frame_sp, _)) = table.pthread_exit_stack.last() {
+                    if cur_sp <= frame_sp {
+                        table.pthread_exit_stack.pop()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some((frame_sp, retval_slot)) = frame {
+                let _ = uc.reg_write(RegisterARM64::SP, frame_sp);
+                let _ = uc.reg_write(RegisterARM64::X19, retval_slot);
+                let _ = uc.reg_write(RegisterARM64::X0, x0);
+                let _ = uc.reg_write(RegisterARM64::PC, PTHREAD_CREATE_STUB_ADDR + 16);
+                return;
+            }
+            let _ = uc.emu_stop();
+            return;
+        }
+        HleBuiltin::Setjmp => {
+            // int setjmp(jmp_buf env) / int sigsetjmp(sigjmp_buf env, int savesigs)
+            if x0 != 0 {
+                let mut buf = [0u8; 21 * 8];
+                for (i, &reg) in JMPBUF_REGS.iter().enumerate() {
+                    let v = uc.reg_read(reg).unwrap_or(0);
+                    buf[i * 8..(i + 1) * 8].copy_from_slice(&v.to_le_bytes());
+                }
+                let _ = uc.mem_write(x0, &buf);
+            }
+            0
+        }
+        HleBuiltin::Longjmp => {
+            // void longjmp(jmp_buf env, int val) / void siglongjmp(sigjmp_buf env, int val)
+            if x0 != 0 {
+                let mut buf = [0u8; 21 * 8];
+                if uc.mem_read(x0, &mut buf).is_ok() {
+                    for (i, &reg) in JMPBUF_REGS.iter().enumerate() {
+                        let v = u64::from_le_bytes(buf[i * 8..(i + 1) * 8].try_into().unwrap());
+                        let _ = uc.reg_write(reg, v);
+                    }
+                    let target_pc = u64::from_le_bytes(buf[11 * 8..12 * 8].try_into().unwrap());
+                    let val = if (x1 as i32) == 0 {
+                        1u64
+                    } else {
+                        (x1 as i32) as i64 as u64
+                    };
+                    let _ = uc.reg_write(RegisterARM64::X0, val);
+                    let _ = uc.reg_write(RegisterARM64::PC, target_pc);
+                    return;
+                }
+            }
+            0
+        }
+        HleBuiltin::Sigaction => {
+            // int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
+            let signum = x0 as i32;
+            let prev = {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                table.sigactions.get(&signum).copied().unwrap_or([0u8; 32])
+            };
+            if x2 != 0 {
+                let _ = uc.mem_write(x2, &prev);
+            }
+            if x1 != 0 {
+                let mut act = [0u8; 32];
+                if uc.mem_read(x1, &mut act).is_ok() {
+                    let (table, _, _) = get_state(uc.get_data_mut());
+                    table.sigactions.insert(signum, act);
+                }
+            }
+            0
+        }
+        HleBuiltin::Signal => {
+            // sighandler_t signal(int signum, sighandler_t handler)
+            let signum = x0 as i32;
+            let (table, _, _) = get_state(uc.get_data_mut());
+            let prev = table
+                .sigactions
+                .get(&signum)
+                .map(|a| u64::from_le_bytes(a[0..8].try_into().unwrap()))
+                .unwrap_or(0);
+            let mut next = [0u8; 32];
+            next[0..8].copy_from_slice(&x1.to_le_bytes());
+            table.sigactions.insert(signum, next);
+            prev
+        }
+        HleBuiltin::Sigprocmask => {
+            // int sigprocmask(int how, const sigset_t *set, sigset_t *oldset)
+            let old = {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                table.sigmask
+            };
+            if x2 != 0 {
+                let _ = uc.mem_write(x2, &old.to_le_bytes());
+            }
+            if x1 != 0 {
+                let new_set = read_guest_u64(uc, x1);
+                let (table, _, _) = get_state(uc.get_data_mut());
+                match x0 as i32 {
+                    0 => table.sigmask |= new_set,  // SIG_BLOCK
+                    1 => table.sigmask &= !new_set, // SIG_UNBLOCK
+                    2 => table.sigmask = new_set,   // SIG_SETMASK
+                    _ => {}
+                }
+            }
+            0
+        }
+        HleBuiltin::Sigemptyset => {
+            if x0 != 0 {
+                let _ = uc.mem_write(x0, &0u64.to_le_bytes());
+            }
+            0
+        }
+        HleBuiltin::Sigfillset => {
+            if x0 != 0 {
+                let _ = uc.mem_write(x0, &(!0u64).to_le_bytes());
+            }
+            0
+        }
+        HleBuiltin::Sigaddset => {
+            let sig = x1 as i32;
+            if x0 != 0 && (1..=64).contains(&sig) {
+                let cur = read_guest_u64(uc, x0);
+                let _ = uc.mem_write(x0, &(cur | (1u64 << (sig - 1))).to_le_bytes());
+            }
+            0
+        }
+        HleBuiltin::Sigdelset => {
+            let sig = x1 as i32;
+            if x0 != 0 && (1..=64).contains(&sig) {
+                let cur = read_guest_u64(uc, x0);
+                let _ = uc.mem_write(x0, &(cur & !(1u64 << (sig - 1))).to_le_bytes());
+            }
+            0
+        }
+        HleBuiltin::Sigismember => {
+            let sig = x1 as i32;
+            if x0 != 0 && (1..=64).contains(&sig) {
+                let cur = read_guest_u64(uc, x0);
+                u64::from((cur & (1u64 << (sig - 1))) != 0)
+            } else {
+                0
+            }
+        }
+        HleBuiltin::AAssetManagerFromJava => {
+            // AAssetManager* AAssetManager_fromJava(JNIEnv* env, jobject assetManager)
+            0xAA55_0001
+        }
+        HleBuiltin::AAssetManagerOpen => {
+            // AAsset* AAssetManager_open(AAssetManager* mgr, const char* filename, int mode)
+            let name = read_guest_cstr(uc, x1, 512);
+            let trimmed = name.trim_start_matches('/');
+            let candidates = [
+                format!("/assets/{trimmed}"),
+                format!("/{trimmed}"),
+                name.clone(),
+            ];
+            let (table, mem, vfs) = get_state(uc.get_data_mut());
+            let mut found = None;
+            for cand in &candidates {
+                let fd = vfs.open(cand, mem);
+                if fd >= 0 {
+                    let fd = fd as i32;
+                    let mut all = Vec::new();
+                    loop {
+                        match vfs.read(fd, 65536) {
+                            Ok(chunk) if !chunk.is_empty() => all.extend_from_slice(&chunk),
+                            _ => break,
+                        }
+                    }
+                    let _ = vfs.close(fd);
+                    found = Some(all);
+                    break;
+                }
+            }
+            if let Some(data) = found {
+                if let Ok(handle) = mem.alloc_heap(8) {
+                    table.asset_streams.insert(
+                        handle,
+                        AssetStream {
+                            data,
+                            pos: 0,
+                            guest_buf: None,
+                        },
+                    );
+                    handle
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
+        HleBuiltin::AAssetManagerOpenDir => {
+            // AAssetDir* AAssetManager_openDir(AAssetManager* mgr, const char* dirName)
+            let dir_name = read_guest_cstr(uc, x1, 512);
+            let trimmed = dir_name.trim_matches('/');
+            let vfs_dir = if trimmed.is_empty() {
+                "/assets".to_string()
+            } else {
+                format!("/assets/{trimmed}")
+            };
+            let (table, mem, vfs) = get_state(uc.get_data_mut());
+            let files: Vec<String> = vfs
+                .list_dir(&vfs_dir)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|(n, d_type)| n != "." && n != ".." && *d_type != 4)
+                .map(|(n, _)| n)
+                .collect();
+            if let (Ok(handle), Ok(name_buf)) = (mem.alloc_heap(8), mem.alloc_heap(512)) {
+                table.asset_dirs.insert(
+                    handle,
+                    AssetDirStream {
+                        files,
+                        cursor: 0,
+                        name_buf,
+                    },
+                );
+                handle
+            } else {
+                0
+            }
+        }
+        HleBuiltin::AAssetRead => {
+            // int AAsset_read(AAsset* asset, void* buf, size_t count)
+            let chunk = {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                if let Some(st) = table.asset_streams.get_mut(&x0) {
+                    let avail = st.data.len().saturating_sub(st.pos);
+                    let n = (x2 as usize).min(avail);
+                    let slice = st.data[st.pos..st.pos + n].to_vec();
+                    st.pos += n;
+                    Some(slice)
+                } else {
+                    None
+                }
+            };
+            if let Some(bytes) = chunk {
+                if !bytes.is_empty() && x1 != 0 {
+                    let _ = uc.mem_write(x1, &bytes);
+                }
+                bytes.len() as u64
+            } else {
+                (-1i64) as u64
+            }
+        }
+        HleBuiltin::AAssetSeek => {
+            // off_t AAsset_seek(AAsset* asset, off_t offset, int whence)
+            let (table, _, _) = get_state(uc.get_data_mut());
+            if let Some(st) = table.asset_streams.get_mut(&x0) {
+                let off = x1 as i64;
+                let base = match x2 as i32 {
+                    0 => 0i64,
+                    1 => st.pos as i64,
+                    2 => st.data.len() as i64,
+                    _ => return,
+                };
+                let next = base.saturating_add(off).clamp(0, st.data.len() as i64) as usize;
+                st.pos = next;
+                next as u64
+            } else {
+                (-1i64) as u64
+            }
+        }
+        HleBuiltin::AAssetGetLength => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            table
+                .asset_streams
+                .get(&x0)
+                .map(|st| st.data.len() as u64)
+                .unwrap_or(0)
+        }
+        HleBuiltin::AAssetGetRemainingLength => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            table
+                .asset_streams
+                .get(&x0)
+                .map(|st| st.data.len().saturating_sub(st.pos) as u64)
+                .unwrap_or(0)
+        }
+        HleBuiltin::AAssetGetBuffer => {
+            let existing_or_alloc = {
+                let (table, mem, _) = get_state(uc.get_data_mut());
+                if let Some(st) = table.asset_streams.get_mut(&x0) {
+                    if let Some(ptr) = st.guest_buf {
+                        Some((ptr, None))
+                    } else if let Ok(ptr) = mem.alloc_heap(st.data.len().max(1) as u64) {
+                        st.guest_buf = Some(ptr);
+                        Some((ptr, Some(st.data.clone())))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            match existing_or_alloc {
+                Some((ptr, Some(bytes))) => {
+                    if !bytes.is_empty() {
+                        let _ = uc.mem_write(ptr, &bytes);
+                    }
+                    ptr
+                }
+                Some((ptr, None)) => ptr,
+                None => 0,
+            }
+        }
+        HleBuiltin::AAssetClose => {
+            let (table, mem, _) = get_state(uc.get_data_mut());
+            if let Some(st) = table.asset_streams.remove(&x0) {
+                if let Some(ptr) = st.guest_buf {
+                    mem.free_heap(ptr);
+                }
+            }
+            mem.free_heap(x0);
+            0
+        }
+        HleBuiltin::AAssetDirGetNextFileName => {
+            let next = {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                if let Some(dir) = table.asset_dirs.get_mut(&x0) {
+                    if dir.cursor < dir.files.len() {
+                        let name = dir.files[dir.cursor].clone();
+                        dir.cursor += 1;
+                        Some((dir.name_buf, name))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some((buf, name)) = next {
+                let mut bytes = name.into_bytes();
+                bytes.truncate(511);
+                bytes.push(0);
+                let _ = uc.mem_write(buf, &bytes);
+                buf
+            } else {
+                0
+            }
+        }
+        HleBuiltin::AAssetDirRewind => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            if let Some(dir) = table.asset_dirs.get_mut(&x0) {
+                dir.cursor = 0;
+            }
+            0
+        }
+        HleBuiltin::AAssetDirClose => {
+            let (table, mem, _) = get_state(uc.get_data_mut());
+            if let Some(dir) = table.asset_dirs.remove(&x0) {
+                mem.free_heap(dir.name_buf);
+            }
+            mem.free_heap(x0);
+            0
+        }
+        HleBuiltin::Adler32 => {
+            // uLong adler32(uLong adler, const Bytef *buf, uInt len)
+            if x1 == 0 {
+                1
+            } else {
+                let len = (x2 as usize).min(64 * 1024 * 1024);
+                let mut buf = vec![0u8; len];
+                if uc.mem_read(x1, &mut buf).is_ok() {
+                    zlib_adler32(x0 as u32, &buf) as u64
+                } else {
+                    x0
+                }
+            }
+        }
+        HleBuiltin::CompressBound => {
+            // uLong compressBound(uLong sourceLen)
+            x0.wrapping_add(x0 >> 12)
+                .wrapping_add(x0 >> 14)
+                .wrapping_add(x0 >> 25)
+                .wrapping_add(13)
+        }
+        b @ (HleBuiltin::Compress | HleBuiltin::Compress2) => {
+            // int compress2(Bytef *dest, uLongf *destLen, const Bytef *source, uLong sourceLen, int level)
+            use std::io::Write;
+            let level = if matches!(b, HleBuiltin::Compress2) {
+                let lv = x4 as i32;
+                if lv < 0 { 6 } else { (lv as u32).min(9) }
+            } else {
+                6
+            };
+            let dest_cap = read_guest_u64(uc, x1) as usize;
+            let src_len = (x3 as usize).min(64 * 1024 * 1024);
+            let mut src = vec![0u8; src_len];
+            if x0 == 0 || x1 == 0 || (src_len > 0 && uc.mem_read(x2, &mut src).is_err()) {
+                (-2i64) as u64 // Z_STREAM_ERROR
+            } else {
+                let mut enc =
+                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level));
+                if enc.write_all(&src).is_ok() {
+                    if let Ok(out) = enc.finish() {
+                        if out.len() > dest_cap {
+                            (-5i64) as u64 // Z_BUF_ERROR
+                        } else {
+                            let _ = uc.mem_write(x0, &out);
+                            let _ = uc.mem_write(x1, &(out.len() as u64).to_le_bytes());
+                            0 // Z_OK
+                        }
+                    } else {
+                        (-2i64) as u64
+                    }
+                } else {
+                    (-2i64) as u64
+                }
+            }
+        }
+        HleBuiltin::Uncompress => {
+            // int uncompress(Bytef *dest, uLongf *destLen, const Bytef *source, uLong sourceLen)
+            use std::io::Read;
+            let dest_cap = read_guest_u64(uc, x1) as usize;
+            let src_len = (x3 as usize).min(64 * 1024 * 1024);
+            let mut src = vec![0u8; src_len];
+            if x0 == 0 || x1 == 0 || (src_len > 0 && uc.mem_read(x2, &mut src).is_err()) {
+                (-2i64) as u64
+            } else {
+                let mut dec = flate2::read::ZlibDecoder::new(src.as_slice());
+                let mut out = Vec::new();
+                match dec.read_to_end(&mut out) {
+                    Ok(_) => {
+                        if out.len() > dest_cap {
+                            (-5i64) as u64 // Z_BUF_ERROR
+                        } else {
+                            let _ = uc.mem_write(x0, &out);
+                            let _ = uc.mem_write(x1, &(out.len() as u64).to_le_bytes());
+                            0 // Z_OK
+                        }
+                    }
+                    Err(_) => (-3i64) as u64, // Z_DATA_ERROR
+                }
+            }
+        }
+        b @ (HleBuiltin::DeflateInit | HleBuiltin::DeflateInit2) => {
+            // deflateInit_(strm, level, version, stream_size)
+            // deflateInit2_(strm, level, method, windowBits, memLevel, strategy, version, stream_size)
+            if x0 == 0 {
+                (-2i64) as u64
+            } else {
+                let lv_raw = x1 as i32;
+                let level = if lv_raw < 0 { 6 } else { (lv_raw as u32).min(9) };
+                let window_bits = if matches!(b, HleBuiltin::DeflateInit2) {
+                    x3 as i32
+                } else {
+                    15
+                };
+                let zlib_header = window_bits >= 0;
+                let _ = uc.mem_write(x0 + 0x10, &0u64.to_le_bytes()); // total_in
+                let _ = uc.mem_write(x0 + 0x28, &0u64.to_le_bytes()); // total_out
+                let _ = uc.mem_write(x0 + 0x30, &0u64.to_le_bytes()); // msg
+                let _ = uc.mem_write(x0 + 0x38, &x0.to_le_bytes()); // state
+                let (table, _, _) = get_state(uc.get_data_mut());
+                table.zlib_streams.insert(
+                    x0,
+                    ZlibStreamState::Deflate {
+                        compress: flate2::Compress::new(
+                            flate2::Compression::new(level),
+                            zlib_header,
+                        ),
+                        level,
+                        zlib_header,
+                    },
+                );
+                0
+            }
+        }
+        HleBuiltin::Deflate => {
+            // int deflate(z_streamp strm, int flush)
+            let next_in = read_guest_u64(uc, x0);
+            let mut a_in = [0u8; 4];
+            let avail_in = if uc.mem_read(x0 + 0x08, &mut a_in).is_ok() {
+                u32::from_le_bytes(a_in) as usize
+            } else {
+                0
+            };
+            let total_in = read_guest_u64(uc, x0 + 0x10);
+            let next_out = read_guest_u64(uc, x0 + 0x18);
+            let mut a_out = [0u8; 4];
+            let avail_out = if uc.mem_read(x0 + 0x20, &mut a_out).is_ok() {
+                u32::from_le_bytes(a_out) as usize
+            } else {
+                0
+            };
+            let total_out = read_guest_u64(uc, x0 + 0x28);
+            let mut in_buf = vec![0u8; avail_in.min(16 * 1024 * 1024)];
+            if !in_buf.is_empty() && next_in != 0 {
+                let _ = uc.mem_read(next_in, &mut in_buf);
+            }
+            let mut out_buf = vec![0u8; avail_out.min(16 * 1024 * 1024)];
+            let flush = match x1 as i32 {
+                1 => flate2::FlushCompress::Partial,
+                2 => flate2::FlushCompress::Sync,
+                3 => flate2::FlushCompress::Full,
+                4 => flate2::FlushCompress::Finish,
+                _ => flate2::FlushCompress::None,
+            };
+            let res = {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                if let Some(ZlibStreamState::Deflate { compress, .. }) =
+                    table.zlib_streams.get_mut(&x0)
+                {
+                    let before_in = compress.total_in();
+                    let before_out = compress.total_out();
+                    match compress.compress(&in_buf, &mut out_buf, flush) {
+                        Ok(status) => {
+                            let consumed = (compress.total_in() - before_in) as usize;
+                            let produced = (compress.total_out() - before_out) as usize;
+                            let code = match status {
+                                flate2::Status::Ok => 0i64,
+                                flate2::Status::StreamEnd => 1i64,
+                                flate2::Status::BufError => -5i64,
+                            };
+                            Some((consumed, produced, code))
+                        }
+                        Err(_) => Some((0, 0, -2i64)),
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some((consumed, produced, code)) = res {
+                if produced > 0 && next_out != 0 {
+                    let _ = uc.mem_write(next_out, &out_buf[..produced]);
+                }
+                let _ = uc.mem_write(x0, &(next_in + consumed as u64).to_le_bytes());
+                let _ = uc.mem_write(
+                    x0 + 0x08,
+                    &(avail_in.saturating_sub(consumed) as u32).to_le_bytes(),
+                );
+                let _ = uc.mem_write(x0 + 0x10, &(total_in + consumed as u64).to_le_bytes());
+                let _ = uc.mem_write(x0 + 0x18, &(next_out + produced as u64).to_le_bytes());
+                let _ = uc.mem_write(
+                    x0 + 0x20,
+                    &(avail_out.saturating_sub(produced) as u32).to_le_bytes(),
+                );
+                let _ = uc.mem_write(x0 + 0x28, &(total_out + produced as u64).to_le_bytes());
+                code as u64
+            } else {
+                (-2i64) as u64
+            }
+        }
+        HleBuiltin::DeflateEnd => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            table.zlib_streams.remove(&x0);
+            0
+        }
+        HleBuiltin::DeflateReset => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            if let Some(ZlibStreamState::Deflate {
+                compress,
+                level,
+                zlib_header,
+            }) = table.zlib_streams.get_mut(&x0)
+            {
+                *compress = flate2::Compress::new(flate2::Compression::new(*level), *zlib_header);
+                let _ = uc.mem_write(x0 + 0x10, &0u64.to_le_bytes());
+                let _ = uc.mem_write(x0 + 0x28, &0u64.to_le_bytes());
+                0
+            } else {
+                (-2i64) as u64
+            }
+        }
+        b @ (HleBuiltin::InflateInit | HleBuiltin::InflateInit2) => {
+            // inflateInit_(strm, version, stream_size)
+            // inflateInit2_(strm, windowBits, version, stream_size)
+            if x0 == 0 {
+                (-2i64) as u64
+            } else {
+                let window_bits = if matches!(b, HleBuiltin::InflateInit2) {
+                    x1 as i32
+                } else {
+                    15
+                };
+                let zlib_header = window_bits > 0 && window_bits <= 15;
+                let gzip_header_pending = window_bits >= 16;
+                let _ = uc.mem_write(x0 + 0x10, &0u64.to_le_bytes());
+                let _ = uc.mem_write(x0 + 0x28, &0u64.to_le_bytes());
+                let _ = uc.mem_write(x0 + 0x30, &0u64.to_le_bytes());
+                let _ = uc.mem_write(x0 + 0x38, &x0.to_le_bytes());
+                let (table, _, _) = get_state(uc.get_data_mut());
+                table.zlib_streams.insert(
+                    x0,
+                    ZlibStreamState::Inflate {
+                        decompress: flate2::Decompress::new(zlib_header),
+                        window_bits,
+                        gzip_header_pending,
+                    },
+                );
+                0
+            }
+        }
+        HleBuiltin::Inflate => {
+            // int inflate(z_streamp strm, int flush)
+            let next_in = read_guest_u64(uc, x0);
+            let mut a_in = [0u8; 4];
+            let avail_in = if uc.mem_read(x0 + 0x08, &mut a_in).is_ok() {
+                u32::from_le_bytes(a_in) as usize
+            } else {
+                0
+            };
+            let total_in = read_guest_u64(uc, x0 + 0x10);
+            let next_out = read_guest_u64(uc, x0 + 0x18);
+            let mut a_out = [0u8; 4];
+            let avail_out = if uc.mem_read(x0 + 0x20, &mut a_out).is_ok() {
+                u32::from_le_bytes(a_out) as usize
+            } else {
+                0
+            };
+            let total_out = read_guest_u64(uc, x0 + 0x28);
+            let mut in_buf = vec![0u8; avail_in.min(16 * 1024 * 1024)];
+            if !in_buf.is_empty() && next_in != 0 {
+                let _ = uc.mem_read(next_in, &mut in_buf);
+            }
+            let mut out_buf = vec![0u8; avail_out.min(16 * 1024 * 1024)];
+            let flush = match x1 as i32 {
+                2 => flate2::FlushDecompress::Sync,
+                4 => flate2::FlushDecompress::Finish,
+                _ => flate2::FlushDecompress::None,
+            };
+            let res = {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                if let Some(ZlibStreamState::Inflate {
+                    decompress,
+                    window_bits,
+                    gzip_header_pending,
+                }) = table.zlib_streams.get_mut(&x0)
+                {
+                    let mut header_skip = 0usize;
+                    if *gzip_header_pending && !in_buf.is_empty() {
+                        *gzip_header_pending = false;
+                        if in_buf.len() >= 2 && in_buf[0] == 0x1F && in_buf[1] == 0x8B {
+                            header_skip = parse_gzip_header_len(&in_buf);
+                            *decompress = flate2::Decompress::new(false);
+                        } else if *window_bits >= 32 {
+                            *decompress = flate2::Decompress::new(true);
+                        }
+                    }
+                    let slice = &in_buf[header_skip.min(in_buf.len())..];
+                    let before_in = decompress.total_in();
+                    let before_out = decompress.total_out();
+                    match decompress.decompress(slice, &mut out_buf, flush) {
+                        Ok(status) => {
+                            let consumed = header_skip + (decompress.total_in() - before_in) as usize;
+                            let produced = (decompress.total_out() - before_out) as usize;
+                            let code = match status {
+                                flate2::Status::Ok => 0i64,
+                                flate2::Status::StreamEnd => 1i64,
+                                flate2::Status::BufError => -5i64,
+                            };
+                            Some((consumed, produced, code))
+                        }
+                        Err(_) => Some((header_skip, 0, -3i64)),
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some((consumed, produced, code)) = res {
+                if produced > 0 && next_out != 0 {
+                    let _ = uc.mem_write(next_out, &out_buf[..produced]);
+                }
+                let _ = uc.mem_write(x0, &(next_in + consumed as u64).to_le_bytes());
+                let _ = uc.mem_write(
+                    x0 + 0x08,
+                    &(avail_in.saturating_sub(consumed) as u32).to_le_bytes(),
+                );
+                let _ = uc.mem_write(x0 + 0x10, &(total_in + consumed as u64).to_le_bytes());
+                let _ = uc.mem_write(x0 + 0x18, &(next_out + produced as u64).to_le_bytes());
+                let _ = uc.mem_write(
+                    x0 + 0x20,
+                    &(avail_out.saturating_sub(produced) as u32).to_le_bytes(),
+                );
+                let _ = uc.mem_write(x0 + 0x28, &(total_out + produced as u64).to_le_bytes());
+                code as u64
+            } else {
+                (-2i64) as u64
+            }
+        }
+        HleBuiltin::InflateEnd => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            table.zlib_streams.remove(&x0);
+            0
+        }
+        HleBuiltin::InflateReset => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            if let Some(ZlibStreamState::Inflate {
+                decompress,
+                window_bits,
+                gzip_header_pending,
+            }) = table.zlib_streams.get_mut(&x0)
+            {
+                let zlib_header = *window_bits > 0 && *window_bits <= 15;
+                *decompress = flate2::Decompress::new(zlib_header);
+                *gzip_header_pending = *window_bits >= 16;
+                let _ = uc.mem_write(x0 + 0x10, &0u64.to_le_bytes());
+                let _ = uc.mem_write(x0 + 0x28, &0u64.to_le_bytes());
+                0
+            } else {
+                (-2i64) as u64
+            }
+        }
         HleBuiltin::UnimplementedStub(sym) => {
             let (table, _, vfs) = get_state(uc.get_data_mut());
             vfs.diag().record_missing_hle(&sym);
@@ -3672,4 +4582,80 @@ fn stdio_read_line(
     } else {
         Some(chunk)
     }
+}
+
+/// ARM64 `setjmp`/`longjmp` 保存的 21 个 callee-saved 寄存器（共 168 字节，兼容 Bionic 256 字节 `jmp_buf`）
+const JMPBUF_REGS: [RegisterARM64; 21] = [
+    RegisterARM64::X19,
+    RegisterARM64::X20,
+    RegisterARM64::X21,
+    RegisterARM64::X22,
+    RegisterARM64::X23,
+    RegisterARM64::X24,
+    RegisterARM64::X25,
+    RegisterARM64::X26,
+    RegisterARM64::X27,
+    RegisterARM64::X28,
+    RegisterARM64::X29,
+    RegisterARM64::X30,
+    RegisterARM64::SP,
+    RegisterARM64::D8,
+    RegisterARM64::D9,
+    RegisterARM64::D10,
+    RegisterARM64::D11,
+    RegisterARM64::D12,
+    RegisterARM64::D13,
+    RegisterARM64::D14,
+    RegisterARM64::D15,
+];
+
+/// 标准 RFC 1950 `adler32` 校验和
+fn zlib_adler32(adler: u32, data: &[u8]) -> u32 {
+    const MOD_ADLER: u32 = 65521;
+    let mut s1 = adler & 0xFFFF;
+    let mut s2 = (adler >> 16) & 0xFFFF;
+    for &b in data {
+        s1 = (s1 + u32::from(b)) % MOD_ADLER;
+        s2 = (s2 + s1) % MOD_ADLER;
+    }
+    (s2 << 16) | s1
+}
+
+/// 解析 RFC 1952 gzip 头部字节长度（用于 `inflateInit2_(strm, 16+15)` 流式解压）
+fn parse_gzip_header_len(buf: &[u8]) -> usize {
+    if buf.len() < 10 || buf[0] != 0x1F || buf[1] != 0x8B {
+        return 0;
+    }
+    let flg = buf[3];
+    let mut pos = 10;
+    // FEXTRA
+    if (flg & 0x04) != 0 && pos + 2 <= buf.len() {
+        let xlen = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
+        pos = (pos + 2 + xlen).min(buf.len());
+    }
+    // FNAME
+    if (flg & 0x08) != 0 {
+        while pos < buf.len() {
+            let b = buf[pos];
+            pos += 1;
+            if b == 0 {
+                break;
+            }
+        }
+    }
+    // FCOMMENT
+    if (flg & 0x10) != 0 {
+        while pos < buf.len() {
+            let b = buf[pos];
+            pos += 1;
+            if b == 0 {
+                break;
+            }
+        }
+    }
+    // FHCRC
+    if (flg & 0x02) != 0 && pos + 2 <= buf.len() {
+        pos += 2;
+    }
+    pos
 }

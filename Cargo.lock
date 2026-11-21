@@ -783,6 +783,7 @@ dependencies = [
  "async-channel",
  "axum",
  "bad64",
+ "flate2",
  "goblin",
  "memmap2",
  "rquickjs",
