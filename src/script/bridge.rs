@@ -21,7 +21,9 @@ use super::hooks::{
     dump_regs, encode_arm64_nop, encode_arm64_ret, parse_hex_pattern, parse_reg_name, scan_memory,
     with_active_uc, JsNativeHookTable, SYSCALL_WILDCARD,
 };
-use super::jni_bridge::{with_active_objects, JsCtxGuard, JsHookTable, JsJniHandler, CURRENT_JS_CTX};
+use super::jni_bridge::{
+    current_js_ctx, with_active_objects, JsCtxGuard, JsHookTable, JsJniHandler, CURRENT_JS_CTX,
+};
 use super::{EmuEntry, SharedHost, SharedLogSink};
 
 /// 统一可重入 `Unicorn` 访问器：
@@ -163,6 +165,27 @@ fn jvalue_opt_to_js<'js>(ctx: &Ctx<'js>, stored: Option<JValue>) -> rquickjs::Re
             }
         }
     }
+}
+
+fn jni_trace_event_to_js<'js>(
+    ctx: &Ctx<'js>,
+    ev: &crate::jni::JniTraceEvent,
+) -> rquickjs::Result<Object<'js>> {
+    let obj = Object::new(ctx.clone())?;
+    obj.set("seq", ev.seq as f64)?;
+    obj.set("op", ev.op.as_str())?;
+    obj.set("className", ev.class_name.as_str())?;
+    obj.set("targetRef", ev.target_ref as f64)?;
+    obj.set("member", ev.member.as_str())?;
+    obj.set("sig", ev.sig.as_str())?;
+    let args = Array::new(ctx.clone())?;
+    for (i, a) in ev.args.iter().enumerate() {
+        args.set(i, a.as_str())?;
+    }
+    obj.set("args", args)?;
+    obj.set("ret", ev.ret.as_str())?;
+    obj.set("isNull", ev.is_null)?;
+    Ok(obj)
 }
 
 fn dex_value_to_js<'js>(
@@ -1430,6 +1453,128 @@ pub(super) fn register_native_bridge<'js>(
                     obj.set("className", class_name)?;
                     obj.set("kind", kind)?;
                     Ok(obj.into_value())
+                },
+            )?,
+        )?;
+    }
+
+    // jniTraceStart(emuId, maxStrLen, maxEvents)
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniTraceStart",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>,
+                      emu_id: usize,
+                      max_str_len: usize,
+                      max_events: usize|
+                      -> rquickjs::Result<()> {
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        uc.get_data_mut()
+                            .jni
+                            .jni_tracer
+                            .start(max_str_len, max_events);
+                        Ok(())
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    // jniTraceStop(emuId)
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniTraceStop",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize| -> rquickjs::Result<()> {
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        uc.get_data_mut().jni.jni_tracer.stop();
+                        Ok(())
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    // jniTraceClear(emuId)
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniTraceClear",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize| -> rquickjs::Result<()> {
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        uc.get_data_mut().jni.jni_tracer.clear();
+                        Ok(())
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    // jniTraceEvents(emuId) -> JniTraceEvent[]
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniTraceEvents",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize| -> rquickjs::Result<Array<'js>> {
+                    let events = with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc.get_data().jni.jni_tracer.events().to_vec())
+                    })?;
+                    let arr = Array::new(ctx.clone())?;
+                    for (i, ev) in events.iter().enumerate() {
+                        arr.set(i, jni_trace_event_to_js(&ctx, ev)?)?;
+                    }
+                    Ok(arr)
+                },
+            )?,
+        )?;
+    }
+
+    // jniTraceOnEvent(emuId, fn | null)
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniTraceOnEvent",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize, cb: Value<'js>| -> rquickjs::Result<()> {
+                    if cb.is_null() || cb.is_undefined() {
+                        return with_uc(&ctx, &host, emu_id, |uc| {
+                            uc.get_data_mut().jni.jni_tracer.set_listener(None);
+                            Ok(())
+                        });
+                    }
+                    let func = cb
+                        .into_function()
+                        .ok_or_else(|| throw_err(&ctx, "jni.trace.onEvent 需要函数或 null"))?;
+                    let persistent = Persistent::save(&ctx, func);
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        uc.get_data_mut().jni.jni_tracer.set_listener(Some(Box::new(
+                            move |ev| {
+                                let Some(raw_ctx) = current_js_ctx() else {
+                                    return;
+                                };
+                                // SAFETY: `JsCtxGuard` 保证 `raw_ctx` 有效
+                                let js_ctx = unsafe { Ctx::from_raw(raw_ctx) };
+                                if let (Ok(f), Ok(js_ev)) = (
+                                    persistent.clone().restore(&js_ctx),
+                                    jni_trace_event_to_js(&js_ctx, ev),
+                                ) {
+                                    if let Err(err) = f.call::<_, Value<'_>>((js_ev,)) {
+                                        eprintln!("[JS JNI EVENT ERROR] {}: {err}", ev.op);
+                                    }
+                                }
+                            },
+                        )));
+                        Ok(())
+                    })
                 },
             )?,
         )?;

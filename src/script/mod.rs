@@ -204,6 +204,7 @@ impl Drop for JsSession {
         for entry in &mut h.emus {
             entry.hooks.borrow_mut().hooks.clear();
             entry.hooks.borrow_mut().unhandled = None;
+            entry.emu.jni_mut().jni_tracer.set_listener(None);
             entry.native_hooks.borrow_mut().clear_all(entry.emu.uc_mut());
         }
     }

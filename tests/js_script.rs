@@ -841,3 +841,73 @@ fn js_jni_describe_field_method_and_object() {
         .expect("JNI describeField/Method/Object test failed");
 }
 
+#[test]
+fn js_jni_trace_events_and_subscription() {
+    let script = r#"
+        const emu = Emu.create({ packageName: "com.test.jnitrace", hleAccel: true });
+        const envPtr = emu.jni.envPtr;
+        const vtable = Number(emu.mem.readU64(envPtr));
+        const fnFindClass = Number(emu.mem.readU64(vtable + 6 * 8));
+        const fnGetMethodID = Number(emu.mem.readU64(vtable + 33 * 8));
+        const fnCallObjectMethod = Number(emu.mem.readU64(vtable + 34 * 8));
+        const fnGetFieldID = Number(emu.mem.readU64(vtable + 94 * 8));
+        const fnGetObjectField = Number(emu.mem.readU64(vtable + 95 * 8));
+
+        const buf = emu.mem.alloc(256);
+        const ws = (off, s) => { emu.mem.writeCString(buf + off, s); return buf + off; };
+
+        // 默认关闭，零记录
+        const clsW0 = emu.call(fnFindClass, envPtr, ws(0, "cas/w0"));
+        if (emu.jni.trace.events().length !== 0) {
+            throw new Error("jni.trace should be disabled by default");
+        }
+
+        // 开启采集 + 实时订阅（无需硬编码虚表/槽位）
+        const live = [];
+        emu.jni.trace.start({ maxStrLen: 12 });
+        emu.jni.trace.onEvent((ev) => live.push(ev));
+
+        const fidF = emu.call(fnGetFieldID, envPtr, clsW0, ws(16, "f"), ws(24, "Lcas/p1;"));
+        const objW0 = emu.jni.newObject("cas/w0");
+        emu.call(fnGetObjectField, envPtr, objW0, fidF); // -> NULL
+
+        // 连续 36 次 CallObjectMethod（超过 32 条 breadcrumb 上限，验证全量不截断 + 参数摘要截断）
+        emu.jni.hook("java/lang/StringBuilder", {
+            append(str) { return "appended:" + str; },
+        });
+        const clsSb = emu.call(fnFindClass, envPtr, ws(48, "java/lang/StringBuilder"));
+        const midAppend = emu.call(fnGetMethodID, envPtr, clsSb, ws(80, "append"), ws(96, "(Ljava/lang/String;)Ljava/lang/String;"));
+        const sbObj = emu.jni.newObject("java/lang/StringBuilder");
+        const longStr = emu.jni.newString("hello_castle_token_payload_12345");
+        for (let i = 0; i < 36; i++) {
+            emu.call(fnCallObjectMethod, envPtr, sbObj, midAppend, longStr);
+        }
+
+        const events = emu.jni.trace.events();
+        if (events.length !== live.length || events.length < 40) {
+            throw new Error(`expected >=40 events without 32-entry truncation, got events=${events.length}, live=${live.length}`);
+        }
+
+        const nullEv = events.find((e) => e.op === "GetObjectField" && e.isNull);
+        if (!nullEv || nullEv.className !== "cas/w0" || nullEv.member !== "f" || nullEv.sig !== "Lcas/p1;" || nullEv.ret !== "NULL") {
+            throw new Error("unexpected GetObjectField NULL event: " + JSON.stringify(nullEv));
+        }
+
+        const callEv = events.find((e) => e.op === "CallObjectMethod" && e.member === "append");
+        if (!callEv || !callEv.args[0] || !callEv.args[0].includes("hello_castle") || !callEv.ret.includes("appended:")) {
+            throw new Error("unexpected CallObjectMethod event: " + JSON.stringify(callEv));
+        }
+
+        // 取消订阅 & 停止
+        const countBeforeStop = events.length;
+        emu.jni.trace.onEvent(null);
+        emu.jni.trace.stop();
+        emu.call(fnGetObjectField, envPtr, objW0, fidF);
+        if (emu.jni.trace.events().length !== countBeforeStop) {
+            throw new Error("jni.trace.stop did not stop recording");
+        }
+    "#;
+
+    JsRunner::run_source_with_args(script, &[]).expect("JNI trace & subscription test failed");
+}
+

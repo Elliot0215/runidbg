@@ -636,6 +636,25 @@
           describeObject(ref) {
             return __native.jniDescribeObject(emuId, toAddr(ref));
           },
+          trace: {
+            start(opts = {}) {
+              const maxStrLen = opts && opts.maxStrLen !== undefined ? Number(opts.maxStrLen) : 64;
+              const maxEvents = opts && opts.maxEvents !== undefined ? Number(opts.maxEvents) : 0;
+              __native.jniTraceStart(emuId, maxStrLen, maxEvents);
+            },
+            stop() {
+              __native.jniTraceStop(emuId);
+            },
+            clear() {
+              __native.jniTraceClear(emuId);
+            },
+            events() {
+              return __native.jniTraceEvents(emuId);
+            },
+            onEvent(fn) {
+              __native.jniTraceOnEvent(emuId, fn || null);
+            },
+          },
           pushLocalFrame() {
             __native.jniPushLocalFrame(emuId);
           },

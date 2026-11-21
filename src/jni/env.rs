@@ -36,6 +36,212 @@ const ENV_TRAMPOLINE_SLOT_OFFSET: usize = 16;
 /// ARM64 `RET` 机器码
 const ARM64_RET_INSN: u32 = 0xD65F_03C0;
 
+/// 单条结构化 JNI 调用事件（供全量导出与实时订阅，默认关闭零开销）
+#[derive(Debug, Clone)]
+pub struct JniTraceEvent {
+    pub seq: u64,
+    pub op: String,
+    pub class_name: String,
+    pub target_ref: u64,
+    pub member: String,
+    pub sig: String,
+    pub args: Vec<String>,
+    pub ret: String,
+    pub is_null: bool,
+}
+
+pub type JniTraceListener = Box<dyn FnMut(&JniTraceEvent)>;
+
+/// 可开关的 JNI 事件追踪器（默认 `enabled = false`，关闭时仅 1 次布尔判断、零分配）
+pub struct JniTracer {
+    pub enabled: bool,
+    pub max_str_len: usize,
+    pub max_events: usize,
+    events: Vec<JniTraceEvent>,
+    next_seq: u64,
+    listener: Option<JniTraceListener>,
+}
+
+impl Default for JniTracer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl JniTracer {
+    pub fn new() -> Self {
+        Self {
+            enabled: false,
+            max_str_len: 64,
+            max_events: 0,
+            events: Vec::new(),
+            next_seq: 1,
+            listener: None,
+        }
+    }
+
+    pub fn start(&mut self, max_str_len: usize, max_events: usize) {
+        self.enabled = true;
+        self.max_str_len = max_str_len.max(8);
+        self.max_events = max_events;
+    }
+
+    pub fn stop(&mut self) {
+        self.enabled = false;
+    }
+
+    pub fn clear(&mut self) {
+        self.events.clear();
+        self.next_seq = 1;
+    }
+
+    pub fn events(&self) -> &[JniTraceEvent] {
+        &self.events
+    }
+
+    pub fn set_listener(&mut self, cb: Option<JniTraceListener>) {
+        if cb.is_some() {
+            self.enabled = true;
+        }
+        self.listener = cb;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        &mut self,
+        op: impl Into<String>,
+        class_name: impl Into<String>,
+        target_ref: u64,
+        member: impl Into<String>,
+        sig: impl Into<String>,
+        args: Vec<String>,
+        ret: impl Into<String>,
+        is_null: bool,
+    ) {
+        if !self.enabled {
+            return;
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let ev = JniTraceEvent {
+            seq,
+            op: op.into(),
+            class_name: class_name.into(),
+            target_ref,
+            member: member.into(),
+            sig: sig.into(),
+            args,
+            ret: ret.into(),
+            is_null,
+        };
+        if let Some(mut cb) = self.listener.take() {
+            cb(&ev);
+            if self.listener.is_none() {
+                self.listener = Some(cb);
+            }
+        }
+        if self.max_events == 0 || self.events.len() < self.max_events {
+            self.events.push(ev);
+        }
+    }
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let mut end = max_len;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        format!("{}…(+{}B)", &s[..end], s.len() - end)
+    }
+}
+
+fn format_jobject_summary(objects: &ObjectTable, r: JObjectRef, max_str_len: usize) -> String {
+    if r.is_null() {
+        return "NULL".to_string();
+    }
+    match objects.get(r) {
+        Some(JObject::String(s)) => format!("{:?}", truncate_str(s, max_str_len)),
+        Some(JObject::Class { name }) => format!("class({name})@0x{:x}", r.0),
+        Some(JObject::ByteArray(b)) => format!("byte[{}]@0x{:x}", b.len(), r.0),
+        Some(JObject::CharArray(c)) => {
+            let preview = String::from_utf16_lossy(&c[..c.len().min(max_str_len)]);
+            format!("char[{}]({:?})@0x{:x}", c.len(), preview, r.0)
+        }
+        Some(JObject::IntArray(v)) => format!("int[{}]@0x{:x}", v.len(), r.0),
+        Some(JObject::LongArray(v)) => format!("long[{}]@0x{:x}", v.len(), r.0),
+        Some(JObject::ObjectArray(v)) => format!("Object[{}]@0x{:x}", v.len(), r.0),
+        Some(obj) => format!("{}@0x{:x}", obj.class_name(), r.0),
+        None => format!("0x{:x}", r.0),
+    }
+}
+
+fn format_jvalue_summary(objects: &ObjectTable, val: &JValue, max_str_len: usize) -> String {
+    match *val {
+        JValue::Void => "void".to_string(),
+        JValue::Boolean(b) => b.to_string(),
+        JValue::Byte(v) => v.to_string(),
+        JValue::Char(v) => format!("'{}'({v})", char::from_u32(u32::from(v)).unwrap_or('?')),
+        JValue::Short(v) => v.to_string(),
+        JValue::Int(v) => v.to_string(),
+        JValue::Long(v) => format!("{v}L"),
+        JValue::Float(v) => format!("{v}f"),
+        JValue::Double(v) => format!("{v}d"),
+        JValue::Object(r) => format_jobject_summary(objects, r, max_str_len),
+    }
+}
+
+fn format_call_return_summary(
+    objects: &ObjectTable,
+    base_slot: usize,
+    ret: u64,
+    max_str_len: usize,
+) -> (String, bool) {
+    match base_slot {
+        34 | 64 | 114 => {
+            let r = JObjectRef(ret);
+            (format_jobject_summary(objects, r, max_str_len), r.is_null())
+        }
+        37 | 67 | 117 => ((ret != 0).to_string(), false),
+        40 | 70 | 120 => ((ret as i8).to_string(), false),
+        43 | 73 | 123 => ((ret as u16).to_string(), false),
+        46 | 76 | 126 => ((ret as i16).to_string(), false),
+        49 | 79 | 129 => ((ret as i32).to_string(), false),
+        52 | 82 | 132 => (format!("{}L", ret as i64), false),
+        55 | 85 | 135 => (format!("{}f", f32::from_bits(ret as u32)), false),
+        58 | 88 | 138 => (format!("{}d", f64::from_bits(ret)), false),
+        _ => ("void".to_string(), false),
+    }
+}
+
+fn call_op_name(base_slot: usize) -> &'static str {
+    match base_slot {
+        34 => "CallObjectMethod",
+        37 => "CallBooleanMethod",
+        40 => "CallByteMethod",
+        43 => "CallCharMethod",
+        46 => "CallShortMethod",
+        49 => "CallIntMethod",
+        52 => "CallLongMethod",
+        55 => "CallFloatMethod",
+        58 => "CallDoubleMethod",
+        61 => "CallVoidMethod",
+        114 => "CallStaticObjectMethod",
+        117 => "CallStaticBooleanMethod",
+        120 => "CallStaticByteMethod",
+        123 => "CallStaticCharMethod",
+        126 => "CallStaticShortMethod",
+        129 => "CallStaticIntMethod",
+        132 => "CallStaticLongMethod",
+        135 => "CallStaticFloatMethod",
+        138 => "CallStaticDoubleMethod",
+        141 => "CallStaticVoidMethod",
+        _ => "CallMethod",
+    }
+}
+
 /// JNI 运行时可变状态快照（供 `EmuSnapshot` 完整回滚对象表与临时缓冲映射）
 #[derive(Debug, Clone)]
 pub struct JniSnapshot {
@@ -70,6 +276,7 @@ pub struct JniVm {
     pub strict_find_class: bool,
     pub diag: EnvDiag,
     pub breadcrumbs: BreadcrumbRing,
+    pub jni_tracer: JniTracer,
 
     pending_exception: JObjectRef,
     /// 记录 `GetStringUTFChars` 分配的缓冲区，供 `ReleaseStringUTFChars` 追踪
@@ -105,6 +312,7 @@ impl JniVm {
             strict_find_class: false,
             diag: EnvDiag::new(),
             breadcrumbs: BreadcrumbRing::new(),
+            jni_tracer: JniTracer::new(),
             pending_exception: JObjectRef::NULL,
             utf_buffers: HashMap::new(),
             array_buffers: HashMap::new(),
@@ -501,7 +709,7 @@ where
         6 => {
             let name = read_guest_cstr(uc, x1, 512);
             let (vm, _) = get_state(uc.get_data_mut());
-            if vm.strict_find_class
+            let out = if vm.strict_find_class
                 && !vm.dex_index.is_empty()
                 && !is_system_or_array_class(&name)
                 && !vm.dex_index.has_class(&name)
@@ -519,7 +727,22 @@ where
                     package_name: &vm.package_name,
                 };
                 vm.handler.find_class(&mut ctx, &name).0
+            };
+            if vm.jni_tracer.enabled {
+                let max_len = vm.jni_tracer.max_str_len;
+                let ret_s = format_jobject_summary(&vm.objects, JObjectRef(out), max_len);
+                vm.jni_tracer.record(
+                    "FindClass",
+                    name.clone(),
+                    out,
+                    "",
+                    "",
+                    vec![format!("{name:?}")],
+                    ret_s,
+                    out == 0,
+                );
             }
+            out
         }
 
         // 7: FromReflectedMethod
@@ -736,6 +959,18 @@ where
             let mid = vm.intern_method(cls.clone(), name.clone(), sig.clone(), slot == 113);
             vm.breadcrumbs
                 .push(format!("[JNI] {kind} {cls}.{name}{sig} -> 0x{mid:x}"));
+            if vm.jni_tracer.enabled {
+                vm.jni_tracer.record(
+                    kind,
+                    cls,
+                    x1,
+                    name,
+                    sig,
+                    Vec::new(),
+                    format!("0x{mid:x}"),
+                    mid == 0,
+                );
+            }
             mid
         }
 
@@ -835,6 +1070,18 @@ where
             let fid = vm.intern_field(cls.clone(), name.clone(), sig.clone(), slot == 144);
             vm.breadcrumbs
                 .push(format!("[JNI] {kind} {cls}.{name}({sig}) -> 0x{fid:x}"));
+            if vm.jni_tracer.enabled {
+                vm.jni_tracer.record(
+                    kind,
+                    cls,
+                    x1,
+                    name,
+                    sig,
+                    Vec::new(),
+                    format!("0x{fid:x}"),
+                    fid == 0,
+                );
+            }
             fid
         }
 
@@ -865,6 +1112,25 @@ where
                     vm.diag.record_missing_jni_field(&key);
                     vm.breadcrumbs
                         .push(format!("[JNI] GetObjectField {key} -> NULL"));
+                }
+                if vm.jni_tracer.enabled {
+                    let max_len = vm.jni_tracer.max_str_len;
+                    let obj_cls = vm
+                        .objects
+                        .get(o)
+                        .map(|obj| obj.class_name().to_string())
+                        .unwrap_or_else(|| field.class_name.clone());
+                    let ret_s = format_jobject_summary(&vm.objects, JObjectRef(out), max_len);
+                    vm.jni_tracer.record(
+                        "GetObjectField",
+                        obj_cls,
+                        x1,
+                        field.name,
+                        field.sig,
+                        Vec::new(),
+                        ret_s,
+                        out == 0,
+                    );
                 }
                 out
             } else {
@@ -967,6 +1233,25 @@ where
             if let Some(field) = vm.fields.get(&x2).cloned() {
                 let obj = JObjectRef(x1);
                 vm.set_instance_field(obj, &field.name, val);
+                if vm.jni_tracer.enabled {
+                    let max_len = vm.jni_tracer.max_str_len;
+                    let obj_cls = vm
+                        .objects
+                        .get(obj)
+                        .map(|o| o.class_name().to_string())
+                        .unwrap_or_else(|| field.class_name.clone());
+                    let val_s = format_jvalue_summary(&vm.objects, &val, max_len);
+                    vm.jni_tracer.record(
+                        "SetField",
+                        obj_cls,
+                        x1,
+                        field.name.clone(),
+                        field.sig.clone(),
+                        vec![val_s],
+                        "void",
+                        false,
+                    );
+                }
                 let mut ctx = JniContext {
                     objects: &mut vm.objects,
                     package_name: &vm.package_name,
@@ -1085,6 +1370,20 @@ where
                     vm.diag.record_missing_jni_field(&key);
                     vm.breadcrumbs
                         .push(format!("[JNI] GetStaticObjectField {key} -> NULL"));
+                }
+                if vm.jni_tracer.enabled {
+                    let max_len = vm.jni_tracer.max_str_len;
+                    let ret_s = format_jobject_summary(&vm.objects, JObjectRef(out), max_len);
+                    vm.jni_tracer.record(
+                        "GetStaticObjectField",
+                        cls,
+                        x1,
+                        field.name,
+                        field.sig,
+                        Vec::new(),
+                        ret_s,
+                        out == 0,
+                    );
                 }
                 out
             } else {
@@ -1352,6 +1651,20 @@ where
             let cls = vm.resolve_class_name(JObjectRef(x1));
             if let Some(field) = vm.fields.get(&x2).cloned() {
                 vm.set_static_field(&cls, &field.name, val);
+                if vm.jni_tracer.enabled {
+                    let max_len = vm.jni_tracer.max_str_len;
+                    let val_s = format_jvalue_summary(&vm.objects, &val, max_len);
+                    vm.jni_tracer.record(
+                        "SetStaticField",
+                        cls.clone(),
+                        x1,
+                        field.name.clone(),
+                        field.sig.clone(),
+                        vec![val_s],
+                        "void",
+                        false,
+                    );
+                }
                 let mut ctx = JniContext {
                     objects: &mut vm.objects,
                     package_name: &vm.package_name,
@@ -1821,11 +2134,37 @@ where
     };
     let args = read_jni_call_args(uc, slot, base_slot, x3, &method.sig);
     let (vm, _) = get_state(uc.get_data_mut());
-    let mut ctx = JniContext {
-        objects: &mut vm.objects,
-        package_name: &vm.package_name,
+    let ret = {
+        let mut ctx = JniContext {
+            objects: &mut vm.objects,
+            package_name: &vm.package_name,
+        };
+        invoke(vm.handler.as_mut(), &mut ctx, JObjectRef(obj_raw), &method, &args)
     };
-    invoke(vm.handler.as_mut(), &mut ctx, JObjectRef(obj_raw), &method, &args)
+    if vm.jni_tracer.enabled {
+        let max_len = vm.jni_tracer.max_str_len;
+        let obj_cls = vm
+            .objects
+            .get(JObjectRef(obj_raw))
+            .map(|o| o.class_name().to_string())
+            .unwrap_or_else(|| method.class_name.clone());
+        let arg_strs: Vec<String> = args
+            .iter()
+            .map(|a| format_jvalue_summary(&vm.objects, a, max_len))
+            .collect();
+        let (ret_s, is_null) = format_call_return_summary(&vm.objects, base_slot, ret, max_len);
+        vm.jni_tracer.record(
+            call_op_name(base_slot),
+            obj_cls,
+            obj_raw,
+            method.name,
+            method.sig,
+            arg_strs,
+            ret_s,
+            is_null,
+        );
+    }
+    ret
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1855,11 +2194,32 @@ where
     };
     let args = read_jni_call_args(uc, slot, base_slot, x3, &method.sig);
     let (vm, _) = get_state(uc.get_data_mut());
-    let mut ctx = JniContext {
-        objects: &mut vm.objects,
-        package_name: &vm.package_name,
+    let ret = {
+        let mut ctx = JniContext {
+            objects: &mut vm.objects,
+            package_name: &vm.package_name,
+        };
+        invoke(vm.handler.as_mut(), &mut ctx, &class_name, &method, &args)
     };
-    invoke(vm.handler.as_mut(), &mut ctx, &class_name, &method, &args)
+    if vm.jni_tracer.enabled {
+        let max_len = vm.jni_tracer.max_str_len;
+        let arg_strs: Vec<String> = args
+            .iter()
+            .map(|a| format_jvalue_summary(&vm.objects, a, max_len))
+            .collect();
+        let (ret_s, is_null) = format_call_return_summary(&vm.objects, base_slot, ret, max_len);
+        vm.jni_tracer.record(
+            call_op_name(base_slot),
+            class_name,
+            cls_raw,
+            method.name,
+            method.sig,
+            arg_strs,
+            ret_s,
+            is_null,
+        );
+    }
+    ret
 }
 
 fn dispatch_instance_field<D, F, H>(

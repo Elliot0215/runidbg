@@ -227,6 +227,29 @@ interface JniObjectInfo {
   readonly kind: string;
 }
 
+interface JniTraceEvent {
+  readonly seq: number;
+  readonly op: string;
+  readonly className: string;
+  readonly targetRef: number;
+  readonly member: string;
+  readonly sig: string;
+  readonly args: string[];
+  readonly ret: string;
+  readonly isNull: boolean;
+}
+
+interface JniTraceNamespace {
+  /** 开启全量 JNI 调用事件采集（默认关闭，关闭时零开销） */
+  start(opts?: { maxStrLen?: number; maxEvents?: number }): void;
+  stop(): void;
+  clear(): void;
+  /** 导出完整 JNI 调用序列（不受 32 条面包屑环形缓冲截断） */
+  events(): JniTraceEvent[];
+  /** 实时订阅每一次 JNI 调用事件（无需硬编码虚表/槽位地址；传 null 取消订阅） */
+  onEvent(cb: ((ev: JniTraceEvent) => void) | null): void;
+}
+
 interface JniNamespace {
   readonly envPtr: number;
   hook(className: string, methods: Record<string, (...args: any[]) => any>): void;
@@ -292,6 +315,8 @@ interface JniNamespace {
   listMethods(): JniMethodInfo[];
   /** 按 `jobject` / `jclass` 句柄反查真实类名与对象类型（支持在 Hook 回调内调用；未知返回 `null`） */
   describeObject(ref: number | bigint): JniObjectInfo | null;
+  /** 结构化 JNI 事件追踪与实时订阅（默认关闭，零开销，无需硬编码虚表槽位） */
+  readonly trace: JniTraceNamespace;
   pushLocalFrame(): void;
   popLocalFrame(keepRef?: number | bigint): number;
   withLocalFrame<T>(fn: () => T): T;
