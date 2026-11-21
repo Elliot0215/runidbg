@@ -911,3 +911,79 @@ fn js_jni_trace_events_and_subscription() {
     JsRunner::run_source_with_args(script, &[]).expect("JNI trace & subscription test failed");
 }
 
+#[test]
+fn js_jni_hook_interface_dispatch_and_per_instance_this() {
+    let script = r#"
+        const emu = Emu.create({ packageName: "com.test.lazy", hleAccel: true });
+        const envPtr = emu.jni.envPtr;
+        const vtable = Number(emu.mem.readU64(envPtr));
+        const fnFindClass = Number(emu.mem.readU64(vtable + 6 * 8));
+        const fnGetMethodID = Number(emu.mem.readU64(vtable + 33 * 8));
+        const fnCallObjectMethod = Number(emu.mem.readU64(vtable + 34 * 8));
+
+        const buf = emu.mem.alloc(256);
+        const ws = (off, s) => { emu.mem.writeCString(buf + off, s); return buf + off; };
+
+        // 模拟 kotlin/Lazy.getValue() 被 3 个不同具体类实例调用（SynchronizedLazyImpl）
+        const lazy1 = emu.jni.newObject("kotlin/SynchronizedLazyImpl");
+        const lazy2 = emu.jni.newObject("kotlin/SynchronizedLazyImpl");
+        const lazy3 = emu.jni.newObject("kotlin/SafePublicationLazyImpl");
+        const targetA = emu.jni.newObject("cas/a0");
+        const targetB = emu.jni.newObject("cas/b0");
+        const targetW = emu.jni.newObject("cas/w0");
+
+        const lazyMap = new Map([
+            [lazy1, targetA],
+            [lazy2, targetB],
+            [lazy3, targetW],
+        ]);
+
+        // 仅在接口 "kotlin/Lazy" 上挂 Hook，必须对子类实例也生效，且能拿到真实 this 与 describeObject(self)
+        const seenClasses = [];
+        emu.jni.hook("kotlin/Lazy", {
+            getValue(self) {
+                if (this.ref !== self) {
+                    throw new Error(`this.ref (${this.ref}) !== self (${self})`);
+                }
+                const desc = emu.jni.describeObject(self);
+                if (!desc) throw new Error("describeObject(self) failed inside JNI hook");
+                seenClasses.push(desc.className);
+                return lazyMap.get(self) ?? null;
+            },
+        });
+
+        const clsLazy = emu.call(fnFindClass, envPtr, ws(0, "kotlin/Lazy"));
+        const midGetVal = emu.call(fnGetMethodID, envPtr, clsLazy, ws(32, "getValue"), ws(48, "()Ljava/lang/Object;"));
+
+        const r1 = emu.call(fnCallObjectMethod, envPtr, lazy1, midGetVal);
+        const r2 = emu.call(fnCallObjectMethod, envPtr, lazy2, midGetVal);
+        const r3 = emu.call(fnCallObjectMethod, envPtr, lazy3, midGetVal);
+        if (r1 !== targetA || r2 !== targetB || r3 !== targetW) {
+            throw new Error(`per-instance Lazy dispatch failed: r1=${r1}, r2=${r2}, r3=${r3}`);
+        }
+        if (seenClasses.length !== 3 || seenClasses[0] !== "kotlin/SynchronizedLazyImpl" || seenClasses[2] !== "kotlin/SafePublicationLazyImpl") {
+            throw new Error("unexpected seenClasses: " + JSON.stringify(seenClasses));
+        }
+
+        // 同时验证含对象实参的调用：回调第 1 参为 self，第 2 参为对象实参引用，且可 describeObject(arg)
+        let seenArgClass = null;
+        emu.jni.hook("java/lang/StringBuilder", {
+            append(self, argRef) {
+                const d = emu.jni.describeObject(argRef);
+                seenArgClass = d ? d.className : null;
+                return self;
+            },
+        });
+        const clsSb = emu.call(fnFindClass, envPtr, ws(80, "java/lang/StringBuilder"));
+        const midAppendObj = emu.call(fnGetMethodID, envPtr, clsSb, ws(112, "append"), ws(128, "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"));
+        const sb = emu.jni.newObject("java/lang/StringBuilder");
+        const sbRet = emu.call(fnCallObjectMethod, envPtr, sb, midAppendObj, targetW);
+        if (sbRet !== sb || seenArgClass !== "cas/w0") {
+            throw new Error(`object arg hook failed: sbRet=${sbRet}, seenArgClass=${seenArgClass}`);
+        }
+    "#;
+
+    JsRunner::run_source_with_args(script, &[])
+        .expect("JNI interface hook & per-instance this dispatch test failed");
+}
+

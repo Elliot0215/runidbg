@@ -252,6 +252,12 @@ interface JniTraceNamespace {
 
 interface JniNamespace {
   readonly envPtr: number;
+  /**
+   * 拦截指定类（或接口/父类）的 JNI 方法或字段读取（支持运行时子类自动回退到声明接口/父类）。
+   * - 实例方法：第 1 个实参为 `self`（`this` 的 `jobject` 句柄），后续为 Java 实参；同时 JS `this` 绑定为 `{ ref, className, declaringClass, name, sig, isStatic }`。
+   * - 静态方法：实参直接为 Java 实参。
+   * - 优先级：用户 `emu.jni.hook` > 内置 Java 模型 > `onUnhandled`。
+   */
   hook(className: string, methods: Record<string, (...args: any[]) => any>): void;
   onUnhandled(callback: (info: UnhandledJniInfo) => any): void;
   registeredNatives(): RegisteredNativeInfo[];

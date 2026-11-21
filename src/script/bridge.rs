@@ -167,6 +167,25 @@ fn jvalue_opt_to_js<'js>(ctx: &Ctx<'js>, stored: Option<JValue>) -> rquickjs::Re
     }
 }
 
+fn object_kind_str(obj: &JObject) -> &'static str {
+    match obj {
+        JObject::Class { .. } => "class",
+        JObject::String(_) => "string",
+        JObject::BooleanArray(_) => "boolean[]",
+        JObject::ByteArray(_) => "byte[]",
+        JObject::CharArray(_) => "char[]",
+        JObject::ShortArray(_) => "short[]",
+        JObject::IntArray(_) => "int[]",
+        JObject::LongArray(_) => "long[]",
+        JObject::FloatArray(_) => "float[]",
+        JObject::DoubleArray(_) => "double[]",
+        JObject::ObjectArray(_) => "object[]",
+        JObject::DirectBuffer { .. } => "directBuffer",
+        JObject::Custom { .. } => "custom",
+        _ => "builtin",
+    }
+}
+
 fn jni_trace_event_to_js<'js>(
     ctx: &Ctx<'js>,
     ev: &crate::jni::JniTraceEvent,
@@ -1442,9 +1461,15 @@ pub(super) fn register_native_bridge<'js>(
                 ctx.clone(),
                 move |ctx: Ctx<'js>, emu_id: usize, obj_ref: f64| -> rquickjs::Result<Value<'js>> {
                     let r = JObjectRef(obj_ref as u64);
-                    let info = with_uc(&ctx, &host, emu_id, |uc| {
-                        Ok(uc.get_data().jni.describe_object(r))
-                    })?;
+                    let info = if let Some(res) = with_active_objects(|objs| {
+                        objs.get(r).map(|o| (o.class_name().to_string(), object_kind_str(o)))
+                    }) {
+                        res
+                    } else {
+                        with_uc(&ctx, &host, emu_id, |uc| {
+                            Ok(uc.get_data().jni.describe_object(r))
+                        })?
+                    };
                     let Some((class_name, kind)) = info else {
                         return Ok(Value::new_null(ctx.clone()));
                     };

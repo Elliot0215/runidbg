@@ -122,12 +122,20 @@ impl JsJniHandler {
             return false;
         };
         let norm_cls = class_name.replace('.', "/");
-        let hook_fn = self
-            .table
-            .borrow()
-            .hooks
-            .get(&(norm_cls.clone(), method.name.clone()))
-            .cloned();
+        let decl_cls = method.class_name.replace('.', "/");
+        let hook_fn = {
+            let tbl = self.table.borrow();
+            tbl.hooks
+                .get(&(norm_cls.clone(), method.name.clone()))
+                .or_else(|| {
+                    if decl_cls != norm_cls {
+                        tbl.hooks.get(&(decl_cls.clone(), method.name.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .cloned()
+        };
         let Some(pfn) = hook_fn else {
             return false;
         };
@@ -138,6 +146,15 @@ impl JsJniHandler {
 
         if let Ok(func) = pfn.restore(&js_ctx) {
             let mut call_args = Args::new(js_ctx.clone(), args.len() + usize::from(obj.is_some()));
+            if let Ok(this_meta) = Object::new(js_ctx.clone()) {
+                let _ = this_meta.set("ref", obj.map(|r| r.0 as f64).unwrap_or(0.0));
+                let _ = this_meta.set("className", norm_cls.as_str());
+                let _ = this_meta.set("declaringClass", decl_cls.as_str());
+                let _ = this_meta.set("name", method.name.as_str());
+                let _ = this_meta.set("sig", method.sig.as_str());
+                let _ = this_meta.set("isStatic", method.is_static);
+                let _ = call_args.this(this_meta);
+            }
             if let Some(this_obj) = obj {
                 let _ = call_args.push_arg(this_obj.0 as f64);
             }
@@ -167,11 +184,13 @@ impl JsJniHandler {
         false
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn invoke_unhandled<'js>(
         &self,
         ctx_jni: &mut JniContext<'_>,
         kind: &str,
         class_name: &str,
+        obj: Option<JObjectRef>,
         method: &MethodDesc,
         args: &[JValue],
         f: impl FnOnce(&Ctx<'js>, Value<'js>, &mut ObjectTable),
@@ -199,6 +218,7 @@ impl JsJniHandler {
             if let Ok(info) = Object::new(js_ctx.clone()) {
                 let _ = info.set("kind", kind);
                 let _ = info.set("className", norm_cls.as_str());
+                let _ = info.set("thisObj", obj.map(|r| r.0 as f64).unwrap_or(0.0));
                 let _ = info.set("name", method.name.as_str());
                 let _ = info.set("sig", method.sig.as_str());
                 let _ = info.set("isStatic", method.is_static);
@@ -241,7 +261,7 @@ impl JsJniHandler {
             return true;
         }
         if let Some(func) = cb {
-            return self.invoke_unhandled(ctx_jni, kind, class_name, method, args, func);
+            return self.invoke_unhandled(ctx_jni, kind, class_name, obj, method, args, func);
         }
         false
     }
@@ -394,7 +414,7 @@ impl JniHandler for JsJniHandler {
         if !default_ret.is_null() {
             return default_ret;
         }
-        if self.invoke_unhandled(ctx, "CallObjectMethod", &cls, method, args, |_, v, objs| {
+        if self.invoke_unhandled(ctx, "CallObjectMethod", &cls, Some(obj), method, args, |_, v, objs| {
             out = js_to_jobject(v, objs);
         }) {
             return out;
@@ -423,6 +443,7 @@ impl JniHandler for JsJniHandler {
             ctx,
             "CallStaticObjectMethod",
             class_name,
+            None,
             method,
             args,
             |_, v, objs| {
@@ -765,7 +786,7 @@ impl JniHandler for JsJniHandler {
         if !default_ret.is_null() {
             return default_ret;
         }
-        if self.invoke_unhandled(ctx, "GetObjectField", &cls, &pseudo, &[], |_, v, objs| {
+        if self.invoke_unhandled(ctx, "GetObjectField", &cls, Some(obj), &pseudo, &[], |_, v, objs| {
             if is_char_array {
                 if let Some(s) = v.as_string() {
                     if let Ok(rust_s) = s.to_string() {
