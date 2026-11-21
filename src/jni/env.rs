@@ -682,7 +682,15 @@ where
             let sig = read_guest_cstr(uc, x3, 512);
             let (vm, _) = get_state(uc.get_data_mut());
             let cls = vm.resolve_class_name(JObjectRef(x1));
-            vm.intern_method(cls, name, sig, slot == 113)
+            let kind = if slot == 113 {
+                "GetStaticMethodID"
+            } else {
+                "GetMethodID"
+            };
+            let mid = vm.intern_method(cls.clone(), name.clone(), sig.clone(), slot == 113);
+            vm.breadcrumbs
+                .push(format!("[JNI] {kind} {cls}.{name}{sig} -> 0x{mid:x}"));
+            mid
         }
 
         // 实例方法三联调用 (34..=63)
@@ -773,7 +781,15 @@ where
             let sig = read_guest_cstr(uc, x3, 512);
             let (vm, _) = get_state(uc.get_data_mut());
             let cls = vm.resolve_class_name(JObjectRef(x1));
-            vm.intern_field(cls, name, sig, slot == 144)
+            let kind = if slot == 144 {
+                "GetStaticFieldID"
+            } else {
+                "GetFieldID"
+            };
+            let fid = vm.intern_field(cls.clone(), name.clone(), sig.clone(), slot == 144);
+            vm.breadcrumbs
+                .push(format!("[JNI] {kind} {cls}.{name}({sig}) -> 0x{fid:x}"));
+            fid
         }
 
         // 实例字段读取 (95..=103)
