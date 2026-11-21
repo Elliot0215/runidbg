@@ -223,6 +223,8 @@ interface JniNamespace {
   setStaticField(className: string, fieldName: string, value: unknown, sig?: string): void;
   /** 查询已设置的类静态字段值 */
   getStaticField(className: string, fieldName: string): unknown;
+  /** 开启/关闭 FindClass 严格存在性校验（开启且已加载 DEX 时，非系统类不存在返回 NULL 并抛出 ClassNotFoundException） */
+  setStrictFindClass(enabled: boolean): void;
   pushLocalFrame(): void;
   popLocalFrame(keepRef?: number | bigint): number;
   withLocalFrame<T>(fn: () => T): T;
@@ -345,8 +347,25 @@ interface CrashReport {
   readonly formatted: string;
 }
 
+interface DexClassInfo {
+  readonly name: string;
+  readonly superClass: string | null;
+  readonly interfaces: string[];
+  readonly fields: Array<{ name: string; sig: string; isStatic: boolean }>;
+  readonly methods: Array<{ name: string; sig: string; isDirect: boolean }>;
+  readonly staticValues: Record<string, unknown>;
+}
+
+interface DexNamespace {
+  classes(prefix?: string): string[];
+  classInfo(className: string): DexClassInfo | null;
+}
+
 interface EmuHandle {
   load(path: string, opts?: LoadOptions): ModuleHandle;
+  /** 加载单个 .dex 文件到轻量元数据索引并挂载到 VFS */
+  loadDex(path: string): { classes: number; dexCount: number };
+  readonly dex: DexNamespace;
   loadApk(path: string): ApkHandle;
   jniOnLoad(mod: ModuleHandle): number | null;
   call(addr: number | bigint, ...args: Array<number | bigint>): number;

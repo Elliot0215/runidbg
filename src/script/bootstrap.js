@@ -314,6 +314,20 @@
           const info = __native.emuLoad(emuId, String(path), runInit);
           return makeModule(emuId, info);
         },
+        loadDex(path) {
+          return __native.emuLoadDex(emuId, String(path));
+        },
+        dex: {
+          classes(prefix) {
+            return __native.dexClasses(
+              emuId,
+              prefix !== undefined ? String(prefix) : undefined
+            );
+          },
+          classInfo(className) {
+            return __native.dexClassInfo(emuId, String(className));
+          },
+        },
         loadApk(path) {
           const info = __native.emuLoadApk(emuId, String(path));
           return {
@@ -561,6 +575,9 @@
           },
           getStaticField(className, fieldName) {
             return __native.jniGetStaticField(emuId, String(className), String(fieldName));
+          },
+          setStrictFindClass(enabled) {
+            __native.jniSetStrictFindClass(emuId, Boolean(enabled));
           },
           pushLocalFrame() {
             __native.jniPushLocalFrame(emuId);

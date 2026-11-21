@@ -538,10 +538,30 @@ impl AndroidEmulator {
         self.uc.get_data().vfs.diag()
     }
 
+    /// 从磁盘加载单个 `.dex` 文件到轻量元数据索引并挂载到 VFS，返回解析出的类数量
+    pub fn load_dex(&mut self, path: impl AsRef<Path>) -> EmuResult<usize> {
+        let path_ref = path.as_ref();
+        let name = path_ref
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "classes.dex".to_string());
+        let bytes = std::fs::read(path_ref)?;
+        self.load_dex_bytes(&name, &bytes)
+    }
+
+    /// 从字节流加载 `.dex` 到轻量元数据索引并挂载到 VFS，返回解析出的类数量
+    pub fn load_dex_bytes(&mut self, name: &str, bytes: &[u8]) -> EmuResult<usize> {
+        let data = self.uc.get_data_mut();
+        let pkg = data.vfs.package_name.clone();
+        data.vfs
+            .add_overlay_file(format!("/data/app/{pkg}/{name}"), bytes.to_vec());
+        data.jni.dex_index.add_dex_bytes(bytes)
+    }
+
     /// 一键加载 Android APK：
     /// - 解析包名与签名证书（`AndroidManifest.xml` + `META-INF/*.RSA`）
     /// - 将 `lib/arm64-v8a/*.so` 注册到内存动态链接器（自动解析 `DT_NEEDED`）
-    /// - 将 `assets/**` 与 `base.apk` 挂载到内存 VFS
+    /// - 将 `assets/**`、`classes*.dex` 与 `base.apk` 挂载到内存 VFS，并自动建立 DEX 元数据索引
     #[cfg(feature = "apk")]
     pub fn load_apk(&mut self, path: impl AsRef<Path>) -> EmuResult<ApkPackage> {
         let apk = ApkPackage::from_path(path)?;
@@ -549,7 +569,7 @@ impl AndroidEmulator {
         Ok(apk)
     }
 
-    /// 从已解析的 `ApkPackage` 注入运行环境（包名、内存 `.so` 库、VFS `assets/` 与 `base.apk`）
+    /// 从已解析的 `ApkPackage` 注入运行环境（包名、内存 `.so` 库、VFS `assets/`、`classes*.dex` 与 `base.apk`）
     #[cfg(feature = "apk")]
     pub fn install_apk(&mut self, apk: &ApkPackage) {
         let pkg_name = apk
@@ -557,15 +577,30 @@ impl AndroidEmulator {
             .clone()
             .unwrap_or_else(|| self.uc.get_data().vfs.package_name.clone());
         {
-            let vfs = &mut self.uc.get_data_mut().vfs;
-            vfs.package_name = pkg_name.clone();
-            vfs.add_overlay_file(format!("/data/app/{pkg_name}/base.apk"), apk.raw_apk.clone());
-            for (rel, data) in &apk.assets {
-                vfs.add_overlay_file(format!("/assets/{rel}"), data.clone());
-                vfs.add_overlay_file(format!("/data/app/{pkg_name}/assets/{rel}"), data.clone());
+            let data = self.uc.get_data_mut();
+            data.vfs.package_name = pkg_name.clone();
+            data.vfs
+                .add_overlay_file(format!("/data/app/{pkg_name}/base.apk"), apk.raw_apk.clone());
+            for (rel, bytes) in &apk.assets {
+                data.vfs
+                    .add_overlay_file(format!("/assets/{rel}"), bytes.clone());
+                data.vfs
+                    .add_overlay_file(format!("/data/app/{pkg_name}/assets/{rel}"), bytes.clone());
+            }
+            for (dex_name, dex_bytes) in &apk.dex_files {
+                data.vfs.add_overlay_file(
+                    format!("/data/app/{pkg_name}/{dex_name}"),
+                    dex_bytes.clone(),
+                );
+                if let Err(e) = data.jni.dex_index.add_dex_bytes(dex_bytes) {
+                    tracing::warn!(target: "runidbg::dex", "解析 APK 内 {dex_name} 失败（已跳过）: {e}");
+                }
             }
             if let Some(cert) = &apk.signature_cert {
-                vfs.add_overlay_file(format!("/data/app/{pkg_name}/META-INF/CERT.RSA"), cert.clone());
+                data.vfs.add_overlay_file(
+                    format!("/data/app/{pkg_name}/META-INF/CERT.RSA"),
+                    cert.clone(),
+                );
             }
         }
         for (lib_name, bytes) in &apk.native_libs {

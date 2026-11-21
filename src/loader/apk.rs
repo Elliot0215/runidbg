@@ -6,13 +6,14 @@ use zip::ZipArchive;
 
 use crate::error::{EmuError, EmuResult};
 
-/// 解析后的 Android APK 内存镜像（`lib/arm64-v8a/*.so`、`assets/**`、签名证书与包名）
+/// 解析后的 Android APK 内存镜像（`lib/arm64-v8a/*.so`、`assets/**`、`classes*.dex`、签名证书与包名）
 #[derive(Debug, Clone)]
 pub struct ApkPackage {
     pub package_name: Option<String>,
     pub abi: String,
     pub native_libs: BTreeMap<String, Vec<u8>>,
     pub assets: BTreeMap<String, Vec<u8>>,
+    pub dex_files: BTreeMap<String, Vec<u8>>,
     pub signature_cert: Option<Vec<u8>>,
     pub raw_apk: Vec<u8>,
 }
@@ -33,6 +34,7 @@ impl ApkPackage {
         let mut package_name: Option<String> = None;
         let mut native_libs: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut assets: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        let mut dex_files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut signature_cert: Option<Vec<u8>> = None;
 
         for i in 0..archive.len() {
@@ -60,6 +62,10 @@ impl ApkPackage {
                     file.read_to_end(&mut buf)?;
                     assets.insert(asset_rel.to_string(), buf);
                 }
+            } else if !name.contains('/') && name.starts_with("classes") && name.ends_with(".dex") {
+                let mut buf = Vec::with_capacity(file.size() as usize);
+                file.read_to_end(&mut buf)?;
+                dex_files.insert(name, buf);
             } else if signature_cert.is_none()
                 && name.starts_with("META-INF/")
                 && (name.ends_with(".RSA") || name.ends_with(".DSA") || name.ends_with(".EC"))
@@ -77,6 +83,7 @@ impl ApkPackage {
             abi: "arm64-v8a".to_string(),
             native_libs,
             assets,
+            dex_files,
             signature_cert,
             raw_apk,
         })

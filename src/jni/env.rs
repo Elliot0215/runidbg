@@ -12,6 +12,7 @@ use crate::jni::types::{
 use crate::jni::va_list::{
     read_varargs_direct, read_varargs_jvalue_array, read_varargs_va_list,
 };
+use crate::loader::dex::{is_system_or_array_class, DexIndex, DexValue};
 use crate::memory::{read_guest_cstr, read_guest_u64, MemoryManager, PAGE_SIZE};
 use crate::os::DeviceProfile;
 
@@ -61,6 +62,11 @@ pub struct JniVm {
     /// 类静态字段表：`(normalized_class_name, field_name) -> JValue`
     static_fields: HashMap<(String, String), JValue>,
 
+    /// 轻量 DEX 元数据索引（类继承链、方法/字段签名、静态常量初值）
+    pub dex_index: DexIndex,
+    /// `FindClass` 严格模式：开启且已加载 DEX 时，非系统类不存在返回 `NULL` 并挂 `ClassNotFoundException`
+    pub strict_find_class: bool,
+
     pending_exception: JObjectRef,
     /// 记录 `GetStringUTFChars` 分配的缓冲区，供 `ReleaseStringUTFChars` 追踪
     utf_buffers: HashMap<u64, JObjectRef>,
@@ -91,6 +97,8 @@ impl JniVm {
             field_lookup: HashMap::new(),
             next_field_id: 0x3000_0001,
             static_fields: HashMap::new(),
+            dex_index: DexIndex::new(),
+            strict_find_class: false,
             pending_exception: JObjectRef::NULL,
             utf_buffers: HashMap::new(),
             array_buffers: HashMap::new(),
@@ -441,11 +449,23 @@ where
         6 => {
             let name = read_guest_cstr(uc, x1, 512);
             let (vm, _) = get_state(uc.get_data_mut());
-            let mut ctx = JniContext {
-                objects: &mut vm.objects,
-                package_name: &vm.package_name,
-            };
-            vm.handler.find_class(&mut ctx, &name).0
+            if vm.strict_find_class
+                && !vm.dex_index.is_empty()
+                && !is_system_or_array_class(&name)
+                && !vm.dex_index.has_class(&name)
+            {
+                let exc = vm
+                    .objects
+                    .add_string(format!("java.lang.ClassNotFoundException: {name}"));
+                vm.pending_exception = exc;
+                0
+            } else {
+                let mut ctx = JniContext {
+                    objects: &mut vm.objects,
+                    package_name: &vm.package_name,
+                };
+                vm.handler.find_class(&mut ctx, &name).0
+            }
         }
 
         // 7: FromReflectedMethod
@@ -473,6 +493,8 @@ where
             let cls = vm.resolve_class_name(JObjectRef(x1));
             if cls == "java/lang/Object" || cls == "<unknown>" {
                 0
+            } else if let Some(super_cls) = vm.dex_index.get_superclass(&cls).map(str::to_string) {
+                vm.objects.find_or_create_class(&super_cls).0
             } else {
                 vm.objects.find_or_create_class("java/lang/Object").0
             }
@@ -484,8 +506,12 @@ where
                 JNI_TRUE
             } else {
                 let (vm, _) = get_state(uc.get_data_mut());
-                if vm.resolve_class_name(JObjectRef(x2)) == "java/lang/Object" {
+                let sub = vm.resolve_class_name(JObjectRef(x1));
+                let sup = vm.resolve_class_name(JObjectRef(x2));
+                if sup == "java/lang/Object" {
                     JNI_TRUE
+                } else if let Some(ok) = vm.dex_index.is_assignable_from(&sub, &sup) {
+                    if ok { JNI_TRUE } else { JNI_FALSE }
                 } else {
                     JNI_FALSE
                 }
@@ -916,6 +942,7 @@ where
         }
 
         // 静态字段读取 (145..=153)
+        // 优先级：用户显式 setStaticField > handler/JS Hook > DEX static_values > 内置 Build 表
         145 => {
             let (vm, _) = get_state(uc.get_data_mut());
             let cls = vm.resolve_class_name(JObjectRef(x1));
@@ -932,6 +959,20 @@ where
                     };
                     if !ret.is_null() {
                         ret.0
+                    } else if let Some(dv) = vm.dex_index.get_static_value(&cls, &field.name).cloned()
+                    {
+                        let r = dex_value_to_jobject(&mut vm.objects, &dv, &field.sig);
+                        if !r.is_null() {
+                            r.0
+                        } else {
+                            resolve_builtin_build_object_field(
+                                &mut vm.objects,
+                                &vm.device_profile,
+                                &cls,
+                                &field,
+                            )
+                            .0
+                        }
                     } else {
                         resolve_builtin_build_object_field(
                             &mut vm.objects,
@@ -953,11 +994,22 @@ where
                 if let Some(JValue::Boolean(b)) = vm.get_static_field(&cls, &field.name).copied() {
                     u64::from(b)
                 } else {
-                    let mut ctx = JniContext {
-                        objects: &mut vm.objects,
-                        package_name: &vm.package_name,
+                    let v = {
+                        let mut ctx = JniContext {
+                            objects: &mut vm.objects,
+                            package_name: &vm.package_name,
+                        };
+                        vm.handler.get_static_boolean_field(&mut ctx, &cls, &field)
                     };
-                    u64::from(vm.handler.get_static_boolean_field(&mut ctx, &cls, &field))
+                    if v {
+                        1
+                    } else if let Some(DexValue::Boolean(b)) =
+                        vm.dex_index.get_static_value(&cls, &field.name)
+                    {
+                        u64::from(*b)
+                    } else {
+                        0
+                    }
                 }
             } else {
                 0
@@ -970,11 +1022,22 @@ where
                 if let Some(JValue::Byte(v)) = vm.get_static_field(&cls, &field.name).copied() {
                     v as i64 as u64
                 } else {
-                    let mut ctx = JniContext {
-                        objects: &mut vm.objects,
-                        package_name: &vm.package_name,
+                    let v = {
+                        let mut ctx = JniContext {
+                            objects: &mut vm.objects,
+                            package_name: &vm.package_name,
+                        };
+                        vm.handler.get_static_byte_field(&mut ctx, &cls, &field)
                     };
-                    vm.handler.get_static_byte_field(&mut ctx, &cls, &field) as i64 as u64
+                    if v != 0 {
+                        v as i64 as u64
+                    } else if let Some(DexValue::Byte(b)) =
+                        vm.dex_index.get_static_value(&cls, &field.name)
+                    {
+                        *b as i64 as u64
+                    } else {
+                        0
+                    }
                 }
             } else {
                 0
@@ -987,11 +1050,22 @@ where
                 if let Some(JValue::Char(v)) = vm.get_static_field(&cls, &field.name).copied() {
                     u64::from(v)
                 } else {
-                    let mut ctx = JniContext {
-                        objects: &mut vm.objects,
-                        package_name: &vm.package_name,
+                    let v = {
+                        let mut ctx = JniContext {
+                            objects: &mut vm.objects,
+                            package_name: &vm.package_name,
+                        };
+                        vm.handler.get_static_char_field(&mut ctx, &cls, &field)
                     };
-                    u64::from(vm.handler.get_static_char_field(&mut ctx, &cls, &field))
+                    if v != 0 {
+                        u64::from(v)
+                    } else if let Some(DexValue::Char(c)) =
+                        vm.dex_index.get_static_value(&cls, &field.name)
+                    {
+                        u64::from(*c)
+                    } else {
+                        0
+                    }
                 }
             } else {
                 0
@@ -1004,11 +1078,22 @@ where
                 if let Some(JValue::Short(v)) = vm.get_static_field(&cls, &field.name).copied() {
                     v as i64 as u64
                 } else {
-                    let mut ctx = JniContext {
-                        objects: &mut vm.objects,
-                        package_name: &vm.package_name,
+                    let v = {
+                        let mut ctx = JniContext {
+                            objects: &mut vm.objects,
+                            package_name: &vm.package_name,
+                        };
+                        vm.handler.get_static_short_field(&mut ctx, &cls, &field)
                     };
-                    vm.handler.get_static_short_field(&mut ctx, &cls, &field) as i64 as u64
+                    if v != 0 {
+                        v as i64 as u64
+                    } else if let Some(DexValue::Short(s)) =
+                        vm.dex_index.get_static_value(&cls, &field.name)
+                    {
+                        *s as i64 as u64
+                    } else {
+                        0
+                    }
                 }
             } else {
                 0
@@ -1030,6 +1115,10 @@ where
                     };
                     if val != 0 {
                         val as i64 as u64
+                    } else if let Some(DexValue::Int(i)) =
+                        vm.dex_index.get_static_value(&cls, &field.name)
+                    {
+                        *i as i64 as u64
                     } else if cls == "android/os/Build$VERSION" && field.name == "SDK_INT" {
                         (vm.device_profile.sdk_int as i32) as i64 as u64
                     } else {
@@ -1047,11 +1136,22 @@ where
                 if let Some(JValue::Long(v)) = vm.get_static_field(&cls, &field.name).copied() {
                     v as u64
                 } else {
-                    let mut ctx = JniContext {
-                        objects: &mut vm.objects,
-                        package_name: &vm.package_name,
+                    let v = {
+                        let mut ctx = JniContext {
+                            objects: &mut vm.objects,
+                            package_name: &vm.package_name,
+                        };
+                        vm.handler.get_static_long_field(&mut ctx, &cls, &field)
                     };
-                    vm.handler.get_static_long_field(&mut ctx, &cls, &field) as u64
+                    if v != 0 {
+                        v as u64
+                    } else if let Some(DexValue::Long(l)) =
+                        vm.dex_index.get_static_value(&cls, &field.name)
+                    {
+                        *l as u64
+                    } else {
+                        0
+                    }
                 }
             } else {
                 0
@@ -1066,11 +1166,22 @@ where
                     {
                         u64::from(v.to_bits())
                     } else {
-                        let mut ctx = JniContext {
-                            objects: &mut vm.objects,
-                            package_name: &vm.package_name,
+                        let v = {
+                            let mut ctx = JniContext {
+                                objects: &mut vm.objects,
+                                package_name: &vm.package_name,
+                            };
+                            vm.handler.get_static_float_field(&mut ctx, &cls, &field)
                         };
-                        u64::from(vm.handler.get_static_float_field(&mut ctx, &cls, &field).to_bits())
+                        if v != 0.0 {
+                            u64::from(v.to_bits())
+                        } else if let Some(DexValue::Float(f)) =
+                            vm.dex_index.get_static_value(&cls, &field.name)
+                        {
+                            u64::from(f.to_bits())
+                        } else {
+                            0
+                        }
                     }
                 } else {
                     0
@@ -1089,13 +1200,22 @@ where
                     {
                         v.to_bits()
                     } else {
-                        let mut ctx = JniContext {
-                            objects: &mut vm.objects,
-                            package_name: &vm.package_name,
+                        let v = {
+                            let mut ctx = JniContext {
+                                objects: &mut vm.objects,
+                                package_name: &vm.package_name,
+                            };
+                            vm.handler.get_static_double_field(&mut ctx, &cls, &field)
                         };
-                        vm.handler
-                            .get_static_double_field(&mut ctx, &cls, &field)
-                            .to_bits()
+                        if v != 0.0 {
+                            v.to_bits()
+                        } else if let Some(DexValue::Double(d)) =
+                            vm.dex_index.get_static_value(&cls, &field.name)
+                        {
+                            d.to_bits()
+                        } else {
+                            0
+                        }
                     }
                 } else {
                     0
@@ -1721,6 +1841,114 @@ fn resolve_builtin_build_object_field(
                 fields,
             })
         }
+        _ => JObjectRef::NULL,
+    }
+}
+
+/// 将 DEX `static_values` 中的对象/数组常量转换为 JNI `JObjectRef`
+fn dex_value_to_jobject(objects: &mut ObjectTable, val: &DexValue, field_sig: &str) -> JObjectRef {
+    match val {
+        DexValue::String(s) => {
+            if field_sig == "[C" {
+                objects.add_char_array(s.encode_utf16().collect::<Vec<u16>>())
+            } else {
+                objects.add_string(s.clone())
+            }
+        }
+        DexValue::Type(cls) => objects.find_or_create_class(cls),
+        DexValue::Array(elems) => match field_sig {
+            "[C" => {
+                let chars: Vec<u16> = elems
+                    .iter()
+                    .map(|e| match e {
+                        DexValue::Char(c) => *c,
+                        DexValue::Int(i) => *i as u16,
+                        DexValue::Byte(b) => *b as u8 as u16,
+                        _ => 0,
+                    })
+                    .collect();
+                objects.add_char_array(chars)
+            }
+            "[B" => {
+                let bytes: Vec<u8> = elems
+                    .iter()
+                    .map(|e| match e {
+                        DexValue::Byte(b) => *b as u8,
+                        DexValue::Int(i) => *i as u8,
+                        _ => 0,
+                    })
+                    .collect();
+                objects.add_byte_array(bytes)
+            }
+            "[I" => {
+                let ints: Vec<i32> = elems
+                    .iter()
+                    .map(|e| match e {
+                        DexValue::Int(i) => *i,
+                        DexValue::Short(s) => i32::from(*s),
+                        DexValue::Byte(b) => i32::from(*b),
+                        _ => 0,
+                    })
+                    .collect();
+                objects.add_int_array(ints)
+            }
+            "[J" => {
+                let longs: Vec<i64> = elems
+                    .iter()
+                    .map(|e| match e {
+                        DexValue::Long(l) => *l,
+                        DexValue::Int(i) => i64::from(*i),
+                        _ => 0,
+                    })
+                    .collect();
+                objects.add_long_array(longs)
+            }
+            "[Z" => {
+                let bools: Vec<u8> = elems
+                    .iter()
+                    .map(|e| u8::from(matches!(e, DexValue::Boolean(true))))
+                    .collect();
+                objects.add_local(JObject::BooleanArray(bools))
+            }
+            "[S" => {
+                let shorts: Vec<i16> = elems
+                    .iter()
+                    .map(|e| match e {
+                        DexValue::Short(s) => *s,
+                        DexValue::Int(i) => *i as i16,
+                        _ => 0,
+                    })
+                    .collect();
+                objects.add_local(JObject::ShortArray(shorts))
+            }
+            "[F" => {
+                let floats: Vec<f32> = elems
+                    .iter()
+                    .map(|e| match e {
+                        DexValue::Float(f) => *f,
+                        _ => 0.0,
+                    })
+                    .collect();
+                objects.add_local(JObject::FloatArray(floats))
+            }
+            "[D" => {
+                let doubles: Vec<f64> = elems
+                    .iter()
+                    .map(|e| match e {
+                        DexValue::Double(d) => *d,
+                        _ => 0.0,
+                    })
+                    .collect();
+                objects.add_local(JObject::DoubleArray(doubles))
+            }
+            _ => {
+                let refs: Vec<JObjectRef> = elems
+                    .iter()
+                    .map(|e| dex_value_to_jobject(objects, e, ""))
+                    .collect();
+                objects.add_local(JObject::ObjectArray(refs))
+            }
+        },
         _ => JObjectRef::NULL,
     }
 }

@@ -165,6 +165,34 @@ fn jvalue_opt_to_js<'js>(ctx: &Ctx<'js>, stored: Option<JValue>) -> rquickjs::Re
     }
 }
 
+fn dex_value_to_js<'js>(
+    ctx: &Ctx<'js>,
+    val: &crate::loader::DexValue,
+) -> rquickjs::Result<Value<'js>> {
+    use crate::loader::DexValue;
+    match val {
+        DexValue::Null => Ok(Value::new_null(ctx.clone())),
+        DexValue::Boolean(b) => Ok(Value::new_bool(ctx.clone(), *b)),
+        DexValue::Byte(v) => Ok(Value::new_int(ctx.clone(), i32::from(*v))),
+        DexValue::Short(v) => Ok(Value::new_int(ctx.clone(), i32::from(*v))),
+        DexValue::Char(v) => Ok(Value::new_int(ctx.clone(), i32::from(*v))),
+        DexValue::Int(v) => Ok(Value::new_int(ctx.clone(), *v)),
+        DexValue::Long(v) => Ok(Value::new_number(ctx.clone(), *v as f64)),
+        DexValue::Float(v) => Ok(Value::new_float(ctx.clone(), f64::from(*v))),
+        DexValue::Double(v) => Ok(Value::new_float(ctx.clone(), *v)),
+        DexValue::String(s) | DexValue::Type(s) => {
+            Ok(rquickjs::String::from_str(ctx.clone(), s)?.into_value())
+        }
+        DexValue::Array(elems) => {
+            let arr = Array::new(ctx.clone())?;
+            for (i, e) in elems.iter().enumerate() {
+                arr.set(i, dex_value_to_js(ctx, e)?)?;
+            }
+            Ok(arr.into_value())
+        }
+    }
+}
+
 fn js_val_to_u64(ctx: &Ctx<'_>, v: &Value<'_>) -> rquickjs::Result<u64> {
     if let Some(i) = v.as_int() {
         Ok(i as i64 as u64)
@@ -1227,6 +1255,142 @@ pub(super) fn register_native_bridge<'js>(
                             .copied())
                     })?;
                     jvalue_opt_to_js(&ctx, stored)
+                },
+            )?,
+        )?;
+    }
+
+    // jniSetStrictFindClass(emuId, enabled) -> void
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniSetStrictFindClass",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, enabled: bool| -> rquickjs::Result<()> {
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        uc.get_data_mut().jni.strict_find_class = enabled;
+                        Ok(())
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    // emuLoadDex(emuId, path) -> { classes, dexCount }
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "emuLoadDex",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize, path: String| -> rquickjs::Result<Object<'js>> {
+                    let (added, dex_count) = with_uc(&ctx, &host, emu_id, |uc| {
+                        let p = Path::new(&path);
+                        let name = p
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "classes.dex".to_string());
+                        let bytes = fs::read(p)
+                            .map_err(|e| throw_err(&ctx, format!("读取 DEX 失败 {path}: {e}")))?;
+                        let data = uc.get_data_mut();
+                        let pkg = data.vfs.package_name.clone();
+                        data.vfs
+                            .add_overlay_file(format!("/data/app/{pkg}/{name}"), bytes.clone());
+                        let added = data
+                            .jni
+                            .dex_index
+                            .add_dex_bytes(&bytes)
+                            .map_err(|e| throw_err(&ctx, e))?;
+                        Ok((added, data.jni.dex_index.dex_count()))
+                    })?;
+                    let obj = Object::new(ctx.clone())?;
+                    obj.set("classes", added)?;
+                    obj.set("dexCount", dex_count)?;
+                    Ok(obj)
+                },
+            )?,
+        )?;
+    }
+
+    // dexClasses(emuId, prefix?) -> string[]
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "dexClasses",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>,
+                      emu_id: usize,
+                      prefix: Option<String>|
+                      -> rquickjs::Result<Vec<String>> {
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc
+                            .get_data()
+                            .jni
+                            .dex_index
+                            .list_classes(prefix.as_deref()))
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    // dexClassInfo(emuId, className) -> { name, superClass, interfaces, fields, methods, staticValues } | null
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "dexClassInfo",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      class_name: String|
+                      -> rquickjs::Result<Value<'js>> {
+                    let info = with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc.get_data().jni.dex_index.get_class(&class_name).cloned())
+                    })?;
+                    let Some(info) = info else {
+                        return Ok(Value::new_null(ctx.clone()));
+                    };
+                    let obj = Object::new(ctx.clone())?;
+                    obj.set("name", info.name)?;
+                    match info.super_class {
+                        Some(sc) => obj.set("superClass", sc)?,
+                        None => obj.set("superClass", Value::new_null(ctx.clone()))?,
+                    }
+                    let ifaces = Array::new(ctx.clone())?;
+                    for (i, iface) in info.interfaces.iter().enumerate() {
+                        ifaces.set(i, iface.as_str())?;
+                    }
+                    obj.set("interfaces", ifaces)?;
+
+                    let fields = Array::new(ctx.clone())?;
+                    for (i, f) in info.fields.iter().enumerate() {
+                        let fo = Object::new(ctx.clone())?;
+                        fo.set("name", f.name.as_str())?;
+                        fo.set("sig", f.sig.as_str())?;
+                        fo.set("isStatic", f.is_static)?;
+                        fields.set(i, fo)?;
+                    }
+                    obj.set("fields", fields)?;
+
+                    let methods = Array::new(ctx.clone())?;
+                    for (i, m) in info.methods.iter().enumerate() {
+                        let mo = Object::new(ctx.clone())?;
+                        mo.set("name", m.name.as_str())?;
+                        mo.set("sig", m.sig.as_str())?;
+                        mo.set("isDirect", m.is_direct)?;
+                        methods.set(i, mo)?;
+                    }
+                    obj.set("methods", methods)?;
+
+                    let sv_obj = Object::new(ctx.clone())?;
+                    for (k, v) in &info.static_values {
+                        sv_obj.set(k.as_str(), dex_value_to_js(&ctx, v)?)?;
+                    }
+                    obj.set("staticValues", sv_obj)?;
+                    Ok(obj.into_value())
                 },
             )?,
         )?;
