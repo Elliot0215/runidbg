@@ -146,7 +146,7 @@ fn js_field_val_to_jvalue<'js>(
 
 fn jvalue_opt_to_js<'js>(ctx: &Ctx<'js>, stored: Option<JValue>) -> rquickjs::Result<Value<'js>> {
     match stored {
-        None | Some(JValue::Void) => Ok(Value::new_undefined(ctx.clone())),
+        None | Some(JValue::Void) => Ok(Value::new_null(ctx.clone())),
         Some(JValue::Boolean(b)) => Ok(Value::new_bool(ctx.clone(), b)),
         Some(JValue::Byte(v)) => Ok(Value::new_int(ctx.clone(), i32::from(v))),
         Some(JValue::Char(v)) => Ok(Value::new_int(ctx.clone(), i32::from(v))),
@@ -616,7 +616,8 @@ pub(super) fn register_native_bridge<'js>(
                       emu_id: usize,
                       cls: String,
                       method: String,
-                      raw_args: Vec<f64>|
+                      raw_args: Vec<f64>,
+                      this_obj: f64|
                       -> rquickjs::Result<f64> {
                     let _guard = JsCtxGuard::enter(&ctx);
                     let mut h = host.borrow_mut();
@@ -625,11 +626,23 @@ pub(super) fn register_native_bridge<'js>(
                         .get_mut(emu_id)
                         .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
                     let args_u64: Vec<u64> = raw_args.into_iter().map(|v| v as u64).collect();
-                    let ret = entry
+                    let this_ref = if this_obj > 0.0 {
+                        Some(JObjectRef(this_obj as u64))
+                    } else {
+                        None
+                    };
+                    let _ret = entry
                         .emu
-                        .call_registered_native(&cls, &method, &args_u64)
+                        .call_registered_native_with_this(&cls, &method, this_ref, &args_u64)
                         .map_err(|e| throw_err(&ctx, e))?;
-                    Ok(ret as f64)
+                    let nh = Rc::clone(&entry.native_hooks);
+                    JsNativeHookTable::flush_ret_magic_leaves(&nh, emu_id, entry.emu.uc_mut());
+                    let final_ret = entry
+                        .emu
+                        .uc()
+                        .reg_read(unicorn_engine::RegisterARM64::X0)
+                        .unwrap_or(_ret);
+                    Ok(final_ret as f64)
                 },
             )?,
         )?;
@@ -1277,37 +1290,100 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
-    // emuLoadDex(emuId, path) -> { classes, dexCount }
+    // emuLoadDex(emuId, pathOrPaths) -> { classes, addedClasses, totalClasses, dexCount }
     {
         let host = Rc::clone(host);
         native.set(
             "emuLoadDex",
             Function::new(
                 ctx.clone(),
-                move |ctx: Ctx<'js>, emu_id: usize, path: String| -> rquickjs::Result<Object<'js>> {
-                    let (added, dex_count) = with_uc(&ctx, &host, emu_id, |uc| {
-                        let p = Path::new(&path);
-                        let name = p
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "classes.dex".to_string());
-                        let bytes = fs::read(p)
-                            .map_err(|e| throw_err(&ctx, format!("读取 DEX 失败 {path}: {e}")))?;
-                        let data = uc.get_data_mut();
-                        let pkg = data.vfs.package_name.clone();
-                        data.vfs
-                            .add_overlay_file(format!("/data/app/{pkg}/{name}"), bytes.clone());
-                        let added = data
-                            .jni
-                            .dex_index
-                            .add_dex_bytes(&bytes)
-                            .map_err(|e| throw_err(&ctx, e))?;
-                        Ok((added, data.jni.dex_index.dex_count()))
-                    })?;
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      paths: Vec<String>|
+                      -> rquickjs::Result<Object<'js>> {
+                    let mut dex_files: Vec<PathBuf> = Vec::new();
+                    for raw in paths {
+                        let p = PathBuf::from(&raw);
+                        if p.is_dir() {
+                            let mut dir_entries: Vec<PathBuf> = fs::read_dir(&p)
+                                .map_err(|e| throw_err(&ctx, format!("读取 DEX 目录失败 {raw}: {e}")))?
+                                .filter_map(|e| e.ok().map(|ent| ent.path()))
+                                .filter(|fp| {
+                                    fp.is_file()
+                                        && fp
+                                            .extension()
+                                            .and_then(|s| s.to_str())
+                                            .is_some_and(|ext| ext.eq_ignore_ascii_case("dex"))
+                                })
+                                .collect();
+                            // 自然排序：classes.dex < classes2.dex < classes10.dex
+                            dir_entries.sort_by(|a, b| {
+                                let na = a.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                                let nb = b.file_name().and_then(|s| s.to_str()).unwrap_or("");
+                                (na.len(), na).cmp(&(nb.len(), nb))
+                            });
+                            dex_files.extend(dir_entries);
+                        } else {
+                            dex_files.push(p);
+                        }
+                    }
+
+                    let (added_total, total_classes, dex_count) =
+                        with_uc(&ctx, &host, emu_id, |uc| {
+                            let mut added_sum = 0usize;
+                            for p in &dex_files {
+                                let name = p
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_else(|| "classes.dex".to_string());
+                                let bytes = fs::read(p).map_err(|e| {
+                                    throw_err(&ctx, format!("读取 DEX 失败 {}: {e}", p.display()))
+                                })?;
+                                let data = uc.get_data_mut();
+                                let pkg = data.vfs.package_name.clone();
+                                data.vfs.add_overlay_file(
+                                    format!("/data/app/{pkg}/{name}"),
+                                    bytes.clone(),
+                                );
+                                added_sum += data
+                                    .jni
+                                    .dex_index
+                                    .add_dex_bytes(&bytes)
+                                    .map_err(|e| throw_err(&ctx, e))?;
+                            }
+                            let idx = &uc.get_data().jni.dex_index;
+                            Ok((added_sum, idx.class_count(), idx.dex_count()))
+                        })?;
                     let obj = Object::new(ctx.clone())?;
-                    obj.set("classes", added)?;
+                    obj.set("classes", added_total)?;
+                    obj.set("addedClasses", added_total)?;
+                    obj.set("totalClasses", total_classes)?;
                     obj.set("dexCount", dex_count)?;
                     Ok(obj)
+                },
+            )?,
+        )?;
+    }
+
+    // hookImportResolve(emuId, symbolName) -> trampolineAddr
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "hookImportResolve",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, sym_name: String| -> rquickjs::Result<f64> {
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        let mut mem = std::mem::replace(
+                            &mut uc.get_data_mut().mem,
+                            crate::memory::MemoryManager::new(0, 0),
+                        );
+                        let mut tramp = std::mem::take(&mut uc.get_data_mut().trampolines);
+                        let res = tramp.resolve_or_register_import(uc, &mut mem, &sym_name);
+                        uc.get_data_mut().mem = mem;
+                        uc.get_data_mut().trampolines = tramp;
+                        res.map(|a| a as f64).map_err(|e| throw_err(&ctx, e))
+                    })
                 },
             )?,
         )?;
@@ -2587,10 +2663,25 @@ pub(super) fn register_native_bridge<'js>(
                     for (k, v) in snap.missing_jni {
                         jni.set(k, v as f64)?;
                     }
+                    let hle = Object::new(ctx.clone())?;
+                    for (k, v) in snap.missing_hle {
+                        hle.set(k, v as f64)?;
+                    }
+                    let jni_fields = Object::new(ctx.clone())?;
+                    for (k, v) in snap.missing_jni_fields {
+                        jni_fields.set(k, v as f64)?;
+                    }
+                    let auxv = Object::new(ctx.clone())?;
+                    for (k, v) in snap.missing_auxv {
+                        auxv.set(k.to_string(), v as f64)?;
+                    }
                     out.set("missingFiles", files)?;
                     out.set("missingProperties", props)?;
                     out.set("missingSyscalls", syscalls)?;
                     out.set("missingJni", jni)?;
+                    out.set("missingHle", hle)?;
+                    out.set("missingJniFields", jni_fields)?;
+                    out.set("missingAuxv", auxv)?;
                     Ok(out)
                 },
             )?,

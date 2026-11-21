@@ -149,8 +149,26 @@ interface RegsNamespace {
 }
 
 interface HookNamespace {
+  /** 在已映射指令地址挂入 onEnter/onLeave Hook（若地址未映射会立即抛错） */
   attach(addr: number | bigint, callbacks: AttachCallbacks): HookHandle;
   replace(addr: number | bigint, fn: (ctx: CpuContext) => number | bigint | boolean | void): HookHandle;
+  /** 按外部导入符号名（如 `"fopen"`, `"getauxval"`）挂 Hook；支持在 `emu.load` 之前或之后调用 */
+  import(
+    symbolName: string,
+    callbacks: AttachCallbacks | ((ctx: CpuContext) => number | bigint | boolean | void)
+  ): HookHandle;
+  /** 按外部导入符号名直接替换其实现（无需反汇编找 PLT 偏移） */
+  importReplace(
+    symbolName: string,
+    fn: (ctx: CpuContext) => number | bigint | boolean | void
+  ): HookHandle;
+  /**
+   * 指令级 Hook（**指令执行前**触发回调；在回调内调用 `ctx.setReg` / 改写 `ctx.x0` 会立即作用于当前即将执行的这条指令）。
+   * 若要改写某次 `BL` 调用后的返回值，请把地址挂在 `BL` 的**下一条指令**（`blAddr + 4`），例如：
+   * ```js
+   * emu.hook.code(mod.base + 0x93664 + 4, (ctx) => { ctx.x0 = 1; });
+   * ```
+   */
   code(
     addrOrRange: number | bigint | [number | bigint, number | bigint],
     fn: (ctx: CpuContext, pc: number, size: number) => void,
@@ -192,7 +210,24 @@ interface JniNamespace {
   hook(className: string, methods: Record<string, (...args: any[]) => any>): void;
   onUnhandled(callback: (info: UnhandledJniInfo) => any): void;
   registeredNatives(): RegisteredNativeInfo[];
-  callNative(className: string, methodName: string, args?: Array<number | bigint>): number;
+  /**
+   * 调用通过 `RegisterNatives` 动态注册的 JNI 方法。
+   * - 静态方法：不传 `opts.this`，`X1` 自动传 `jclass`；
+   * - 实例方法：传 `{ this: objRef }`，`X1` 传入该实例 `jobject`（使 `GetObjectField(this, ...)` 正常读取实例字段）。
+   */
+  callNative(
+    className: string,
+    methodName: string,
+    args?: Array<number | bigint>,
+    opts?: { this?: number | bigint }
+  ): number;
+  /** 以指定实例 `objRef` 作为 `this` 调用已注册的 JNI 实例方法 */
+  callNativeOn(
+    objRef: number | bigint,
+    className: string,
+    methodName: string,
+    args?: Array<number | bigint>
+  ): number;
   findClass(className: string): number;
   newString(value: string): number;
   newByteArray(bytes: Uint8Array): number;
@@ -217,11 +252,11 @@ interface JniNamespace {
   getLongs(ref: number | bigint): BigInt64Array | null;
   /** 设置实例对象字段（支持基本类型、string、TypedArray、jobject 句柄及可选 JNI 签名 `sig`） */
   setField(objRef: number | bigint, fieldName: string, value: unknown, sig?: string): void;
-  /** 查询实例对象字段值 */
+  /** 查询实例对象字段：基本类型返回原值，对象/数组字段返回 `jobject` 句柄（配合 `getString`/`getBytes`/`getChars`/`getInts` 读取内容），未设置返回 `null` */
   getField(objRef: number | bigint, fieldName: string): unknown;
-  /** 设置类静态字段（支持基本类型、string、Uint8Array(`[B`)、Uint16Array(`[C`)、jobject 句柄及可选 JNI 签名 `sig`） */
+  /** 设置类静态字段（支持基本类型、string、Uint8Array(`[B`)、Uint16Array(`[C`)、Int32Array(`[I`)、BigInt64Array(`[J`)、jobject 句柄及可选 JNI 签名 `sig`） */
   setStaticField(className: string, fieldName: string, value: unknown, sig?: string): void;
-  /** 查询已设置的类静态字段值 */
+  /** 查询已设置的类静态字段：基本类型返回原值，对象/数组字段返回 `jobject` 句柄（配合 `getString`/`getBytes`/`getChars`/`getInts` 读取内容），未设置返回 `null` */
   getStaticField(className: string, fieldName: string): unknown;
   /** 开启/关闭 FindClass 严格存在性校验（开启且已加载 DEX 时，非系统类不存在返回 NULL 并抛出 ClassNotFoundException） */
   setStrictFindClass(enabled: boolean): void;
@@ -313,6 +348,9 @@ interface DiagReport {
   missingProperties: Record<string, number>;
   missingSyscalls: Record<string, number>;
   missingJni: Record<string, number>;
+  missingHle: Record<string, number>;
+  missingJniFields: Record<string, number>;
+  missingAuxv: Record<string, number>;
 }
 
 interface DiagNamespace {
@@ -363,8 +401,13 @@ interface DexNamespace {
 
 interface EmuHandle {
   load(path: string, opts?: LoadOptions): ModuleHandle;
-  /** 加载单个 .dex 文件到轻量元数据索引并挂载到 VFS */
-  loadDex(path: string): { classes: number; dexCount: number };
+  /** 加载单个 `.dex`、路径数组或包含 `classes*.dex` 的目录到轻量元数据索引并挂载到 VFS */
+  loadDex(pathOrPaths: string | string[]): {
+    classes: number;
+    addedClasses: number;
+    totalClasses: number;
+    dexCount: number;
+  };
   readonly dex: DexNamespace;
   loadApk(path: string): ApkHandle;
   jniOnLoad(mod: ModuleHandle): number | null;

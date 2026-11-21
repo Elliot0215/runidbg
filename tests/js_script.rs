@@ -647,3 +647,97 @@ fn js_static_fields_and_char_array() {
         .expect("static fields and [C char[] test failed");
 }
 
+#[test]
+fn js_v015_feedback_fixes() {
+    let script = r#"
+        const emu = Emu.create({ packageName: "com.test.v015", hleAccel: true });
+        emu.diag.enable();
+
+        // 1. getStaticField / getField 未设置时返回 null（非 undefined）
+        if (emu.jni.getStaticField("com/foo/Bar", "NOPE") !== null) {
+            throw new Error("expected null for unset static field");
+        }
+        const instObj = emu.jni.newObject("com/foo/Bar");
+        if (emu.jni.getField(instObj, "NOPE") !== null) {
+            throw new Error("expected null for unset instance field");
+        }
+
+        // 2. hook.attach 到未映射地址必须抛明确错误，不再静默失效
+        let attachThrew = false;
+        try {
+            emu.hook.attach(0x12340000, { onEnter() {} });
+        } catch (e) {
+            attachThrew = String(e).includes("未映射") || String(e).includes("0x12340000");
+        }
+        if (!attachThrew) {
+            throw new Error("expected hook.attach on unmapped address to throw");
+        }
+
+        // 3. emu.hook.importReplace("lrand48", ...) 按符号名直接替换导入函数
+        let lrandHits = 0;
+        const hImp = emu.hook.importReplace("lrand48", () => {
+            lrandHits++;
+            return 0x1337;
+        });
+        // 通过未实现符号 + getauxval(999) + GetStaticObjectField 触发 EnvDiag 三个新维度
+        const unimplAddr = __native.hookImportResolve(0, "fake_missing_sym");
+        emu.call(unimplAddr);
+        emu.call(unimplAddr); // 二次命中应只打印一次 WARN，但 diag 计数为 2
+        const auxvAddr = __native.hookImportResolve(0, "getauxval");
+        emu.call(auxvAddr, 999);
+        const lrandAddr = __native.hookImportResolve(0, "lrand48");
+        const r = emu.call(lrandAddr);
+        if (r !== 0x1337 || lrandHits !== 1) {
+            throw new Error(`hook.importReplace failed: r=${r}, hits=${lrandHits}`);
+        }
+        hImp.detach();
+
+        // 触发 GetStaticObjectField 返回 NULL -> 记录 missingJniFields
+        const envPtr = emu.jni.envPtr;
+        const vtable = Number(emu.mem.readU64(envPtr));
+        const fnFindClass = Number(emu.mem.readU64(vtable + 6 * 8));
+        const fnGetStaticFieldID = Number(emu.mem.readU64(vtable + 144 * 8));
+        const fnGetStaticObjectField = Number(emu.mem.readU64(vtable + 145 * 8));
+        const fnRegisterNatives = Number(emu.mem.readU64(vtable + 215 * 8));
+        const sBuf = emu.mem.alloc(256);
+        const ws = (off, s) => { emu.mem.writeCString(sBuf + off, s); return sBuf + off; };
+        const cls = emu.call(fnFindClass, envPtr, ws(0, "com/foo/Bar"));
+        const fid = emu.call(fnGetStaticFieldID, envPtr, cls, ws(32, "missingField"), ws(64, "[C"));
+        emu.call(fnGetStaticObjectField, envPtr, cls, fid);
+
+        const rep = emu.diag.report();
+        if (rep.missingHle["fake_missing_sym"] !== 2) {
+            throw new Error("missingHle mismatch: " + JSON.stringify(rep.missingHle));
+        }
+        if (rep.missingAuxv["999"] !== 1) {
+            throw new Error("missingAuxv mismatch: " + JSON.stringify(rep.missingAuxv));
+        }
+        if (!rep.missingJniFields["com/foo/Bar.missingField([C)"]) {
+            throw new Error("missingJniFields mismatch: " + JSON.stringify(rep.missingJniFields));
+        }
+
+        // 4. callNative(..., { this: instObj }) 与 callNativeOn(instObj, ...) 传递真实 this
+        // 在 r-xp cpu_init 页尾部写一个简单 native 函数：mov x0, x1; ret（直接返回收到的 X1/this）
+        const fnEchoThis = 0xdead1200;
+        emu.mem.writeU32(fnEchoThis, 0xAA0103E0); // mov x0, x1
+        emu.mem.writeU32(fnEchoThis + 4, 0xD65F03C0); // ret
+        const regStruct = emu.mem.alloc(24);
+        emu.mem.writeU64(regStruct, BigInt(ws(96, "echoThis")));
+        emu.mem.writeU64(regStruct + 8, BigInt(ws(120, "()J")));
+        emu.mem.writeU64(regStruct + 16, BigInt(fnEchoThis));
+        emu.call(fnRegisterNatives, envPtr, cls, regStruct, 1);
+
+        const got1 = emu.jni.callNative("com/foo/Bar", "echoThis", [], { this: instObj });
+        const got2 = emu.jni.callNativeOn(instObj, "com/foo/Bar", "echoThis", []);
+        const gotStatic = emu.jni.callNative("com/foo/Bar", "echoThis", []);
+        if (got1 !== instObj || got2 !== instObj) {
+            throw new Error(`callNative with this failed: got1=${got1}, got2=${got2}, expected=${instObj}`);
+        }
+        if (gotStatic !== cls) {
+            throw new Error(`callNative static expected cls=${cls}, got=${gotStatic}`);
+        }
+    "#;
+
+    JsRunner::run_source_with_args(script, &[]).expect("v0.1.5 feedback fixes test failed");
+}
+

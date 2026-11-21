@@ -715,6 +715,18 @@ $("btnParseDiag").onclick = () => {
       cards.push(`<span class="pill pill-aes">JNI ${esc(k)} ×${cnt}</span>`);
       lines.push(`// TODO JNI hook: ${k}`);
     }
+    for (const [k, cnt] of Object.entries(d.missingHle || {})) {
+      cards.push(`<span class="pill pill-md5">HLE ${esc(k)} ×${cnt}</span>`);
+      lines.push(`emu.hook.importReplace(${JSON.stringify(k)}, (ctx) => 0);`);
+    }
+    for (const [k, cnt] of Object.entries(d.missingJniFields || {})) {
+      cards.push(`<span class="pill pill-aes">FIELD ${esc(k)} ×${cnt}</span>`);
+      lines.push(`// TODO JNI field: ${k} -> emu.jni.setStaticField / setField`);
+    }
+    for (const [k, cnt] of Object.entries(d.missingAuxv || {})) {
+      cards.push(`<span class="pill pill-sha">AUXV #${esc(k)} ×${cnt}</span>`);
+      lines.push(`// TODO getauxval(${k}) -> emu.hook.import("getauxval", ...)`);
+    }
     $("diagCards").innerHTML = cards.join("") || '<div class="muted">未发现缺失项</div>';
     $("diagPatchOut").textContent = lines.join("\n");
   } catch (e) {

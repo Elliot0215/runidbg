@@ -435,7 +435,7 @@ fn test_mcp_server_protocol_and_tools() {
         .expect("tools/list response");
     let list: Value = serde_json::from_str(&list_raw).unwrap();
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 17);
+    assert_eq!(tools.len(), 21);
     assert!(tools.iter().any(|t| t["name"] == "trace_calltree"));
     assert!(tools.iter().any(|t| t["name"] == "trace_crypto_scan"));
 

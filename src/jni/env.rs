@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM64, UcHookId, Unicorn};
 
+use crate::crash::BreadcrumbRing;
+use crate::diag::EnvDiag;
 use crate::error::EmuResult;
 use crate::jni::handler::{DefaultJniHandler, JniContext, JniHandler};
 use crate::jni::types::{
@@ -66,6 +68,8 @@ pub struct JniVm {
     pub dex_index: DexIndex,
     /// `FindClass` 严格模式：开启且已加载 DEX 时，非系统类不存在返回 `NULL` 并挂 `ClassNotFoundException`
     pub strict_find_class: bool,
+    pub diag: EnvDiag,
+    pub breadcrumbs: BreadcrumbRing,
 
     pending_exception: JObjectRef,
     /// 记录 `GetStringUTFChars` 分配的缓冲区，供 `ReleaseStringUTFChars` 追踪
@@ -99,6 +103,8 @@ impl JniVm {
             static_fields: HashMap::new(),
             dex_index: DexIndex::new(),
             strict_find_class: false,
+            diag: EnvDiag::new(),
+            breadcrumbs: BreadcrumbRing::new(),
             pending_exception: JObjectRef::NULL,
             utf_buffers: HashMap::new(),
             array_buffers: HashMap::new(),
@@ -458,6 +464,8 @@ where
                     .objects
                     .add_string(format!("java.lang.ClassNotFoundException: {name}"));
                 vm.pending_exception = exc;
+                vm.breadcrumbs
+                    .push(format!("[JNI] FindClass({name}) -> NULL (ClassNotFound)"));
                 0
             } else {
                 let mut ctx = JniContext {
@@ -769,14 +777,38 @@ where
         }
 
         // 实例字段读取 (95..=103)
-        95 => dispatch_instance_field(uc, x1, x2, get_state, |h, ctx, o, f| {
-            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(o) {
-                if let Some(JValue::Object(r)) = fields.get(&f.name).copied() {
-                    return r.0;
+        95 => {
+            let (vm, _) = get_state(uc.get_data_mut());
+            if let Some(field) = vm.fields.get(&x2).cloned() {
+                let o = JObjectRef(x1);
+                let out = if let Some(JObject::Custom { fields, .. }) = vm.objects.get(o) {
+                    if let Some(JValue::Object(r)) = fields.get(&field.name).copied() {
+                        r.0
+                    } else {
+                        let mut ctx = JniContext {
+                            objects: &mut vm.objects,
+                            package_name: &vm.package_name,
+                        };
+                        vm.handler.get_object_field(&mut ctx, o, &field).0
+                    }
+                } else {
+                    let mut ctx = JniContext {
+                        objects: &mut vm.objects,
+                        package_name: &vm.package_name,
+                    };
+                    vm.handler.get_object_field(&mut ctx, o, &field).0
+                };
+                if out == 0 {
+                    let key = format!("{}.{}({})", field.class_name, field.name, field.sig);
+                    vm.diag.record_missing_jni_field(&key);
+                    vm.breadcrumbs
+                        .push(format!("[JNI] GetObjectField {key} -> NULL"));
                 }
+                out
+            } else {
+                0
             }
-            h.get_object_field(ctx, o, f).0
-        }),
+        }
         96 => dispatch_instance_field(uc, x1, x2, get_state, |h, ctx, o, f| {
             if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(o) {
                 if let Some(JValue::Boolean(b)) = fields.get(&f.name).copied() {
@@ -947,7 +979,9 @@ where
             let (vm, _) = get_state(uc.get_data_mut());
             let cls = vm.resolve_class_name(JObjectRef(x1));
             if let Some(field) = vm.fields.get(&x2).cloned() {
-                if let Some(JValue::Object(r)) = vm.get_static_field(&cls, &field.name).copied() {
+                let out = if let Some(JValue::Object(r)) =
+                    vm.get_static_field(&cls, &field.name).copied()
+                {
                     r.0
                 } else {
                     let ret = {
@@ -959,7 +993,8 @@ where
                     };
                     if !ret.is_null() {
                         ret.0
-                    } else if let Some(dv) = vm.dex_index.get_static_value(&cls, &field.name).cloned()
+                    } else if let Some(dv) =
+                        vm.dex_index.get_static_value(&cls, &field.name).cloned()
                     {
                         let r = dex_value_to_jobject(&mut vm.objects, &dv, &field.sig);
                         if !r.is_null() {
@@ -982,7 +1017,14 @@ where
                         )
                         .0
                     }
+                };
+                if out == 0 {
+                    let key = format!("{cls}.{}({})", field.name, field.sig);
+                    vm.diag.record_missing_jni_field(&key);
+                    vm.breadcrumbs
+                        .push(format!("[JNI] GetStaticObjectField {key} -> NULL"));
                 }
+                out
             } else {
                 0
             }

@@ -45,7 +45,7 @@
 - **⚡ 零拷贝二进制 Tracer 与离线分析**：支持 `fast` / `reg_delta` / `full` 三级分层追踪、`mmap` 双流落盘（`.idx` + `.ext`，结束时精确截断）、执行后寄存器精确归属 + ASCII 旁注、毫秒级离线检索（`dump` / `search --val --ascii --bytes` / `stats` / `calltree` / `crypto-scan`）以及 IDA Pro / Binary Ninja 覆盖率脚本一键导出。
 - **📜 QuickJS 零配置脚本引擎 + TypeScript 智能提示**：写 JS 即可完成逆向分析，内置 `Emu` / `Module` / `jni` / `mem` / `regs` / `hook`（Frida 风格 `attach`、`replace`、`code`、`mem`、`syscall`）/ `vfs` / `net` / `trace` / `fs` / `require()`，并通过 `runidbg-cli init-types` 导出完整 `runidbg.d.ts`。
 - **🌐 生产级异步多核 RPC 服务**：基于 `tokio` + `axum` + 无锁 MPMC Worker 池（`--workers auto`），内置 Keep-Alive、队列背压 `503`、Unicorn 硬超时与指令预算 `504`、JSON-RPC 2.0 Batch、Prometheus `/metrics`、滚动热重载及 `async` 导出。
-- **🤖 MCP AI 逆向闭环 & 调试工具链**：原生支持 stdio 与 Streamable HTTP 双模式 MCP（**17 个逆向工具**，含 `bad64` 反汇编、`trace_calltree`、`trace_crypto_scan`、`trace_inspect` 字节流搜索、一次性 Hook 抓取与崩溃现场诊断）、`EnvDiag` 缺环境自动诊断器、APK 一键内存加载与 ARM64 GDB RSP 远程调试服务端。
+- **🤖 MCP AI 逆向闭环 & 调试工具链**：原生支持 stdio 与 Streamable HTTP 双模式 MCP（**21 个逆向工具**，含 `bad64` 反汇编、`trace_calltree`、`trace_crypto_scan`、`trace_inspect` 字节流搜索、`emu_load_dex` / `emu_dex_class_info`、`emu_jni_set_field`、`emu_jni_call_native`、一次性 Hook 抓取与崩溃现场诊断）、`EnvDiag` 缺环境自动诊断器（覆盖文件/属性/Syscall/JNI/HLE 符号/JNI 字段/auxv）、轻量 DEX 元数据索引、完整 `stdio` HLE、内置暗黑 Web UI、APK 一键内存加载与 ARM64 GDB RSP 远程调试服务端。
 
 ---
 

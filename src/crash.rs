@@ -253,6 +253,14 @@ impl CrashReport {
             "SP / FP  : SP=0x{:016x}  FP=0x{:016x}  NZCV=0x{:08x}\n",
             self.sp, self.fp, self.nzcv
         ));
+        if let Some(null_jni) = self
+            .breadcrumbs
+            .iter()
+            .rev()
+            .find(|b| b.contains("-> NULL"))
+        {
+            out.push_str(&format!("Suspected: 疑似根因 -> {null_jni}\n"));
+        }
 
         if !self.disasm.is_empty() {
             out.push_str("\n--- Disassembly (ARM64) ---\n");

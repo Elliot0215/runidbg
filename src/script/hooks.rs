@@ -469,6 +469,12 @@ impl JsNativeHookTable {
         on_enter: Option<Persistent<Function<'static>>>,
         on_leave: Option<Persistent<Function<'static>>>,
     ) -> Result<usize> {
+        let mut probe = [0u8; 4];
+        uc.mem_read(addr, &mut probe).map_err(|e| {
+            anyhow::anyhow!(
+                "hook.attach 目标地址未映射或不可读 @0x{addr:x} ({e:?})，请确认模块基址或先 load"
+            )
+        })?;
         let state = Rc::new(RefCell::new(AttachState {
             on_enter,
             on_leave,

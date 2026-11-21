@@ -314,8 +314,11 @@
           const info = __native.emuLoad(emuId, String(path), runInit);
           return makeModule(emuId, info);
         },
-        loadDex(path) {
-          return __native.emuLoadDex(emuId, String(path));
+        loadDex(pathOrPaths) {
+          const list = Array.isArray(pathOrPaths)
+            ? pathOrPaths.map(String)
+            : [String(pathOrPaths)];
+          return __native.emuLoadDex(emuId, list);
         },
         dex: {
           classes(prefix) {
@@ -413,6 +416,31 @@
             const id = __native.hookReplace(emuId, toAddr(addr), fn);
             return makeHookHandle(emuId, id);
           },
+          import(symName, callbacks) {
+            const addr = __native.hookImportResolve(emuId, String(symName));
+            if (typeof callbacks === "function") {
+              const id = __native.hookReplace(emuId, addr, callbacks);
+              return makeHookHandle(emuId, id);
+            }
+            if (!callbacks || typeof callbacks !== "object") {
+              throw new TypeError("hook.import(symName, { onEnter?, onLeave? } | fn) expects callbacks or a replace function");
+            }
+            const onEnter = typeof callbacks.onEnter === "function" ? callbacks.onEnter : null;
+            const onLeave = typeof callbacks.onLeave === "function" ? callbacks.onLeave : null;
+            if (!onEnter && !onLeave) {
+              throw new TypeError("hook.import requires at least onEnter or onLeave");
+            }
+            const id = __native.hookAttach(emuId, addr, onEnter, onLeave);
+            return makeHookHandle(emuId, id);
+          },
+          importReplace(symName, fn) {
+            if (typeof fn !== "function") {
+              throw new TypeError("hook.importReplace(symName, fn) expects a function");
+            }
+            const addr = __native.hookImportResolve(emuId, String(symName));
+            const id = __native.hookReplace(emuId, addr, fn);
+            return makeHookHandle(emuId, id);
+          },
           code(addrOrRange, fn, opts = {}) {
             if (typeof fn !== "function") {
               throw new TypeError("hook.code(addrOrRange, fn, opts?) expects a function");
@@ -487,12 +515,26 @@
           registeredNatives() {
             return __native.jniRegisteredNatives(emuId);
           },
-          callNative(className, methodName, callArgs = []) {
+          callNative(className, methodName, callArgs = [], opts = {}) {
+            const thisRef =
+              opts && opts.this !== undefined && opts.this !== null
+                ? toAddr(opts.this)
+                : 0;
             return __native.jniCallNative(
               emuId,
               String(className),
               String(methodName),
-              callArgs.map(toAddr)
+              callArgs.map(toAddr),
+              thisRef
+            );
+          },
+          callNativeOn(objRef, className, methodName, callArgs = []) {
+            return __native.jniCallNative(
+              emuId,
+              String(className),
+              String(methodName),
+              callArgs.map(toAddr),
+              toAddr(objRef)
             );
           },
           newString(s) {

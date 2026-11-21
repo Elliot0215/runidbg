@@ -664,6 +664,81 @@ impl McpServer {
                 );
                 self.eval_js_value(&code)
             }
+            "emu_load_dex" => {
+                let emu_id = req_u64(args, "emuId")?;
+                let path_json = if let Some(arr) = args.get("paths").and_then(Value::as_array) {
+                    serde_json::to_string(arr)?
+                } else {
+                    serde_json::to_string(req_str(args, "path")?)?
+                };
+                let code = format!(
+                    "(() => {{ const e = __mcp.emus[{emu_id}]; if (!e) throw new Error('unknown emuId'); return e.loadDex({path_json}); }})()"
+                );
+                self.eval_js_value(&code)
+            }
+            "emu_dex_class_info" => {
+                let emu_id = req_u64(args, "emuId")?;
+                if let Some(cls) = args.get("className").and_then(Value::as_str) {
+                    let cls_json = serde_json::to_string(cls)?;
+                    let code = format!(
+                        "(() => {{ const e = __mcp.emus[{emu_id}]; if (!e) throw new Error('unknown emuId'); return e.dex.classInfo({cls_json}); }})()"
+                    );
+                    self.eval_js_value(&code)
+                } else {
+                    let prefix_json = args
+                        .get("prefix")
+                        .and_then(Value::as_str)
+                        .map(serde_json::to_string)
+                        .transpose()?
+                        .unwrap_or_else(|| "undefined".to_string());
+                    let code = format!(
+                        "(() => {{ const e = __mcp.emus[{emu_id}]; if (!e) throw new Error('unknown emuId'); return e.dex.classes({prefix_json}); }})()"
+                    );
+                    self.eval_js_value(&code)
+                }
+            }
+            "emu_jni_set_field" => {
+                let emu_id = req_u64(args, "emuId")?;
+                let field_name = serde_json::to_string(req_str(args, "fieldName")?)?;
+                let val_json = serde_json::to_string(args.get("value").unwrap_or(&Value::Null))?;
+                let sig_json = args
+                    .get("sig")
+                    .and_then(Value::as_str)
+                    .map(serde_json::to_string)
+                    .transpose()?
+                    .unwrap_or_else(|| "undefined".to_string());
+                if let Some(obj_ref) = args.get("objRef").and_then(Value::as_u64) {
+                    let code = format!(
+                        "(() => {{ const e = __mcp.emus[{emu_id}]; if (!e) throw new Error('unknown emuId'); e.jni.setField({obj_ref}, {field_name}, {val_json}, {sig_json}); return {{ ok: true, value: e.jni.getField({obj_ref}, {field_name}) }}; }})()"
+                    );
+                    self.eval_js_value(&code)
+                } else {
+                    let cls_json = serde_json::to_string(req_str(args, "className")?)?;
+                    let code = format!(
+                        "(() => {{ const e = __mcp.emus[{emu_id}]; if (!e) throw new Error('unknown emuId'); e.jni.setStaticField({cls_json}, {field_name}, {val_json}, {sig_json}); return {{ ok: true, value: e.jni.getStaticField({cls_json}, {field_name}) }}; }})()"
+                    );
+                    self.eval_js_value(&code)
+                }
+            }
+            "emu_jni_call_native" => {
+                let emu_id = req_u64(args, "emuId")?;
+                let cls_json = serde_json::to_string(req_str(args, "className")?)?;
+                let method_json = serde_json::to_string(req_str(args, "methodName")?)?;
+                let call_args_json = args
+                    .get("args")
+                    .map(serde_json::to_string)
+                    .transpose()?
+                    .unwrap_or_else(|| "[]".to_string());
+                let this_opt = args
+                    .get("thisObj")
+                    .and_then(Value::as_u64)
+                    .map(|r| format!("{{ this: {r} }}"))
+                    .unwrap_or_else(|| "{}".to_string());
+                let code = format!(
+                    "(() => {{ const e = __mcp.emus[{emu_id}]; if (!e) throw new Error('unknown emuId'); const ret = e.jni.callNative({cls_json}, {method_json}, {call_args_json}, {this_opt}); return {{ ret }}; }})()"
+                );
+                self.eval_js_value(&code)
+            }
             _ => Err(anyhow!("未知的 MCP 工具: {name}")),
         }
     }
@@ -951,6 +1026,63 @@ fn tool_definitions() -> Value {
                 "required": ["emuId"],
                 "properties": {
                     "emuId": { "type": "integer" }
+                }
+            }
+        },
+        {
+            "name": "emu_load_dex",
+            "description": "Load a single .dex file, a directory of classes*.dex files, or an array of .dex paths into the lightweight DEX metadata index.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["emuId"],
+                "properties": {
+                    "emuId": { "type": "integer" },
+                    "path": { "type": "string", "description": "Path to a .dex file or directory containing *.dex" },
+                    "paths": { "type": "array", "items": { "type": "string" } }
+                }
+            }
+        },
+        {
+            "name": "emu_dex_class_info",
+            "description": "Query DEX class metadata (superClass, interfaces, fields, methods, staticValues) by className, or list indexed classes by prefix.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["emuId"],
+                "properties": {
+                    "emuId": { "type": "integer" },
+                    "className": { "type": "string" },
+                    "prefix": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "emu_jni_set_field",
+            "description": "Set a JNI static field (className + fieldName) or instance field (objRef + fieldName), supporting primitives, strings, [C/[B/[I/[J arrays via sig, or jobject handles.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["emuId", "fieldName", "value"],
+                "properties": {
+                    "emuId": { "type": "integer" },
+                    "className": { "type": "string" },
+                    "objRef": { "type": "integer" },
+                    "fieldName": { "type": "string" },
+                    "value": {},
+                    "sig": { "type": "string", "description": "Optional JNI signature e.g. [C, I, J, Ljava/lang/String;" }
+                }
+            }
+        },
+        {
+            "name": "emu_jni_call_native",
+            "description": "Call a RegisterNatives JNI method with optional instance `thisObj` (jobject handle) for instance methods.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["emuId", "className", "methodName"],
+                "properties": {
+                    "emuId": { "type": "integer" },
+                    "className": { "type": "string" },
+                    "methodName": { "type": "string" },
+                    "args": { "type": "array", "items": { "type": "integer" } },
+                    "thisObj": { "type": "integer", "description": "Optional jobject handle passed as X1 (this) for instance methods" }
                 }
             }
         }

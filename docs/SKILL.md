@@ -1,6 +1,6 @@
 ---
 name: runidbg
-description: Use runidbg (runidbg-cli) to emulate Android ARM64 .so libraries, write QuickJS JNI/Hook scripts, diagnose missing Android environments with EnvDiag, capture high-speed binary instruction traces (dump/search/stats/calltree/crypto-scan/IDA/BN), launch multi-core HTTP/JSON-RPC signing services, connect via MCP (17 tools), or debug with GDB RSP.
+description: Use runidbg (runidbg-cli) to emulate Android ARM64 .so libraries, write QuickJS JNI/Hook/DEX scripts, diagnose missing Android environments with EnvDiag, capture high-speed binary instruction traces (dump/search/stats/calltree/crypto-scan/IDA/BN), launch multi-core HTTP/JSON-RPC signing services & embedded Web UI, connect via MCP (21 tools), or debug with GDB RSP.
 ---
 
 # runidbg Agent Skill
@@ -127,7 +127,7 @@ runidbg-cli serve script.js --listen 127.0.0.1:8080 --workers auto --timeout-ms 
 ```
 
 ### Using MCP Tools (AI Agent Direct Control)
-Start MCP server via stdio (`runidbg-cli mcp --cwd .`) or Streamable HTTP (`runidbg-cli mcp --http 127.0.0.1:8090 --cwd .`). Available 17 tools:
+Start MCP server via stdio (`runidbg-cli mcp --cwd .`) or Streamable HTTP (`runidbg-cli mcp --http 127.0.0.1:8090 --cwd .`). Available 21 tools (including `emu_load_dex`, `emu_dex_class_info`, `emu_jni_set_field`, `emu_jni_call_native`):
 - Lifecycle & Execution: `emu_create`, `emu_load`, `emu_jni_onload`, `emu_exports`, `emu_call`, `emu_eval_js`
 - Inspection & Memory: `emu_regs`, `emu_mem_read`, `emu_mem_scan`, `emu_disasm`
 - Tracing & Hooks: `emu_trace_call`, `trace_inspect` (`dump`/`search_val`/`search_addr`/`search_ascii`/`search_bytes`), `trace_calltree`, `trace_crypto_scan`, `emu_hook_capture`

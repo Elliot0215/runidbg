@@ -180,6 +180,10 @@ pub enum HleBuiltin {
     Fscanf,
     Getline,
     Getdelim,
+    Lrand48,
+    Mrand48,
+    Srand48,
+    Drand48,
     // 未实现的外部符号占位桩（触发时打印告警并返回 0，避免直接跳空指针崩溃）
     UnimplementedStub(String),
 }
@@ -360,6 +364,10 @@ impl HleBuiltin {
             "fscanf" | "__isoc99_fscanf" => Some(Self::Fscanf),
             "getline" => Some(Self::Getline),
             "getdelim" => Some(Self::Getdelim),
+            "lrand48" => Some(Self::Lrand48),
+            "mrand48" => Some(Self::Mrand48),
+            "srand48" => Some(Self::Srand48),
+            "drand48" => Some(Self::Drand48),
             "flock"
             | "fcntl"
             | "ioctl"
@@ -445,6 +453,8 @@ pub struct TrampolineTable {
     next_pthread_key: u32,
     mmap_backings: HashMap<u64, MmapFileBacking>,
     stdio_streams: HashMap<u64, StdioStream>,
+    lcg48_state: u64,
+    unimplemented_hits: HashMap<String, u64>,
     pub errno_addr: u64,
     initialized: bool,
 }
@@ -475,9 +485,36 @@ impl TrampolineTable {
             next_pthread_key: 1,
             mmap_backings: HashMap::new(),
             stdio_streams: HashMap::new(),
+            lcg48_state: 0x0000_1234_ABCD_330E,
+            unimplemented_hits: HashMap::new(),
             errno_addr: crate::cpu::TLS_BASE + 0x100,
             initialized: false,
         }
+    }
+
+    /// 推进标准 POSIX 48-bit LCG (`X_{n+1} = (0x5DEECE66D * X_n + 0xB) mod 2^48`)
+    fn next_lcg48(&mut self) -> u64 {
+        self.lcg48_state = self
+            .lcg48_state
+            .wrapping_mul(0x5DEE_CE66D)
+            .wrapping_add(0xB)
+            & 0xFFFF_FFFF_FFFF;
+        self.lcg48_state
+    }
+
+    /// 按符号名获取或预注册导入跳板地址（支持在 `emu.load` 之前或之后挂符号级 Hook）
+    pub fn resolve_or_register_import<D>(
+        &mut self,
+        uc: &mut Unicorn<'_, D>,
+        mem: &mut MemoryManager,
+        name: &str,
+    ) -> EmuResult<u64> {
+        if let Some(&addr) = self.name_to_addr.get(name) {
+            return Ok(addr);
+        }
+        let action = HleBuiltin::from_symbol(name)
+            .unwrap_or_else(|| HleBuiltin::UnimplementedStub(name.to_string()));
+        self.register(uc, mem, name, action)
     }
 
     /// 映射跳板区内存（初始映射 64KB，按需使用）
@@ -1877,7 +1914,11 @@ where
         HleBuiltin::Getauxval => match x0 {
             6 => PAGE_SIZE, // AT_PAGESZ
             16 | 26 => 0,   // AT_HWCAP / AT_HWCAP2（关闭可选硬件扩展以走纯兼容路径）
-            _ => 0,
+            other => {
+                let (_, _, vfs) = get_state(uc.get_data_mut());
+                vfs.diag().record_missing_auxv(other);
+                0
+            }
         },
         HleBuiltin::Getpagesize => PAGE_SIZE,
         HleBuiltin::Sysconf => match x0 as i32 {
@@ -2986,17 +3027,45 @@ where
                 _ => (-1i64) as u64, // EOF
             }
         }
+        HleBuiltin::Lrand48 => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            (table.next_lcg48() >> 17) & 0x7FFF_FFFF
+        }
+        HleBuiltin::Mrand48 => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            ((table.next_lcg48() >> 16) as u32 as i32) as i64 as u64
+        }
+        HleBuiltin::Srand48 => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            table.lcg48_state = ((x0 & 0xFFFF_FFFF) << 16) | 0x330E;
+            0
+        }
+        HleBuiltin::Drand48 => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            let val = (table.next_lcg48() as f64) / ((1u64 << 48) as f64);
+            let bits = val.to_bits();
+            let _ = uc.reg_write(RegisterARM64::D0, bits);
+            bits
+        }
         HleBuiltin::UnimplementedStub(sym) => {
-            let (_, _, vfs) = get_state(uc.get_data_mut());
-            vfs.breadcrumbs()
-                .push(format!("[HLE UNIMPL] {sym}(x0=0x{x0:x}, x1=0x{x1:x}) -> 0"));
-            tracing::warn!(
-                target: "runidbg::hle",
-                symbol = %sym,
-                x0 = format_args!("0x{x0:x}"),
-                x1 = format_args!("0x{x1:x}"),
-                "调用未实现的外部符号"
-            );
+            let (table, _, vfs) = get_state(uc.get_data_mut());
+            vfs.diag().record_missing_hle(&sym);
+            let count = {
+                let entry = table.unimplemented_hits.entry(sym.clone()).or_insert(0);
+                *entry += 1;
+                *entry
+            };
+            if count == 1 {
+                vfs.breadcrumbs()
+                    .push(format!("[HLE UNIMPL] {sym}(x0=0x{x0:x}, x1=0x{x1:x}) -> 0"));
+                tracing::warn!(
+                    target: "runidbg::hle",
+                    symbol = %sym,
+                    x0 = format_args!("0x{x0:x}"),
+                    x1 = format_args!("0x{x1:x}"),
+                    "调用未实现的外部符号（同符号后续命中自动聚合计数，可在 EnvDiag.missingHle 查看）"
+                );
+            }
             0
         }
     };

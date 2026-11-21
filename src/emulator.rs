@@ -122,6 +122,8 @@ impl AndroidEmulatorBuilder {
         let mut vfs = VirtualFs::new(&self.package_name);
         let mut trampolines = TrampolineTable::new();
         let mut jni = JniVm::new(self.jni_handler).with_package_name(&self.package_name);
+        jni.diag = vfs.diag().clone();
+        jni.breadcrumbs = vfs.breadcrumbs().clone();
         if let Some(profile) = self.device_profile {
             vfs.apply_device_profile(profile.clone());
             jni.set_device_profile(profile);
@@ -329,6 +331,20 @@ impl AndroidEmulator {
         method_name: &str,
         extra_args: &[u64],
     ) -> EmuResult<u64> {
+        self.call_registered_native_with_this(class_name, method_name, None, extra_args)
+    }
+
+    /// 调用通过 `RegisterNatives` 动态注册的 JNI 本地方法，支持显式传入实例 `this`（`jobject`）
+    ///
+    /// - `this_obj = Some(obj)` 时，`X1` 传入 `obj`（用于实例方法 `GetObjectField(this, ...)`）；
+    /// - `this_obj = None` 时，`X1` 传入 `FindClass(class_name)`（用于静态方法）。
+    pub fn call_registered_native_with_this(
+        &mut self,
+        class_name: &str,
+        method_name: &str,
+        this_obj: Option<JObjectRef>,
+        extra_args: &[u64],
+    ) -> EmuResult<u64> {
         let fn_ptr = self
             .uc
             .get_data()
@@ -340,16 +356,20 @@ impl AndroidEmulator {
             })?;
 
         let env_ptr = self.uc.get_data().jni.jni_env_ptr();
-        let cls_ref = self
-            .uc
-            .get_data_mut()
-            .jni
-            .objects
-            .find_or_create_class(class_name);
+        let second_arg = match this_obj {
+            Some(obj) if !obj.is_null() => obj.0,
+            _ => self
+                .uc
+                .get_data_mut()
+                .jni
+                .objects
+                .find_or_create_class(class_name)
+                .0,
+        };
 
         let mut all_args = Vec::with_capacity(2 + extra_args.len());
         all_args.push(env_ptr);
-        all_args.push(cls_ref.0);
+        all_args.push(second_arg);
         all_args.extend_from_slice(extra_args);
 
         self.call_address(fn_ptr, &all_args)

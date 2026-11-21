@@ -9,6 +9,9 @@ pub struct EnvDiagSnapshot {
     pub missing_properties: BTreeMap<String, u64>,
     pub missing_syscalls: BTreeMap<u64, u64>,
     pub missing_jni: BTreeMap<String, u64>,
+    pub missing_hle: BTreeMap<String, u64>,
+    pub missing_jni_fields: BTreeMap<String, u64>,
+    pub missing_auxv: BTreeMap<u64, u64>,
 }
 
 impl EnvDiagSnapshot {
@@ -17,6 +20,9 @@ impl EnvDiagSnapshot {
             && self.missing_properties.is_empty()
             && self.missing_syscalls.is_empty()
             && self.missing_jni.is_empty()
+            && self.missing_hle.is_empty()
+            && self.missing_jni_fields.is_empty()
+            && self.missing_auxv.is_empty()
     }
 
     /// 自动生成可直接粘贴运行的 QuickJS 补环境骨架代码
@@ -60,6 +66,36 @@ impl EnvDiagSnapshot {
             for (nr, count) in &self.missing_syscalls {
                 out.push_str(&format!(
                     "emu.hook.syscall({nr}, (ctx) => {{ /* TODO: syscall #{nr} 命中 {count} 次 */ return 0; }});\n"
+                ));
+            }
+            out.push('\n');
+        }
+
+        if !self.missing_hle.is_empty() {
+            out.push_str("// 5. 未实现的外部 HLE 导入符号（返回 0）\n");
+            for (sym, count) in &self.missing_hle {
+                out.push_str(&format!(
+                    "emu.hook.importReplace({sym:?}, (ctx) => {{ /* TODO: 命中 {count} 次 */ return 0; }});\n"
+                ));
+            }
+            out.push('\n');
+        }
+
+        if !self.missing_jni_fields.is_empty() {
+            out.push_str("// 6. 缺失的 JNI 静态/实例字段（返回 NULL/0）\n");
+            for (field_key, count) in &self.missing_jni_fields {
+                out.push_str(&format!(
+                    "// {field_key} (命中 {count} 次) -> 可用 emu.jni.setStaticField / emu.jni.setField 注入\n"
+                ));
+            }
+            out.push('\n');
+        }
+
+        if !self.missing_auxv.is_empty() {
+            out.push_str("// 7. 未覆盖的 getauxval(type) 类型\n");
+            for (at_type, count) in &self.missing_auxv {
+                out.push_str(&format!(
+                    "// getauxval({at_type}) 命中 {count} 次 -> 可用 emu.hook.import(\"getauxval\", ...) 注入\n"
                 ));
             }
             out.push('\n');
@@ -135,6 +171,35 @@ impl EnvDiag {
         }
         if let Ok(mut g) = self.data.lock() {
             *g.missing_jni.entry(desc.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    pub fn record_missing_hle(&self, sym: &str) {
+        if !self.is_enabled() {
+            return;
+        }
+        if let Ok(mut g) = self.data.lock() {
+            *g.missing_hle.entry(sym.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    pub fn record_missing_jni_field(&self, field_key: &str) {
+        if !self.is_enabled() {
+            return;
+        }
+        if let Ok(mut g) = self.data.lock() {
+            *g.missing_jni_fields
+                .entry(field_key.to_string())
+                .or_insert(0) += 1;
+        }
+    }
+
+    pub fn record_missing_auxv(&self, at_type: u64) {
+        if !self.is_enabled() {
+            return;
+        }
+        if let Ok(mut g) = self.data.lock() {
+            *g.missing_auxv.entry(at_type).or_insert(0) += 1;
         }
     }
 
