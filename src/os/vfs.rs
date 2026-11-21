@@ -6,6 +6,7 @@ use crate::crash::BreadcrumbRing;
 use crate::diag::EnvDiag;
 use crate::memory::MemoryManager;
 use crate::os::device::DeviceProfile;
+use crate::os::net::NetManager;
 
 /// 标准 Linux 负错误码
 pub const ENOENT: i64 = -2;
@@ -73,6 +74,8 @@ pub struct VirtualFs {
     diag: EnvDiag,
     /// 最近外部事件环形缓冲（供崩溃现场报告使用）
     breadcrumbs: BreadcrumbRing,
+    /// 宿主机 Socket 透传 + Epoll/EventFD/Pipe + 虚拟网卡子系统
+    pub net: NetManager,
 }
 
 impl Default for VirtualFs {
@@ -152,7 +155,15 @@ impl VirtualFs {
             use_real_clock: false,
             diag: EnvDiag::new(),
             breadcrumbs: BreadcrumbRing::new(),
+            net: NetManager::new(),
         }
+    }
+
+    /// 分配一个未占用的 Guest FD 号（供 Socket / Epoll / EventFD / Pipe 与文件共享 FD 空间）
+    pub fn alloc_raw_fd(&mut self) -> i32 {
+        let fd = self.next_fd;
+        self.next_fd += 1;
+        fd
     }
 
     pub fn set_diag(&mut self, diag: EnvDiag) {
@@ -374,6 +385,45 @@ impl VirtualFs {
             let data = self.device.render_cpu_online().into_bytes();
             return self.alloc_fd(path, OpenFileKind::Buffer { data, cursor: 0 });
         }
+        // 2b. 虚拟网卡与 `/proc/net/*`、`/sys/class/net/*` 合成文件
+        if path == "/proc/net/route" {
+            let data = self.net.config.nic.to_proc_net_route().into_bytes();
+            return self.alloc_fd(path, OpenFileKind::Buffer { data, cursor: 0 });
+        }
+        if path == "/proc/net/if_inet6" {
+            let data = self.net.config.nic.to_proc_net_if_inet6().into_bytes();
+            return self.alloc_fd(path, OpenFileKind::Buffer { data, cursor: 0 });
+        }
+        if path == "/proc/net/arp" {
+            let data = self.net.config.nic.to_proc_net_arp().into_bytes();
+            return self.alloc_fd(path, OpenFileKind::Buffer { data, cursor: 0 });
+        }
+        if path == "/sys/class/net/lo/address" {
+            return self.alloc_fd(
+                path,
+                OpenFileKind::Buffer {
+                    data: b"00:00:00:00:00:00\n".to_vec(),
+                    cursor: 0,
+                },
+            );
+        }
+        if path == format!("/sys/class/net/{}/address", self.net.config.nic.name)
+            || path == "/sys/class/net/wlan0/address"
+        {
+            let data = format!("{}\n", self.net.config.nic.mac_string()).into_bytes();
+            return self.alloc_fd(path, OpenFileKind::Buffer { data, cursor: 0 });
+        }
+        if path == format!("/sys/class/net/{}/operstate", self.net.config.nic.name)
+            || path == "/sys/class/net/wlan0/operstate"
+        {
+            return self.alloc_fd(
+                path,
+                OpenFileKind::Buffer {
+                    data: b"up\n".to_vec(),
+                    cursor: 0,
+                },
+            );
+        }
 
         // 3. 内存 Overlay 文件（支持 O_TRUNC 与直接读写共享）
         if let Some(buf) = self.overlay_files.get_mut(&path) {
@@ -414,8 +464,11 @@ impl VirtualFs {
         fd as i64
     }
 
-    /// 从 FD 读取最多 `count` 字节
+    /// 从 FD 读取最多 `count` 字节（支持普通文件、Socket、Pipe、EventFD）
     pub fn read(&mut self, fd: i32, count: usize) -> Result<Vec<u8>, i64> {
+        if self.net.contains_fd(fd) {
+            return self.net.recv(fd, count).map(|(data, _)| data);
+        }
         let is_urandom = matches!(
             self.fds.get(&fd).map(|f| &f.kind),
             Some(OpenFileKind::Urandom)
@@ -466,8 +519,11 @@ impl VirtualFs {
         }
     }
 
-    /// 向 FD 写入字节（标准输出直接打印，Overlay 文件持久化到 `overlay_files`）
+    /// 向 FD 写入字节（支持标准输出、Overlay 文件、Socket、Pipe、EventFD）
     pub fn write(&mut self, fd: i32, bytes: &[u8]) -> i64 {
+        if self.net.contains_fd(fd) {
+            return self.net.send(fd, bytes, None);
+        }
         let overlay_info = match self.fds.get(&fd) {
             Some(OpenFile {
                 path,
@@ -766,7 +822,7 @@ impl VirtualFs {
         if fd <= 2 {
             return 0;
         }
-        if self.fds.remove(&fd).is_some() {
+        if self.net.close_fd(fd) || self.fds.remove(&fd).is_some() {
             0
         } else {
             EBADF

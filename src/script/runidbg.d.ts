@@ -67,6 +67,7 @@ interface EmuOptions {
   heapSize?: number;
   device?: DevicePresetName | DeviceProfileConfig;
   realClock?: boolean;
+  net?: boolean | NetOptions;
 }
 
 interface TraceOptions {
@@ -219,6 +220,49 @@ interface MemNamespace {
   ret(addr: number | bigint, retval?: number | bigint): number;
 }
 
+interface VirtualNicConfig {
+  name?: string;
+  ipv4?: string;
+  netmask?: string;
+  gateway?: string;
+  mac?: string;
+  ipv6?: string;
+}
+
+interface NetOptions {
+  enabled?: boolean;
+  capture?: boolean;
+  allowHosts?: string[];
+  nic?: VirtualNicConfig;
+}
+
+interface CapturedPacket {
+  fd: number;
+  dir: "send" | "recv";
+  peer: string;
+  len: number;
+  hex: string;
+  text: string;
+}
+
+interface PacketHookEvent {
+  fd: number;
+  peer: string;
+  data: Uint8Array;
+  text: string;
+}
+
+interface NetNamespace {
+  enable(options?: boolean | NetOptions): void;
+  disable(): void;
+  setNic(nic: VirtualNicConfig): void;
+  nic(): Required<Omit<VirtualNicConfig, "netmask">>;
+  packets(): CapturedPacket[];
+  clearPackets(): void;
+  onSend(callback: ((pkt: PacketHookEvent) => Uint8Array | string | void) | null): void;
+  onRecv(callback: ((pkt: PacketHookEvent) => Uint8Array | string | void) | null): void;
+}
+
 interface VfsNamespace {
   setProperty(key: string, value: string): void;
   writeFile(guestPath: string, data: string | Uint8Array): void;
@@ -288,6 +332,7 @@ interface EmuHandle {
   readonly jni: JniNamespace;
   readonly mem: MemNamespace;
   readonly vfs: VfsNamespace;
+  readonly net: NetNamespace;
   readonly trace: TraceNamespace;
   snapshot(): number;
   restore(snapshotId: number): void;

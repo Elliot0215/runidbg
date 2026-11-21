@@ -15,7 +15,7 @@ Built-in Async Multi-Core RPC Server · MCP AI Reverse-Engineering Loop · GDB R
 ![Engine](https://img.shields.io/badge/Unicorn-2.1-blueviolet)
 ![Script](https://img.shields.io/badge/QuickJS-TypeScript%20d.ts-F7DF1E?logo=javascript&logoColor=black)
 ![Protocol](https://img.shields.io/badge/RPC%20%7C%20MCP%20%7C%20GDB%20RSP-ready-0A66C2)
-![Tests](https://img.shields.io/badge/Tests-40%2F40%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-45%2F45%20passing-brightgreen)
 
 | 🚀 Cold Start | 🔥 Full-Module Trace | 💾 Single-Worker RPC RAM | ⚙️ Multi-Core RPC | 📦 Trace Footprint |
 | :---: | :---: | :---: | :---: | :---: |
@@ -38,13 +38,14 @@ When opening an Issue or PR, please redact any private credentials (cookies/toke
 
 ## ✨ Key Features
 
-- **🦀 Pure-Rust Android ARM64 Runtime**: Built on Unicorn 2.1 + `goblin` with full ELF dynamic linking (`.init_array`, `IRELATIVE`, symbol relocations, recursive `DT_NEEDED`, TLS `TPIDR_EL0`), high-level libc/libm HLE acceleration (including real AAPCS64 `vsnprintf`/`__snprintf_chk`/`sscanf`/`asprintf`/`atoll`), VMA/MMU memory management, and anti-debugging evasion.
+- **🦀 Pure-Rust Android ARM64 Runtime**: Built on Unicorn 2.1 + `goblin` with full ELF dynamic linking (`.init_array`, `IRELATIVE`, symbol relocations, recursive `DT_NEEDED`, TLS `TPIDR_EL0`), high-level libc/libm HLE acceleration (including real AAPCS64 `vsnprintf`/`__snprintf_chk`/`sscanf`/`asprintf`/`atoll`), a coalescing Free-List guest heap allocator, full snapshot/restore (CPU + writable RAM + heap metadata + JNI tables), and anti-debugging evasion.
 - **📱 Unified `DeviceProfile` & Dual-Mode Clock**: Ships with realistic Android presets (`pixel5` / `pixel8pro` / `s24ultra` / `xiaomi14`) plus per-field overrides that automatically synchronize **30+ Android system properties**, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/version`, `/sys/devices/system/cpu/online`, and `uname`. Switch between deterministic virtual time and live host time (`realClock`) in one line.
-- **🧬 Complete JNI 1.6 Environment**: Supports `JNI_OnLoad`, `RegisterNatives`, container-safe local/global reference lifecycles, built-in Java models (`String` constructors & methods, `Thread.currentThread()`, primitive boxing `valueOf`), and pluggable Rust/JS JNI hooks.
-- **⚡ Zero-Copy Binary Tracer**: Three granularity levels (`fast` / `reg_delta` / `full`), dual-stream `mmap` persistence (`.idx` + `.ext`, truncated to exact written size on finalize), millisecond offline `dump` / `search`, and one-command IDA Pro / Binary Ninja coverage script export.
-- **📜 Zero-Config QuickJS Engine + TypeScript IntelliSense**: Write reverse-engineering scripts in JS with `Emu` / `Module` / `jni` / `mem` / `regs` / Frida-style `hook` (`attach`, `replace`, `code`, `mem`, `syscall`) / `vfs` / `trace` / `fs` / CommonJS `require()`, and export full `runidbg.d.ts` definitions via `runidbg-cli init-types`.
+- **🧬 Complete JNI 1.6 Environment**: Supports `JNI_OnLoad`, `RegisterNatives`, container-safe local/global reference lifecycles with `PushLocalFrame`/`PopLocalFrame` (plus `emu.jni.withLocalFrame` in JS for leak-free long-lived RPC workers), built-in Java models (`String` constructors & methods, `Thread.currentThread()`, primitive boxing `valueOf`), and pluggable Rust/JS JNI hooks.
+- **🌍 Host Socket Passthrough, Event Loop & Virtual NIC (`emu.net`)**: Zero-dependency real TCP/UDP passthrough, `epoll`/`ppoll`/`eventfd2`/`pipe2` async multiplexing primitives, `getaddrinfo`/`getifaddrs`/`ioctl(SIOCGIF*)`, `/proc/net/*` virtual NIC profile, and QuickJS packet capture + `onSend`/`onRecv` live interception — **offline-safe by default (`-EACCES`) with explicit opt-in & `allowHosts` allowlist**.
+- **⚡ Zero-Copy Binary Tracer & Offline Analysis**: Three granularity levels (`fast` / `reg_delta` / `full`), dual-stream `mmap` persistence (`.idx` + `.ext`, truncated on finalize), post-exec register attribution with inline ASCII hints, millisecond offline `dump` / `search --val --ascii --bytes` / `stats` / `calltree` / `crypto-scan`, and one-command IDA Pro / Binary Ninja coverage script export.
+- **📜 Zero-Config QuickJS Engine + TypeScript IntelliSense**: Write reverse-engineering scripts in JS with `Emu` / `Module` / `jni` / `mem` / `regs` / Frida-style `hook` (`attach`, `replace`, `code`, `mem`, `syscall`) / `vfs` / `net` / `trace` / `fs` / CommonJS `require()`, and export full `runidbg.d.ts` definitions via `runidbg-cli init-types`.
 - **🌐 Production Async Multi-Core RPC Server**: Powered by `tokio` + `axum` + lock-free MPMC worker pool (`--workers auto`), with HTTP Keep-Alive, backpressure `503`, Unicorn hard timeout & instruction budget `504`, JSON-RPC 2.0 Batch, Prometheus `/metrics`, atomic rolling hot reload, and `async` exports.
-- **🤖 MCP AI Reverse-Engineering Loop & Debugger**: Native stdio and Streamable HTTP MCP server (14 tools including `bad64` disassembly, function-level tracing, one-shot hooks, and crash inspection), `EnvDiag` missing-environment auto-patcher, in-memory APK loader, and ARM64 GDB RSP stub (IDA Pro / Binary Ninja / pwndbg).
+- **🤖 MCP AI Reverse-Engineering Loop & Debugger**: Native stdio and Streamable HTTP MCP server (**17 tools** including `bad64` disassembly, `trace_calltree`, `trace_crypto_scan`, `trace_inspect` byte-stream search, one-shot hooks, and crash inspection), `EnvDiag` missing-environment auto-patcher, in-memory APK loader, and ARM64 GDB RSP stub (IDA Pro / Binary Ninja / pwndbg).
 
 ---
 
@@ -106,7 +107,7 @@ xychart-beta
 | **Performance & Footprint** | ✅ Pure Rust: **22.6×** faster cold start, **2.9×** faster warm calls, **5.6×** lower single-worker RPC RAM (21.7 MB vs 122.1 MB) | ⚠️ JVM + JNI/JNA overhead (~1.7s cold start, ~122 MB per instance) |
 | **Instruction Tracing** | ✅ Zero-copy binary mmap + offline `bad64` decoding: **31×–114×** faster, 3.7× smaller, built-in `dump`/`search`/IDA/BN export | ⚠️ Online Capstone text formatting in hot path (~0.15 M insns/s, ~118 B/insn) |
 | **Scripting Ergonomics** | ✅ **Zero-compile QuickJS** + `runidbg.d.ts` IntelliSense + Frida-style hooks + `EnvDiag` auto-patch generator | ⚠️ Requires JDK/Maven project setup and Java compilation per iteration |
-| **Engineering & AI Integration** | ✅ Built-in async multi-core HTTP/JSON-RPC 2.0, Prometheus `/metrics`, hot reload, **14-tool MCP server**, GDB RSP, APK loader | ⚠️ Primarily a Java library; RPC pooling, metrics, and AI agent integration require custom wrappers |
+| **Engineering & AI Integration** | ✅ Built-in async multi-core HTTP/JSON-RPC 2.0, Prometheus `/metrics`, hot reload, **17-tool MCP server**, Host Socket passthrough & packet capture, GDB RSP, APK loader | ⚠️ Primarily a Java library; RPC pooling, metrics, and AI agent integration require custom wrappers |
 | **Platform & Arch Support** | ⚠️ **Android ARM64 (`aarch64`) only** — no ARM32 or iOS support yet | ✅ **Supports Android ARM32 / ARM64 and iOS (Mach-O / ObjC)** |
 | **Maturity & Sample Ecosystem** | ⚠️ **Newer project** — verified on Cronet, Conscrypt, MMKV, SQLite, WebP, Zstd, and real MSSDK, but long-tail Android framework stubs & edge syscalls are still growing | ✅ **Years of community battle-testing** with extensive public examples, tutorials, and edge-case stubs |
 | **Java Bytecode Execution** | ⚠️ No built-in ART/Dalvik bytecode interpreter; Java callbacks rely on built-in models + JS hooks | ⚠️ Same — relies on `AbstractJni` stubs rather than executing DEX bytecode |

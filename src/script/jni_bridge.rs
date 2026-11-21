@@ -16,7 +16,7 @@ use crate::jni::handler::{
 use crate::jni::{JObjectRef, JValue, JniContext, JniHandler, MethodDesc, ObjectTable};
 
 thread_local! {
-    static CURRENT_JS_CTX: Cell<Option<NonNull<JSContext>>> = const { Cell::new(None) };
+    pub(crate) static CURRENT_JS_CTX: Cell<Option<NonNull<JSContext>>> = const { Cell::new(None) };
     static ACTIVE_OBJECTS: Cell<Option<NonNull<ObjectTable>>> = const { Cell::new(None) };
 }
 

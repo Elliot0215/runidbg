@@ -15,7 +15,7 @@
 ![Engine](https://img.shields.io/badge/Unicorn-2.1-blueviolet)
 ![Script](https://img.shields.io/badge/QuickJS-TypeScript%20d.ts-F7DF1E?logo=javascript&logoColor=black)
 ![Protocol](https://img.shields.io/badge/RPC%20%7C%20MCP%20%7C%20GDB%20RSP-ready-0A66C2)
-![Tests](https://img.shields.io/badge/Tests-40%2F40%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-45%2F45%20passing-brightgreen)
 
 | 🚀 冷启动速度 | 🔥 全模块 Trace 吞吐 | 💾 单实例 RPC 内存 | ⚙️ 多核 RPC 吞吐 | 📦 单条 Trace 体积 |
 | :---: | :---: | :---: | :---: | :---: |
@@ -38,13 +38,14 @@
 
 ## ✨ 核心特性
 
-- **🦀 Android ARM64 原生仿真底座**：基于 Unicorn 2.1 + `goblin`，完整支持 ELF 动态链接（`.init_array`、`IRELATIVE`、符号重定位、`DT_NEEDED` 递归加载、TLS `TPIDR_EL0`）、高频 libc/libm HLE 加速（含真实 AAPCS64 `vsnprintf`/`__snprintf_chk`/`sscanf`/`asprintf`/`atoll`）、VMA/MMU 内存管理与防反调试。
+- **🦀 Android ARM64 原生仿真底座**：基于 Unicorn 2.1 + `goblin`，完整支持 ELF 动态链接（`.init_array`、`IRELATIVE`、符号重定位、`DT_NEEDED` 递归加载、TLS `TPIDR_EL0`）、高频 libc/libm HLE 加速（含真实 AAPCS64 `vsnprintf`/`__snprintf_chk`/`sscanf`/`asprintf`/`atoll`）、带前后空闲块合并（Coalescing Free-List）的真实堆分配器、完整快照回滚（CPU + 可写内存 + 堆元数据 + JNI 引用表）与防反调试。
 - **📱 统一设备画像与双模式时钟（`DeviceProfile`）**：内置 `pixel5` / `pixel8pro` / `s24ultra` / `xiaomi14` 真机画像与任意字段覆盖，一处配置自动联动 **30+ 系统属性**、`/proc/cpuinfo`、`/proc/meminfo`、`/proc/version`、`/sys/devices/system/cpu/online` 与 `uname`；支持确定性虚拟时钟与宿主机实时时钟（`realClock`）一键切换。
-- **🧬 JNI 1.6 完整环境**：支持 `JNI_OnLoad`、`RegisterNatives`、容器安全的引用生命周期管理、内置常用 Java 模型（`String` 构造与方法、`Thread.currentThread()`、基础类型装箱 `valueOf` 等）以及可插拔 JS/Rust JNI Hook。
-- **⚡ 零拷贝二进制 Tracer**：支持 `fast` / `reg_delta` / `full` 三级分层追踪、`mmap` 双流落盘（`.idx` + `.ext`，结束时精确截断无尾部零填充）、毫秒级离线检索（`dump` / `search`）以及 IDA Pro / Binary Ninja 覆盖率脚本一键导出。
-- **📜 QuickJS 零配置脚本引擎 + TypeScript 智能提示**：写 JS 即可完成逆向分析，内置 `Emu` / `Module` / `jni` / `mem` / `regs` / `hook`（Frida 风格 `attach`、`replace`、`code`、`mem`、`syscall`）/ `vfs` / `trace` / `fs` / `require()`，并通过 `runidbg-cli init-types` 导出完整 `runidbg.d.ts`。
+- **🧬 JNI 1.6 完整环境**：支持 `JNI_OnLoad`、`RegisterNatives`、容器安全的引用生命周期与 `PushLocalFrame`/`PopLocalFrame`（JS 侧 `emu.jni.withLocalFrame` 自动回收常驻 RPC 临时引用与缓冲）、内置常用 Java 模型（`String` 构造与方法、`Thread.currentThread()`、基础类型装箱 `valueOf` 等）以及可插拔 JS/Rust JNI Hook。
+- **🌍 宿主机 Socket 透传、异步事件原语与虚拟网卡（`emu.net`）**：零额外依赖内置真实 TCP/UDP Socket 透传、`epoll`/`ppoll`/`eventfd2`/`pipe2` 异步事件循环、`getaddrinfo`/`getifaddrs`/`ioctl(SIOCGIF*)` 与 `/proc/net/*` 虚拟网卡画像，支持 QuickJS 抓包与 `onSend`/`onRecv` 实时改包；**运行期默认关闭真实联网（`-EACCES` 离线护栏），支持 `allowHosts` 白名单显式放行**。
+- **⚡ 零拷贝二进制 Tracer 与离线分析**：支持 `fast` / `reg_delta` / `full` 三级分层追踪、`mmap` 双流落盘（`.idx` + `.ext`，结束时精确截断）、执行后寄存器精确归属 + ASCII 旁注、毫秒级离线检索（`dump` / `search --val --ascii --bytes` / `stats` / `calltree` / `crypto-scan`）以及 IDA Pro / Binary Ninja 覆盖率脚本一键导出。
+- **📜 QuickJS 零配置脚本引擎 + TypeScript 智能提示**：写 JS 即可完成逆向分析，内置 `Emu` / `Module` / `jni` / `mem` / `regs` / `hook`（Frida 风格 `attach`、`replace`、`code`、`mem`、`syscall`）/ `vfs` / `net` / `trace` / `fs` / `require()`，并通过 `runidbg-cli init-types` 导出完整 `runidbg.d.ts`。
 - **🌐 生产级异步多核 RPC 服务**：基于 `tokio` + `axum` + 无锁 MPMC Worker 池（`--workers auto`），内置 Keep-Alive、队列背压 `503`、Unicorn 硬超时与指令预算 `504`、JSON-RPC 2.0 Batch、Prometheus `/metrics`、滚动热重载及 `async` 导出。
-- **🤖 MCP AI 逆向闭环 & 调试工具链**：原生支持 stdio 与 Streamable HTTP 双模式 MCP（14 个逆向工具，含 `bad64` 反汇编、函数级 Trace、一次性 Hook 抓取、崩溃现场诊断）、`EnvDiag` 缺环境自动诊断器、APK 一键内存加载与 ARM64 GDB RSP 远程调试服务端。
+- **🤖 MCP AI 逆向闭环 & 调试工具链**：原生支持 stdio 与 Streamable HTTP 双模式 MCP（**17 个逆向工具**，含 `bad64` 反汇编、`trace_calltree`、`trace_crypto_scan`、`trace_inspect` 字节流搜索、一次性 Hook 抓取与崩溃现场诊断）、`EnvDiag` 缺环境自动诊断器、APK 一键内存加载与 ARM64 GDB RSP 远程调试服务端。
 
 ---
 
@@ -106,7 +107,7 @@ xychart-beta
 | **运行性能与内存** | ✅ 原生 Rust，冷启动快 **22.6×**、单核热态快 **2.9×**、RPC 内存仅 **1/5.6**（21.7 MB vs 122.1 MB） | ⚠️ JVM + JNI/JNA 跨边界开销，冷启动 ~1.7s，单实例 ~122 MB |
 | **指令级 Trace** | ✅ 零拷贝 mmap 二进制双流 + 离线 `bad64` 解码，吞吐高 **31×–114×**，自带 `dump`/`search`/IDA/BN 导出 | ⚠️ 热路径实时 Capstone 文本反汇编落盘，吞吐 ~0.15 M/s，文本体积大 3.7× |
 | **脚本开发体验** | ✅ **零编译 QuickJS** + 完整 `runidbg.d.ts` 智能提示 + Frida 风格 Hook + `EnvDiag` 自动生成补环境 JS | ⚠️ 需配置 Maven/JDK 工程并编写/编译 Java 代码，迭代周期更长 |
-| **工程化与 AI 集成** | ✅ 原生内置多核异步 HTTP/JSON-RPC 2.0、Prometheus `/metrics`、热重载、**MCP 14 工具**、GDB RSP、APK 加载 | ⚠️ 核心定位为 Java 库，RPC 服务池、监控、AI Agent 接入需自行二次封装 |
+| **工程化与 AI 集成** | ✅ 原生内置多核异步 HTTP/JSON-RPC 2.0、Prometheus `/metrics`、热重载、**MCP 17 工具**、Host Socket 透传与抓包、GDB RSP、APK 加载 | ⚠️ 核心定位为 Java 库，RPC 服务池、监控、AI Agent 接入需自行二次封装 |
 | **平台与架构支持** | ⚠️ **目前仅支持 Android ARM64（`aarch64`）**，暂不支持 ARM32 与 iOS | ✅ **支持 Android ARM32 / ARM64 以及 iOS（Mach-O / ObjC）** |
 | **成熟度与样本生态** | ⚠️ **项目较新**，已验证 Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / 真实 MSSDK 等，但冷门系统库与长尾样本覆盖仍在持续扩充 | ✅ **多年社区沉淀**，公开案例、教程、Android 系统类桩与边缘 syscall 覆盖非常成熟 |
 | **Java 字节码执行** | ⚠️ 无内置 ART/Dalvik 解释器，Java 侧回调依赖内置模型与 JS Hook 补全 | ⚠️ 同样不直接解释执行 DEX 字节码，依赖 `AbstractJni` 补环境 |

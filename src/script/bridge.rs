@@ -20,7 +20,7 @@ use super::hooks::{
     dump_regs, encode_arm64_nop, encode_arm64_ret, parse_hex_pattern, parse_reg_name, scan_memory,
     with_active_uc, JsNativeHookTable, SYSCALL_WILDCARD,
 };
-use super::jni_bridge::{with_active_objects, JsCtxGuard, JsHookTable, JsJniHandler};
+use super::jni_bridge::{with_active_objects, JsCtxGuard, JsHookTable, JsJniHandler, CURRENT_JS_CTX};
 use super::{EmuEntry, SharedHost, SharedLogSink};
 
 /// 统一可重入 `Unicorn` 访问器：
@@ -1253,6 +1253,198 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
+    // ---- Network / Virtual NIC / Packet Capture APIs ----
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "netConfigure",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize, opts: Value<'js>| -> rquickjs::Result<()> {
+                    let mut h = host.borrow_mut();
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let cfg = &mut entry.emu.vfs_mut().net.config;
+                    if let Some(b) = opts.as_bool() {
+                        cfg.enabled = b;
+                        if b {
+                            cfg.capture_packets = true;
+                        }
+                        return Ok(());
+                    }
+                    if let Some(obj) = opts.as_object() {
+                        if let Ok(en) = obj.get::<_, bool>("enabled") {
+                            cfg.enabled = en;
+                        }
+                        if let Ok(cap) = obj.get::<_, bool>("capture") {
+                            cfg.capture_packets = cap;
+                        }
+                        if let Ok(hosts) = obj.get::<_, Vec<String>>("allowHosts") {
+                            cfg.allow_hosts = hosts;
+                        }
+                        if let Ok(nic_obj) = obj.get::<_, Object<'js>>("nic") {
+                            apply_nic_js_obj(&mut cfg.nic, &nic_obj);
+                        }
+                    }
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "netSetNic",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize, obj: Object<'js>| -> rquickjs::Result<()> {
+                    let mut h = host.borrow_mut();
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    apply_nic_js_obj(&mut entry.emu.vfs_mut().net.config.nic, &obj);
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "netNic",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize| -> rquickjs::Result<Object<'js>> {
+                    let h = host.borrow();
+                    let entry = h
+                        .emus
+                        .get(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let nic = &entry.emu.uc().get_data().vfs.net.config.nic;
+                    let out = Object::new(ctx.clone())?;
+                    out.set("name", nic.name.as_str())?;
+                    out.set("ipv4", nic.ipv4_string())?;
+                    out.set("gateway", nic.gateway_string())?;
+                    out.set("mac", nic.mac_string())?;
+                    out.set("ipv6", nic.ipv6.as_str())?;
+                    Ok(out)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "netPackets",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize| -> rquickjs::Result<Array<'js>> {
+                    let h = host.borrow();
+                    let entry = h
+                        .emus
+                        .get(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let pkts = entry.emu.uc().get_data().vfs.net.packets();
+                    let arr = Array::new(ctx.clone())?;
+                    for (i, p) in pkts.iter().enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("fd", p.fd)?;
+                        o.set("dir", p.dir)?;
+                        o.set("peer", p.peer.as_str())?;
+                        o.set("len", p.data.len())?;
+                        let hex: String = p.data.iter().map(|b| format!("{b:02x}")).collect();
+                        o.set("hex", hex)?;
+                        o.set("text", String::from_utf8_lossy(&p.data).into_owned())?;
+                        arr.set(i, o)?;
+                    }
+                    Ok(arr)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "netClearPackets",
+            Function::new(ctx.clone(), move |ctx: Ctx<'_>, emu_id: usize| -> rquickjs::Result<()> {
+                let mut h = host.borrow_mut();
+                let entry = h
+                    .emus
+                    .get_mut(emu_id)
+                    .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                entry.emu.vfs_mut().net.clear_packets();
+                Ok(())
+            })?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "netSetInterceptor",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      is_send: bool,
+                      cb: Option<Function<'js>>|
+                      -> rquickjs::Result<()> {
+                    let mut h = host.borrow_mut();
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let interceptor = cb.map(|func| {
+                        let persisted = Persistent::save(&ctx, func);
+                        let closure: crate::os::net::PacketInterceptor =
+                            Box::new(move |fd: i32, peer: &str, data: &[u8]| -> Option<Vec<u8>> {
+                                let raw_ctx = CURRENT_JS_CTX.with(|c| c.get())?;
+                                // SAFETY: `JsCtxGuard` 保证 `raw_ctx` 有效
+                                let js_ctx: Ctx<'_> = unsafe { Ctx::from_raw(raw_ctx) };
+                                let f = persisted.clone().restore(&js_ctx).ok()?;
+                                let pkt = Object::new(js_ctx.clone()).ok()?;
+                                let _ = pkt.set("fd", fd);
+                                let _ = pkt.set("peer", peer);
+                                if let Ok(ta) = TypedArray::new(js_ctx.clone(), data.to_vec()) {
+                                    let _ = pkt.set("data", ta);
+                                }
+                                let _ = pkt.set("text", String::from_utf8_lossy(data).into_owned());
+                                let ret: Value<'_> = f.call((pkt,)).ok()?;
+                                if ret.is_undefined() || ret.is_null() {
+                                    return None;
+                                }
+                                if let Some(s) = ret.as_string().and_then(|s| s.to_string().ok()) {
+                                    return Some(s.into_bytes());
+                                }
+                                if let Some(obj) = ret.as_object() {
+                                    if let Some(ta) = obj.as_typed_array::<u8>() {
+                                        if let Some(bytes) = ta.as_bytes() {
+                                            return Some(bytes.to_vec());
+                                        }
+                                    }
+                                }
+                                None
+                            });
+                        closure
+                    });
+                    if is_send {
+                        entry.emu.vfs_mut().net.set_on_send(interceptor);
+                    } else {
+                        entry.emu.vfs_mut().net.set_on_recv(interceptor);
+                    }
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
     {
         let host = Rc::clone(host);
         native.set(
@@ -2269,4 +2461,41 @@ pub(super) fn register_native_bridge<'js>(
 
     globals.set("__native", native)?;
     Ok(())
+}
+
+fn apply_nic_js_obj(nic: &mut crate::os::net::VirtualNic, obj: &Object<'_>) {
+    if let Ok(name) = obj.get::<_, String>("name") {
+        if !name.is_empty() {
+            nic.name = name;
+        }
+    }
+    if let Ok(ip_str) = obj.get::<_, String>("ipv4") {
+        if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+            nic.ipv4 = ip.octets();
+        }
+    }
+    if let Ok(mask_str) = obj.get::<_, String>("netmask") {
+        if let Ok(ip) = mask_str.parse::<std::net::Ipv4Addr>() {
+            nic.netmask = ip.octets();
+        }
+    }
+    if let Ok(gw_str) = obj.get::<_, String>("gateway") {
+        if let Ok(ip) = gw_str.parse::<std::net::Ipv4Addr>() {
+            nic.gateway = ip.octets();
+        }
+    }
+    if let Ok(mac_str) = obj.get::<_, String>("mac") {
+        let parts: Vec<u8> = mac_str
+            .split(':')
+            .filter_map(|p| u8::from_str_radix(p.trim(), 16).ok())
+            .collect();
+        if parts.len() == 6 {
+            nic.mac.copy_from_slice(&parts);
+        }
+    }
+    if let Ok(ipv6) = obj.get::<_, String>("ipv6") {
+        if !ipv6.is_empty() {
+            nic.ipv6 = ipv6;
+        }
+    }
 }

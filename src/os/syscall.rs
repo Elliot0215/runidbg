@@ -3,18 +3,29 @@ use unicorn_engine::{RegisterARM64, UcHookId, Unicorn};
 
 use crate::error::EmuResult;
 use crate::memory::{read_guest_cstr as read_guest_c_string, MemoryManager};
+use crate::os::net::{
+    parse_sockaddr, serialize_sockaddr, AF_INET, FIONBIO, O_NONBLOCK, SIOCGIFADDR, SIOCGIFCONF,
+    SIOCGIFFLAGS, SIOCGIFHWADDR, SIOCGIFNETMASK,
+};
 use crate::os::vfs::{VirtualFs, EBADF, EINVAL, ENOSYS};
 
 /// ARM64 Unicorn SVC #0 中断号 (`EXCP_SWI`)
 pub const ARM64_EXCP_SWI: u32 = 2;
 
 /// Linux AArch64 常用系统调用号 (asm-generic/unistd.h)
+pub const SYS_EVENTFD2: u64 = 19;
+pub const SYS_EPOLL_CREATE1: u64 = 20;
+pub const SYS_EPOLL_CTL: u64 = 21;
+pub const SYS_EPOLL_PWAIT: u64 = 22;
+pub const SYS_FCNTL: u64 = 25;
 pub const SYS_IOCTL: u64 = 29;
 pub const SYS_OPENAT: u64 = 56;
 pub const SYS_CLOSE: u64 = 57;
+pub const SYS_PIPE2: u64 = 59;
 pub const SYS_LSEEK: u64 = 62;
 pub const SYS_READ: u64 = 63;
 pub const SYS_WRITE: u64 = 64;
+pub const SYS_PPOLL: u64 = 73;
 pub const SYS_READLINKAT: u64 = 78;
 pub const SYS_NEWFSTATAT: u64 = 79;
 pub const SYS_FSTAT: u64 = 80;
@@ -40,11 +51,25 @@ pub const SYS_GETEUID: u64 = 175;
 pub const SYS_GETGID: u64 = 176;
 pub const SYS_GETEGID: u64 = 177;
 pub const SYS_GETTID: u64 = 178;
+pub const SYS_SOCKET: u64 = 198;
+pub const SYS_SOCKETPAIR: u64 = 199;
+pub const SYS_BIND: u64 = 200;
+pub const SYS_LISTEN: u64 = 201;
+pub const SYS_ACCEPT: u64 = 202;
+pub const SYS_CONNECT: u64 = 203;
+pub const SYS_GETSOCKNAME: u64 = 204;
+pub const SYS_GETPEERNAME: u64 = 205;
+pub const SYS_SENDTO: u64 = 206;
+pub const SYS_RECVFROM: u64 = 207;
+pub const SYS_SETSOCKOPT: u64 = 208;
+pub const SYS_GETSOCKOPT: u64 = 209;
+pub const SYS_SHUTDOWN: u64 = 210;
 pub const SYS_BRK: u64 = 214;
 pub const SYS_MUNMAP: u64 = 215;
 pub const SYS_MMAP: u64 = 222;
 pub const SYS_MPROTECT: u64 = 226;
 pub const SYS_MADVISE: u64 = 233;
+pub const SYS_ACCEPT4: u64 = 242;
 pub const SYS_PRLIMIT64: u64 = 261;
 pub const SYS_GETRANDOM: u64 = 278;
 
@@ -296,9 +321,398 @@ where
         | SYS_RT_SIGACTION
         | SYS_RT_SIGPROCMASK
         | SYS_PRCTL
-        | SYS_IOCTL
         | SYS_SCHED_YIELD
         | SYS_PRLIMIT64 => 0,
+        SYS_IOCTL => {
+            let fd = args[0] as i32;
+            let req = args[1];
+            let argp = args[2];
+            match req {
+                FIONBIO => {
+                    let mut val_buf = [0u8; 4];
+                    if argp != 0 && uc.mem_read(argp, &mut val_buf).is_ok() {
+                        let nb = u32::from_le_bytes(val_buf) != 0;
+                        let (_, vfs) = get_state(uc.get_data_mut());
+                        let _ = vfs.net.set_nonblocking(fd, nb);
+                    }
+                    0
+                }
+                SIOCGIFFLAGS => {
+                    // IFF_UP (0x1) | IFF_BROADCAST (0x2) | IFF_RUNNING (0x40) | IFF_MULTICAST (0x1000)
+                    if argp != 0 {
+                        let flags: u16 = 0x1043;
+                        let _ = uc.mem_write(argp + 16, &flags.to_le_bytes());
+                    }
+                    0
+                }
+                SIOCGIFADDR => {
+                    if argp != 0 {
+                        let ipv4 = get_state(uc.get_data_mut()).1.net.config.nic.ipv4;
+                        let mut sa = [0u8; 16];
+                        sa[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+                        sa[4..8].copy_from_slice(&ipv4);
+                        let _ = uc.mem_write(argp + 16, &sa);
+                    }
+                    0
+                }
+                SIOCGIFNETMASK => {
+                    if argp != 0 {
+                        let mask = get_state(uc.get_data_mut()).1.net.config.nic.netmask;
+                        let mut sa = [0u8; 16];
+                        sa[0..2].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+                        sa[4..8].copy_from_slice(&mask);
+                        let _ = uc.mem_write(argp + 16, &sa);
+                    }
+                    0
+                }
+                SIOCGIFHWADDR => {
+                    if argp != 0 {
+                        let mac = get_state(uc.get_data_mut()).1.net.config.nic.mac;
+                        let mut sa = [0u8; 16];
+                        sa[0..2].copy_from_slice(&1u16.to_le_bytes()); // ARPHRD_ETHER
+                        sa[2..8].copy_from_slice(&mac);
+                        let _ = uc.mem_write(argp + 16, &sa);
+                    }
+                    0
+                }
+                SIOCGIFCONF => {
+                    // struct ifconf { int ifc_len; pad(4); void *ifc_buf; } (AArch64 = 16 bytes)
+                    if argp != 0 {
+                        let mut hdr = [0u8; 16];
+                        if uc.mem_read(argp, &mut hdr).is_ok() {
+                            let cap = i32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]).max(0) as usize;
+                            let buf_ptr = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+                            let nic = get_state(uc.get_data_mut()).1.net.config.nic.clone();
+                            // struct ifreq on AArch64 = 40 bytes (16B name + 24B union)
+                            if buf_ptr != 0 && cap >= 40 {
+                                let mut ifreq = [0u8; 40];
+                                let nbytes = nic.name.as_bytes();
+                                let nlen = nbytes.len().min(15);
+                                ifreq[..nlen].copy_from_slice(&nbytes[..nlen]);
+                                ifreq[16..18].copy_from_slice(&(AF_INET as u16).to_le_bytes());
+                                ifreq[20..24].copy_from_slice(&nic.ipv4);
+                                let _ = uc.mem_write(buf_ptr, &ifreq);
+                                let _ = uc.mem_write(argp, &40i32.to_le_bytes());
+                            } else {
+                                let _ = uc.mem_write(argp, &40i32.to_le_bytes());
+                            }
+                        }
+                    }
+                    0
+                }
+                _ => 0,
+            }
+        }
+        SYS_FCNTL => {
+            let fd = args[0] as i32;
+            let cmd = args[1] as i32;
+            let arg = args[2] as u32;
+            let (_, vfs) = get_state(uc.get_data_mut());
+            match cmd {
+                3 => {
+                    // F_GETFL
+                    if vfs.net.is_nonblocking(fd) {
+                        O_NONBLOCK as i64
+                    } else {
+                        0
+                    }
+                }
+                4 => {
+                    // F_SETFL
+                    if vfs.net.contains_fd(fd) {
+                        vfs.net.set_nonblocking(fd, (arg & O_NONBLOCK) != 0);
+                    }
+                    0
+                }
+                _ => 0,
+            }
+        }
+        SYS_EVENTFD2 => {
+            let initval = args[0];
+            let flags = args[1] as u32;
+            let (_, vfs) = get_state(uc.get_data_mut());
+            let fd = vfs.alloc_raw_fd();
+            vfs.net.create_eventfd(fd, initval, flags)
+        }
+        SYS_EPOLL_CREATE1 => {
+            let (_, vfs) = get_state(uc.get_data_mut());
+            let fd = vfs.alloc_raw_fd();
+            vfs.net.create_epoll(fd)
+        }
+        SYS_EPOLL_CTL => {
+            let epfd = args[0] as i32;
+            let op = args[1] as i32;
+            let fd = args[2] as i32;
+            let ev_ptr = args[3];
+            let (events, data) = if ev_ptr != 0 {
+                // struct epoll_event on AArch64: u32 events (0..4) + u32 pad (4..8) + u64 data (8..16)
+                let mut buf = [0u8; 16];
+                if uc.mem_read(ev_ptr, &mut buf).is_ok() {
+                    let ev = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+                    let dt = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+                    (ev, dt)
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            };
+            get_state(uc.get_data_mut())
+                .1
+                .net
+                .epoll_ctl(epfd, op, fd, events, data)
+        }
+        SYS_EPOLL_PWAIT => {
+            let epfd = args[0] as i32;
+            let ev_ptr = args[1];
+            let max_events = (args[2] as i32).max(0) as usize;
+            let timeout_ms = args[3] as i32;
+            let res = get_state(uc.get_data_mut())
+                .1
+                .net
+                .epoll_wait(epfd, max_events, timeout_ms);
+            match res {
+                Ok(ready) => {
+                    for (i, (ev, dt)) in ready.iter().enumerate() {
+                        let mut buf = [0u8; 16];
+                        buf[0..4].copy_from_slice(&ev.to_le_bytes());
+                        buf[8..16].copy_from_slice(&dt.to_le_bytes());
+                        let _ = uc.mem_write(ev_ptr + (i as u64) * 16, &buf);
+                    }
+                    ready.len() as i64
+                }
+                Err(e) => e,
+            }
+        }
+        SYS_PIPE2 => {
+            let fds_ptr = args[0];
+            let flags = args[1] as u32;
+            let (rfd, wfd, ret) = {
+                let (_, vfs) = get_state(uc.get_data_mut());
+                let rfd = vfs.alloc_raw_fd();
+                let wfd = vfs.alloc_raw_fd();
+                let ret = vfs.net.create_pipe(rfd, wfd, flags);
+                (rfd, wfd, ret)
+            };
+            if ret == 0 && fds_ptr != 0 {
+                let mut pair = [0u8; 8];
+                pair[0..4].copy_from_slice(&rfd.to_le_bytes());
+                pair[4..8].copy_from_slice(&wfd.to_le_bytes());
+                if uc.mem_write(fds_ptr, &pair).is_err() {
+                    return EINVAL;
+                }
+            }
+            ret
+        }
+        SYS_PPOLL => {
+            // ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *tmo_p, ...)
+            let fds_ptr = args[0];
+            let nfds = (args[1] as usize).min(1024);
+            let tmo_ptr = args[2];
+            let timeout_ms = if tmo_ptr != 0 {
+                let mut ts = [0u8; 16];
+                if uc.mem_read(tmo_ptr, &mut ts).is_ok() {
+                    let secs = i64::from_le_bytes(ts[0..8].try_into().unwrap()).max(0);
+                    let nsecs = i64::from_le_bytes(ts[8..16].try_into().unwrap()).max(0);
+                    (secs.saturating_mul(1000) + nsecs / 1_000_000).min(i32::MAX as i64) as i32
+                } else {
+                    0
+                }
+            } else {
+                -1
+            };
+            let mut items = Vec::with_capacity(nfds);
+            for i in 0..nfds {
+                let mut pfd = [0u8; 8];
+                if uc.mem_read(fds_ptr + (i as u64) * 8, &mut pfd).is_ok() {
+                    let fd = i32::from_le_bytes(pfd[0..4].try_into().unwrap());
+                    let ev = u16::from_le_bytes(pfd[4..6].try_into().unwrap());
+                    items.push((fd, ev));
+                }
+            }
+            let revents = get_state(uc.get_data_mut())
+                .1
+                .net
+                .poll_fds(&items, timeout_ms);
+            let mut count = 0i64;
+            for (i, &rev) in revents.iter().enumerate() {
+                if rev != 0 {
+                    count += 1;
+                }
+                let _ = uc.mem_write(fds_ptr + (i as u64) * 8 + 6, &rev.to_le_bytes());
+            }
+            count
+        }
+        SYS_SOCKET => {
+            let domain = args[0] as i32;
+            let sock_type = args[1] as i32;
+            let protocol = args[2] as i32;
+            let (_, vfs) = get_state(uc.get_data_mut());
+            let fd = vfs.alloc_raw_fd();
+            vfs.net.create_socket(fd, domain, sock_type, protocol)
+        }
+        SYS_SOCKETPAIR => {
+            let sv_ptr = args[3];
+            let (fd0, fd1, ret) = {
+                let (_, vfs) = get_state(uc.get_data_mut());
+                let fd0 = vfs.alloc_raw_fd();
+                let fd1 = vfs.alloc_raw_fd();
+                let ret = vfs.net.create_pipe(fd0, fd1, 0);
+                (fd0, fd1, ret)
+            };
+            if ret == 0 && sv_ptr != 0 {
+                let mut pair = [0u8; 8];
+                pair[0..4].copy_from_slice(&fd0.to_le_bytes());
+                pair[4..8].copy_from_slice(&fd1.to_le_bytes());
+                let _ = uc.mem_write(sv_ptr, &pair);
+            }
+            ret
+        }
+        SYS_BIND => {
+            let fd = args[0] as i32;
+            let addr_ptr = args[1];
+            let addr_len = (args[2] as usize).min(128);
+            let mut sa = vec![0u8; addr_len];
+            if uc.mem_read(addr_ptr, &mut sa).is_err() {
+                return EINVAL;
+            }
+            let Some(sock_addr) = parse_sockaddr(&sa) else {
+                return EINVAL;
+            };
+            get_state(uc.get_data_mut()).1.net.bind(fd, sock_addr)
+        }
+        SYS_LISTEN => {
+            let fd = args[0] as i32;
+            get_state(uc.get_data_mut()).1.net.listen(fd)
+        }
+        SYS_ACCEPT | SYS_ACCEPT4 => {
+            let fd = args[0] as i32;
+            let addr_ptr = args[1];
+            let addrlen_ptr = args[2];
+            let flags = if nr == SYS_ACCEPT4 { args[3] as i32 } else { 0 };
+            let (new_fd, res) = {
+                let (_, vfs) = get_state(uc.get_data_mut());
+                let new_fd = vfs.alloc_raw_fd();
+                let res = vfs.net.accept(fd, new_fd, flags);
+                (new_fd, res)
+            };
+            match res {
+                Ok(peer) => {
+                    if addr_ptr != 0 {
+                        let bytes = serialize_sockaddr(peer);
+                        let _ = uc.mem_write(addr_ptr, &bytes);
+                        if addrlen_ptr != 0 {
+                            let _ = uc.mem_write(addrlen_ptr, &(bytes.len() as u32).to_le_bytes());
+                        }
+                    }
+                    new_fd as i64
+                }
+                Err(e) => e,
+            }
+        }
+        SYS_CONNECT => {
+            let fd = args[0] as i32;
+            let addr_ptr = args[1];
+            let addr_len = (args[2] as usize).min(128);
+            let mut sa = vec![0u8; addr_len];
+            if uc.mem_read(addr_ptr, &mut sa).is_err() {
+                return EINVAL;
+            }
+            let Some(sock_addr) = parse_sockaddr(&sa) else {
+                return EINVAL;
+            };
+            get_state(uc.get_data_mut()).1.net.connect(fd, sock_addr)
+        }
+        SYS_GETSOCKNAME | SYS_GETPEERNAME => {
+            let fd = args[0] as i32;
+            let addr_ptr = args[1];
+            let addrlen_ptr = args[2];
+            let addr_opt = {
+                let (_, vfs) = get_state(uc.get_data_mut());
+                if nr == SYS_GETSOCKNAME {
+                    vfs.net.local_addr(fd)
+                } else {
+                    vfs.net.peer_addr(fd)
+                }
+            };
+            let Some(addr) = addr_opt else {
+                return EINVAL;
+            };
+            let bytes = serialize_sockaddr(addr);
+            if addr_ptr != 0 {
+                let _ = uc.mem_write(addr_ptr, &bytes);
+            }
+            if addrlen_ptr != 0 {
+                let _ = uc.mem_write(addrlen_ptr, &(bytes.len() as u32).to_le_bytes());
+            }
+            0
+        }
+        SYS_SENDTO => {
+            let fd = args[0] as i32;
+            let buf_ptr = args[1];
+            let len = (args[2] as usize).min(1024 * 1024);
+            let dest_ptr = args[4];
+            let dest_len = (args[5] as usize).min(128);
+            let mut data = vec![0u8; len];
+            if len > 0 && uc.mem_read(buf_ptr, &mut data).is_err() {
+                return EINVAL;
+            }
+            let dest = if dest_ptr != 0 && dest_len >= 8 {
+                let mut sa = vec![0u8; dest_len];
+                if uc.mem_read(dest_ptr, &mut sa).is_ok() {
+                    parse_sockaddr(&sa)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            get_state(uc.get_data_mut()).1.net.send(fd, &data, dest)
+        }
+        SYS_RECVFROM => {
+            let fd = args[0] as i32;
+            let buf_ptr = args[1];
+            let len = (args[2] as usize).min(1024 * 1024);
+            let src_ptr = args[4];
+            let srclen_ptr = args[5];
+            match get_state(uc.get_data_mut()).1.net.recv(fd, len) {
+                Ok((data, peer)) => {
+                    if !data.is_empty() && uc.mem_write(buf_ptr, &data).is_err() {
+                        return EINVAL;
+                    }
+                    if let Some(peer_addr) = peer {
+                        if src_ptr != 0 {
+                            let bytes = serialize_sockaddr(peer_addr);
+                            let _ = uc.mem_write(src_ptr, &bytes);
+                            if srclen_ptr != 0 {
+                                let _ =
+                                    uc.mem_write(srclen_ptr, &(bytes.len() as u32).to_le_bytes());
+                            }
+                        }
+                    }
+                    data.len() as i64
+                }
+                Err(e) => e,
+            }
+        }
+        SYS_SETSOCKOPT => 0,
+        SYS_GETSOCKOPT => {
+            // SO_ERROR 等默认返回 0（无错误）
+            let optval_ptr = args[3];
+            let optlen_ptr = args[4];
+            if optval_ptr != 0 {
+                let _ = uc.mem_write(optval_ptr, &0i32.to_le_bytes());
+            }
+            if optlen_ptr != 0 {
+                let _ = uc.mem_write(optlen_ptr, &4u32.to_le_bytes());
+            }
+            0
+        }
+        SYS_SHUTDOWN => {
+            let fd = args[0] as i32;
+            let how = args[1] as i32;
+            get_state(uc.get_data_mut()).1.net.shutdown(fd, how)
+        }
         // 反调试对抗：`ptrace(PTRACE_TRACEME, ...)` 伪装未被任何调试器附加，直接返回 0
         SYS_PTRACE => 0,
         // 反调试对抗：屏蔽进程自杀信号（`tkill`/`tgkill`），防止反调试检测到异常后自毁

@@ -5,7 +5,8 @@ use unicorn_engine::{RegisterARM64, UcHookId, Unicorn};
 
 use crate::error::EmuResult;
 use crate::memory::{
-    align_down, align_up, read_guest_cstr, read_guest_cstr_bytes, MemoryManager, PAGE_SIZE,
+    align_down, align_up, read_guest_cstr, read_guest_cstr_bytes, read_guest_u64, MemoryManager,
+    PAGE_SIZE,
 };
 use crate::os::vfs::VirtualFs;
 
@@ -126,6 +127,35 @@ pub enum HleBuiltin {
     PthreadKeyCreate,
     PthreadSetSpecific,
     PthreadGetSpecific,
+    // POSIX Socket / EventLoop / DNS / 虚拟网卡 HLE
+    Socket,
+    Bind,
+    Listen,
+    Accept,
+    Connect,
+    Send,
+    Sendto,
+    Recv,
+    Recvfrom,
+    Shutdown,
+    Setsockopt,
+    Getsockopt,
+    Getsockname,
+    Getpeername,
+    Poll,
+    EpollCreate1,
+    EpollCtl,
+    EpollWait,
+    Eventfd,
+    Pipe,
+    Getaddrinfo,
+    Freeaddrinfo,
+    InetPton,
+    InetNtop,
+    Htons,
+    Htonl,
+    Getifaddrs,
+    Freeifaddrs,
     // 未实现的外部符号占位桩（触发时打印告警并返回 0，避免直接跳空指针崩溃）
     UnimplementedStub(String),
 }
@@ -255,6 +285,34 @@ impl HleBuiltin {
             "pthread_key_create" => Some(Self::PthreadKeyCreate),
             "pthread_setspecific" => Some(Self::PthreadSetSpecific),
             "pthread_getspecific" => Some(Self::PthreadGetSpecific),
+            "socket" => Some(Self::Socket),
+            "bind" => Some(Self::Bind),
+            "listen" => Some(Self::Listen),
+            "accept" | "accept4" => Some(Self::Accept),
+            "connect" => Some(Self::Connect),
+            "send" => Some(Self::Send),
+            "sendto" => Some(Self::Sendto),
+            "recv" => Some(Self::Recv),
+            "recvfrom" => Some(Self::Recvfrom),
+            "shutdown" => Some(Self::Shutdown),
+            "setsockopt" => Some(Self::Setsockopt),
+            "getsockopt" => Some(Self::Getsockopt),
+            "getsockname" => Some(Self::Getsockname),
+            "getpeername" => Some(Self::Getpeername),
+            "poll" => Some(Self::Poll),
+            "epoll_create" | "epoll_create1" => Some(Self::EpollCreate1),
+            "epoll_ctl" => Some(Self::EpollCtl),
+            "epoll_wait" | "epoll_pwait" => Some(Self::EpollWait),
+            "eventfd" => Some(Self::Eventfd),
+            "pipe" | "pipe2" => Some(Self::Pipe),
+            "getaddrinfo" => Some(Self::Getaddrinfo),
+            "freeaddrinfo" => Some(Self::Freeaddrinfo),
+            "inet_pton" => Some(Self::InetPton),
+            "inet_ntop" => Some(Self::InetNtop),
+            "htons" | "ntohs" => Some(Self::Htons),
+            "htonl" | "ntohl" => Some(Self::Htonl),
+            "getifaddrs" => Some(Self::Getifaddrs),
+            "freeifaddrs" => Some(Self::Freeifaddrs),
             "flock"
             | "fcntl"
             | "ioctl"
@@ -908,6 +966,9 @@ where
     let x0 = uc.reg_read(RegisterARM64::X0).unwrap_or(0);
     let x1 = uc.reg_read(RegisterARM64::X1).unwrap_or(0);
     let x2 = uc.reg_read(RegisterARM64::X2).unwrap_or(0);
+    let x3 = uc.reg_read(RegisterARM64::X3).unwrap_or(0);
+    let x4 = uc.reg_read(RegisterARM64::X4).unwrap_or(0);
+    let x5 = uc.reg_read(RegisterARM64::X5).unwrap_or(0);
 
     let ret: u64 = match builtin {
         HleBuiltin::Malloc => {
@@ -1962,6 +2023,413 @@ where
         HleBuiltin::PthreadGetSpecific => {
             let (table, _, _) = get_state(uc.get_data_mut());
             table.pthread_keys.get(&(x0 as u32)).copied().unwrap_or(0)
+        }
+        HleBuiltin::Socket => {
+            let (_, _, vfs) = get_state(uc.get_data_mut());
+            let fd = vfs.alloc_raw_fd();
+            let r = vfs.net.create_socket(fd, x0 as i32, x1 as i32, x2 as i32);
+            if r < 0 { (-1i64) as u64 } else { r as u64 }
+        }
+        HleBuiltin::Bind => {
+            let mut sa = vec![0u8; (x2 as usize).min(128)];
+            if uc.mem_read(x1, &mut sa).is_err() {
+                (-1i64) as u64
+            } else if let Some(addr) = crate::os::net::parse_sockaddr(&sa) {
+                let r = get_state(uc.get_data_mut()).2.net.bind(x0 as i32, addr);
+                if r < 0 { (-1i64) as u64 } else { r as u64 }
+            } else {
+                (-1i64) as u64
+            }
+        }
+        HleBuiltin::Listen => {
+            let r = get_state(uc.get_data_mut()).2.net.listen(x0 as i32);
+            if r < 0 { (-1i64) as u64 } else { r as u64 }
+        }
+        HleBuiltin::Accept => {
+            let (new_fd, res) = {
+                let (_, _, vfs) = get_state(uc.get_data_mut());
+                let nfd = vfs.alloc_raw_fd();
+                let r = vfs.net.accept(x0 as i32, nfd, x3 as i32);
+                (nfd, r)
+            };
+            match res {
+                Ok(peer) => {
+                    if x1 != 0 {
+                        let bytes = crate::os::net::serialize_sockaddr(peer);
+                        let _ = uc.mem_write(x1, &bytes);
+                        if x2 != 0 {
+                            let _ = uc.mem_write(x2, &(bytes.len() as u32).to_le_bytes());
+                        }
+                    }
+                    new_fd as u64
+                }
+                Err(_) => (-1i64) as u64,
+            }
+        }
+        HleBuiltin::Connect => {
+            let mut sa = vec![0u8; (x2 as usize).min(128)];
+            if uc.mem_read(x1, &mut sa).is_err() {
+                (-1i64) as u64
+            } else if let Some(addr) = crate::os::net::parse_sockaddr(&sa) {
+                let r = get_state(uc.get_data_mut()).2.net.connect(x0 as i32, addr);
+                if r < 0 { (-1i64) as u64 } else { r as u64 }
+            } else {
+                (-1i64) as u64
+            }
+        }
+        HleBuiltin::Send => {
+            let len = (x2 as usize).min(1024 * 1024);
+            let mut data = vec![0u8; len];
+            if len > 0 && uc.mem_read(x1, &mut data).is_err() {
+                (-1i64) as u64
+            } else {
+                let r = get_state(uc.get_data_mut()).2.net.send(x0 as i32, &data, None);
+                if r < 0 { (-1i64) as u64 } else { r as u64 }
+            }
+        }
+        HleBuiltin::Sendto => {
+            let len = (x2 as usize).min(1024 * 1024);
+            let mut data = vec![0u8; len];
+            if len > 0 && uc.mem_read(x1, &mut data).is_err() {
+                (-1i64) as u64
+            } else {
+                let dest = if x4 != 0 && x5 >= 8 {
+                    let mut sa = vec![0u8; (x5 as usize).min(128)];
+                    if uc.mem_read(x4, &mut sa).is_ok() {
+                        crate::os::net::parse_sockaddr(&sa)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                let r = get_state(uc.get_data_mut()).2.net.send(x0 as i32, &data, dest);
+                if r < 0 { (-1i64) as u64 } else { r as u64 }
+            }
+        }
+        HleBuiltin::Recv => {
+            let len = (x2 as usize).min(1024 * 1024);
+            match get_state(uc.get_data_mut()).2.net.recv(x0 as i32, len) {
+                Ok((data, _)) => {
+                    if !data.is_empty() && uc.mem_write(x1, &data).is_err() {
+                        (-1i64) as u64
+                    } else {
+                        data.len() as u64
+                    }
+                }
+                Err(_) => (-1i64) as u64,
+            }
+        }
+        HleBuiltin::Recvfrom => {
+            let len = (x2 as usize).min(1024 * 1024);
+            match get_state(uc.get_data_mut()).2.net.recv(x0 as i32, len) {
+                Ok((data, peer)) => {
+                    if !data.is_empty() && uc.mem_write(x1, &data).is_err() {
+                        return;
+                    }
+                    if let Some(p) = peer {
+                        if x4 != 0 {
+                            let bytes = crate::os::net::serialize_sockaddr(p);
+                            let _ = uc.mem_write(x4, &bytes);
+                            if x5 != 0 {
+                                let _ = uc.mem_write(x5, &(bytes.len() as u32).to_le_bytes());
+                            }
+                        }
+                    }
+                    data.len() as u64
+                }
+                Err(_) => (-1i64) as u64,
+            }
+        }
+        HleBuiltin::Shutdown => {
+            let r = get_state(uc.get_data_mut()).2.net.shutdown(x0 as i32, x1 as i32);
+            if r < 0 { (-1i64) as u64 } else { r as u64 }
+        }
+        HleBuiltin::Setsockopt => 0,
+        HleBuiltin::Getsockopt => {
+            if x3 != 0 {
+                let _ = uc.mem_write(x3, &0i32.to_le_bytes());
+            }
+            if x4 != 0 {
+                let _ = uc.mem_write(x4, &4u32.to_le_bytes());
+            }
+            0
+        }
+        HleBuiltin::Getsockname | HleBuiltin::Getpeername => {
+            let addr_opt = {
+                let (_, _, vfs) = get_state(uc.get_data_mut());
+                if matches!(builtin, HleBuiltin::Getsockname) {
+                    vfs.net.local_addr(x0 as i32)
+                } else {
+                    vfs.net.peer_addr(x0 as i32)
+                }
+            };
+            if let Some(addr) = addr_opt {
+                let bytes = crate::os::net::serialize_sockaddr(addr);
+                if x1 != 0 {
+                    let _ = uc.mem_write(x1, &bytes);
+                }
+                if x2 != 0 {
+                    let _ = uc.mem_write(x2, &(bytes.len() as u32).to_le_bytes());
+                }
+                0
+            } else {
+                (-1i64) as u64
+            }
+        }
+        HleBuiltin::Poll => {
+            let nfds = (x1 as usize).min(1024);
+            let timeout_ms = x2 as i32;
+            let mut items = Vec::with_capacity(nfds);
+            for i in 0..nfds {
+                let mut pfd = [0u8; 8];
+                if uc.mem_read(x0 + (i as u64) * 8, &mut pfd).is_ok() {
+                    items.push((
+                        i32::from_le_bytes(pfd[0..4].try_into().unwrap()),
+                        u16::from_le_bytes(pfd[4..6].try_into().unwrap()),
+                    ));
+                }
+            }
+            let revents = get_state(uc.get_data_mut()).2.net.poll_fds(&items, timeout_ms);
+            let mut count = 0u64;
+            for (i, &rev) in revents.iter().enumerate() {
+                if rev != 0 {
+                    count += 1;
+                }
+                let _ = uc.mem_write(x0 + (i as u64) * 8 + 6, &rev.to_le_bytes());
+            }
+            count
+        }
+        HleBuiltin::EpollCreate1 => {
+            let (_, _, vfs) = get_state(uc.get_data_mut());
+            let fd = vfs.alloc_raw_fd();
+            vfs.net.create_epoll(fd) as u64
+        }
+        HleBuiltin::EpollCtl => {
+            let (ev, dt) = if x3 != 0 {
+                let mut buf = [0u8; 16];
+                if uc.mem_read(x3, &mut buf).is_ok() {
+                    (
+                        u32::from_le_bytes(buf[0..4].try_into().unwrap()),
+                        u64::from_le_bytes(buf[8..16].try_into().unwrap()),
+                    )
+                } else {
+                    (0, 0)
+                }
+            } else {
+                (0, 0)
+            };
+            let r = get_state(uc.get_data_mut())
+                .2
+                .net
+                .epoll_ctl(x0 as i32, x1 as i32, x2 as i32, ev, dt);
+            if r < 0 { (-1i64) as u64 } else { r as u64 }
+        }
+        HleBuiltin::EpollWait => {
+            let max_ev = (x2 as i32).max(0) as usize;
+            let timeout_ms = x3 as i32;
+            match get_state(uc.get_data_mut())
+                .2
+                .net
+                .epoll_wait(x0 as i32, max_ev, timeout_ms)
+            {
+                Ok(ready) => {
+                    for (i, (ev, dt)) in ready.iter().enumerate() {
+                        let mut buf = [0u8; 16];
+                        buf[0..4].copy_from_slice(&ev.to_le_bytes());
+                        buf[8..16].copy_from_slice(&dt.to_le_bytes());
+                        let _ = uc.mem_write(x1 + (i as u64) * 16, &buf);
+                    }
+                    ready.len() as u64
+                }
+                Err(_) => (-1i64) as u64,
+            }
+        }
+        HleBuiltin::Eventfd => {
+            let (_, _, vfs) = get_state(uc.get_data_mut());
+            let fd = vfs.alloc_raw_fd();
+            vfs.net.create_eventfd(fd, x0, x1 as u32) as u64
+        }
+        HleBuiltin::Pipe => {
+            let (rfd, wfd, ret) = {
+                let (_, _, vfs) = get_state(uc.get_data_mut());
+                let rfd = vfs.alloc_raw_fd();
+                let wfd = vfs.alloc_raw_fd();
+                let ret = vfs.net.create_pipe(rfd, wfd, x1 as u32);
+                (rfd, wfd, ret)
+            };
+            if ret == 0 && x0 != 0 {
+                let mut pair = [0u8; 8];
+                pair[0..4].copy_from_slice(&rfd.to_le_bytes());
+                pair[4..8].copy_from_slice(&wfd.to_le_bytes());
+                let _ = uc.mem_write(x0, &pair);
+            }
+            if ret < 0 { (-1i64) as u64 } else { 0 }
+        }
+        HleBuiltin::Getaddrinfo => {
+            // int getaddrinfo(const char *node, const char *service, const struct addrinfo *hints, struct addrinfo **res)
+            let node = if x0 != 0 { read_guest_cstr(uc, x0, 256) } else { "127.0.0.1".to_string() };
+            let service = if x1 != 0 { read_guest_cstr(uc, x1, 64) } else { String::new() };
+            let port: u16 = service.parse().unwrap_or(match service.as_str() {
+                "http" => 80,
+                "https" => 443,
+                _ => 0,
+            });
+            let resolved = get_state(uc.get_data_mut()).2.net.resolve_host(&node, port);
+            match resolved {
+                Ok(addrs) if !addrs.is_empty() => {
+                    let first = addrs[0];
+                    let sa_bytes = crate::os::net::serialize_sockaddr(first);
+                    let family: i32 = match first {
+                        std::net::SocketAddr::V4(_) => crate::os::net::AF_INET,
+                        std::net::SocketAddr::V6(_) => crate::os::net::AF_INET6,
+                    };
+                    // struct addrinfo on AArch64 = 48 bytes:
+                    // 0: ai_flags(i32), 4: ai_family(i32), 8: ai_socktype(i32), 12: ai_protocol(i32),
+                    // 16: ai_addrlen(u32), 20: pad(4), 24: ai_addr(*mut sockaddr), 32: ai_canonname, 40: ai_next
+                    let (ai_ptr, sa_ptr) = {
+                        let (_, mem, _) = get_state(uc.get_data_mut());
+                        let ai = mem.alloc_heap(48).unwrap_or(0);
+                        let sa = mem.alloc_heap(sa_bytes.len() as u64).unwrap_or(0);
+                        (ai, sa)
+                    };
+                    if ai_ptr != 0 && sa_ptr != 0 && x3 != 0 {
+                        let _ = uc.mem_write(sa_ptr, &sa_bytes);
+                        let mut ai = [0u8; 48];
+                        ai[4..8].copy_from_slice(&family.to_le_bytes());
+                        ai[8..12].copy_from_slice(&crate::os::net::SOCK_STREAM.to_le_bytes());
+                        ai[16..20].copy_from_slice(&(sa_bytes.len() as u32).to_le_bytes());
+                        ai[24..32].copy_from_slice(&sa_ptr.to_le_bytes());
+                        let _ = uc.mem_write(ai_ptr, &ai);
+                        let _ = uc.mem_write(x3, &ai_ptr.to_le_bytes());
+                        0
+                    } else {
+                        (-10i64) as u64 // EAI_MEMORY
+                    }
+                }
+                _ => (-2i64) as u64, // EAI_NONAME
+            }
+        }
+        HleBuiltin::Freeaddrinfo => {
+            if x0 != 0 {
+                let sa_ptr = read_guest_u64(uc, x0 + 24);
+                let (_, mem, _) = get_state(uc.get_data_mut());
+                if sa_ptr != 0 {
+                    mem.free_heap(sa_ptr);
+                }
+                mem.free_heap(x0);
+            }
+            0
+        }
+        HleBuiltin::InetPton => {
+            let af = x0 as i32;
+            let src = read_guest_cstr(uc, x1, 64);
+            match af {
+                crate::os::net::AF_INET => {
+                    if let Ok(ip) = src.parse::<std::net::Ipv4Addr>() {
+                        let _ = uc.mem_write(x2, &ip.octets());
+                        1
+                    } else {
+                        0
+                    }
+                }
+                crate::os::net::AF_INET6 => {
+                    if let Ok(ip) = src.parse::<std::net::Ipv6Addr>() {
+                        let _ = uc.mem_write(x2, &ip.octets());
+                        1
+                    } else {
+                        0
+                    }
+                }
+                _ => (-1i64) as u64,
+            }
+        }
+        HleBuiltin::InetNtop => {
+            let af = x0 as i32;
+            let size = x3 as usize;
+            let formatted = match af {
+                crate::os::net::AF_INET => {
+                    let mut oct = [0u8; 4];
+                    if uc.mem_read(x1, &mut oct).is_ok() {
+                        Some(std::net::Ipv4Addr::from(oct).to_string())
+                    } else {
+                        None
+                    }
+                }
+                crate::os::net::AF_INET6 => {
+                    let mut oct = [0u8; 16];
+                    if uc.mem_read(x1, &mut oct).is_ok() {
+                        Some(std::net::Ipv6Addr::from(oct).to_string())
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            if let Some(s) = formatted {
+                let mut bytes = s.into_bytes();
+                bytes.push(0);
+                if bytes.len() <= size && x2 != 0 && uc.mem_write(x2, &bytes).is_ok() {
+                    x2
+                } else {
+                    0
+                }
+            } else {
+                0
+            }
+        }
+        HleBuiltin::Htons => (x0 as u16).to_be() as u64,
+        HleBuiltin::Htonl => (x0 as u32).to_be() as u64,
+        HleBuiltin::Getifaddrs => {
+            // 返回单节点 struct ifaddrs (AArch64 = 56 bytes) 对应虚拟网卡 nic
+            let nic = get_state(uc.get_data_mut()).2.net.config.nic.clone();
+            let mut name_bytes = nic.name.into_bytes();
+            name_bytes.push(0);
+            let mut sa = [0u8; 16];
+            sa[0..2].copy_from_slice(&(crate::os::net::AF_INET as u16).to_le_bytes());
+            sa[4..8].copy_from_slice(&nic.ipv4);
+            let mut nm = [0u8; 16];
+            nm[0..2].copy_from_slice(&(crate::os::net::AF_INET as u16).to_le_bytes());
+            nm[4..8].copy_from_slice(&nic.netmask);
+
+            let (ifa_ptr, name_ptr, sa_ptr, nm_ptr) = {
+                let (_, mem, _) = get_state(uc.get_data_mut());
+                (
+                    mem.alloc_heap(56).unwrap_or(0),
+                    mem.alloc_heap(name_bytes.len() as u64).unwrap_or(0),
+                    mem.alloc_heap(16).unwrap_or(0),
+                    mem.alloc_heap(16).unwrap_or(0),
+                )
+            };
+            if ifa_ptr != 0 && name_ptr != 0 && sa_ptr != 0 && nm_ptr != 0 && x0 != 0 {
+                let _ = uc.mem_write(name_ptr, &name_bytes);
+                let _ = uc.mem_write(sa_ptr, &sa);
+                let _ = uc.mem_write(nm_ptr, &nm);
+                let mut ifa = [0u8; 56];
+                ifa[8..16].copy_from_slice(&name_ptr.to_le_bytes());
+                ifa[16..20].copy_from_slice(&0x1043u32.to_le_bytes()); // IFF_UP|BROADCAST|RUNNING|MULTICAST
+                ifa[24..32].copy_from_slice(&sa_ptr.to_le_bytes());
+                ifa[32..40].copy_from_slice(&nm_ptr.to_le_bytes());
+                let _ = uc.mem_write(ifa_ptr, &ifa);
+                let _ = uc.mem_write(x0, &ifa_ptr.to_le_bytes());
+                0
+            } else {
+                (-1i64) as u64
+            }
+        }
+        HleBuiltin::Freeifaddrs => {
+            if x0 != 0 {
+                let name_ptr = read_guest_u64(uc, x0 + 8);
+                let sa_ptr = read_guest_u64(uc, x0 + 24);
+                let nm_ptr = read_guest_u64(uc, x0 + 32);
+                let (_, mem, _) = get_state(uc.get_data_mut());
+                for p in [name_ptr, sa_ptr, nm_ptr, x0] {
+                    if p != 0 {
+                        mem.free_heap(p);
+                    }
+                }
+            }
+            0
         }
         HleBuiltin::UnimplementedStub(sym) => {
             let (_, _, vfs) = get_state(uc.get_data_mut());

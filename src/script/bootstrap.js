@@ -301,6 +301,9 @@
       if (opts.realClock !== undefined) {
         __native.vfsUseRealClock(emuId, Boolean(opts.realClock));
       }
+      if (opts.net !== undefined) {
+        __native.netConfigure(emuId, opts.net);
+      }
 
       return {
         load(path) {
@@ -564,6 +567,36 @@
           },
           deviceProfile() {
             return __native.vfsDeviceProfile(emuId);
+          },
+        },
+        net: {
+          enable(netOpts = true) {
+            if (typeof netOpts === "boolean") {
+              __native.netConfigure(emuId, netOpts);
+            } else {
+              __native.netConfigure(emuId, Object.assign({ enabled: true }, netOpts || {}));
+            }
+          },
+          disable() {
+            __native.netConfigure(emuId, false);
+          },
+          setNic(nicObj) {
+            __native.netSetNic(emuId, nicObj || {});
+          },
+          nic() {
+            return __native.netNic(emuId);
+          },
+          packets() {
+            return __native.netPackets(emuId);
+          },
+          clearPackets() {
+            __native.netClearPackets(emuId);
+          },
+          onSend(fn) {
+            __native.netSetInterceptor(emuId, true, fn || null);
+          },
+          onRecv(fn) {
+            __native.netSetInterceptor(emuId, false, fn || null);
           },
         },
         trace: {
