@@ -68,6 +68,14 @@ impl JValue {
             _ => None,
         }
     }
+
+    pub fn as_long(&self) -> Option<i64> {
+        match *self {
+            Self::Long(v) => Some(v),
+            Self::Int(v) => Some(i64::from(v)),
+            _ => None,
+        }
+    }
 }
 
 /// 内置 Android/Java 常见对象模型
@@ -113,6 +121,23 @@ pub enum JObject {
     Signature(Vec<u8>),
     /// `[Ljava/lang/Object;`
     ObjectArray(Vec<JObjectRef>),
+    /// `java/lang/StringBuilder` / `java/lang/StringBuffer`
+    StringBuilder(String),
+    /// `java/util/ArrayList` / `LinkedList` / `HashSet` / `List` / `Set`
+    List {
+        class_name: String,
+        items: Vec<JObjectRef>,
+    },
+    /// `java/util/HashMap` / `LinkedHashMap` / `Map`
+    Map {
+        class_name: String,
+        entries: Vec<(JObjectRef, JObjectRef)>,
+    },
+    /// `java/util/Iterator`
+    Iterator {
+        items: Vec<JObjectRef>,
+        pos: usize,
+    },
     /// 用户自定义对象模型，支持按字段名挂载任意 `JValue`
     Custom {
         class_name: String,
@@ -142,6 +167,9 @@ impl JObject {
             Self::PackageInfo { .. } => "android/content/pm/PackageInfo",
             Self::Signature(_) => "android/content/pm/Signature",
             Self::ObjectArray(_) => "[Ljava/lang/Object;",
+            Self::StringBuilder(_) => "java/lang/StringBuilder",
+            Self::List { class_name, .. } | Self::Map { class_name, .. } => class_name.as_str(),
+            Self::Iterator { .. } => "java/util/Iterator",
             Self::Custom { class_name, .. } => class_name.as_str(),
         }
     }
@@ -458,6 +486,8 @@ impl ObjectTable {
     fn is_referenced_by_container(&self, r: JObjectRef) -> bool {
         self.objects.values().any(|obj| match obj {
             JObject::ObjectArray(elems) => elems.contains(&r),
+            JObject::List { items, .. } | JObject::Iterator { items, .. } => items.contains(&r),
+            JObject::Map { entries, .. } => entries.iter().any(|(k, v)| *k == r || *v == r),
             JObject::Custom { fields, .. } => fields.values().any(|v| v.as_object() == Some(r)),
             _ => false,
         })

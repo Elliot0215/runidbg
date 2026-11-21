@@ -1066,3 +1066,144 @@ fn js_jni_hook_field_vs_method_and_overload_isolation() {
         .expect("JNI hook field/method/overload isolation test failed");
 }
 
+#[test]
+fn js_builtin_jdk_and_android_models() {
+    let script = r#"
+        const emu = Emu.create({ packageName: "com.test.jdkmodels", hleAccel: true });
+        const envPtr = emu.jni.envPtr;
+        const vtable = Number(emu.mem.readU64(envPtr));
+        const slot = (n) => Number(emu.mem.readU64(vtable + n * 8));
+        const fnFindClass = slot(6);
+        const fnNewObject = slot(28);
+        const fnGetMethodID = slot(33);
+        const fnCallObj = slot(34);
+        const fnCallBool = slot(37);
+        const fnCallChar = slot(43);
+        const fnCallInt = slot(49);
+        const fnCallLong = slot(52);
+        const fnGetStaticMid = slot(113);
+        const fnCallStaticObj = slot(114);
+        const fnCallStaticLong = slot(132);
+
+        const buf = emu.mem.alloc(512);
+        let cur = 0;
+        const ws = (s) => { const p = buf + cur; emu.mem.writeCString(p, s); cur += s.length + 1; return p; };
+
+        // 1. StringBuilder + String.toCharArray + charAt + substring
+        const clsSb = emu.call(fnFindClass, envPtr, ws("java/lang/StringBuilder"));
+        const midSbInit = emu.call(fnGetMethodID, envPtr, clsSb, ws("<init>"), ws("(Ljava/lang/String;)V"));
+        const midSbAppS = emu.call(fnGetMethodID, envPtr, clsSb, ws("append"), ws("(Ljava/lang/String;)Ljava/lang/StringBuilder;"));
+        const midSbAppI = emu.call(fnGetMethodID, envPtr, clsSb, ws("append"), ws("(I)Ljava/lang/StringBuilder;"));
+        const midSbToStr = emu.call(fnGetMethodID, envPtr, clsSb, ws("toString"), ws("()Ljava/lang/String;"));
+
+        const sb = emu.call(fnNewObject, envPtr, clsSb, midSbInit, emu.jni.newString("hi"));
+        emu.call(fnCallObj, envPtr, sb, midSbAppS, emu.jni.newString("_"));
+        emu.call(fnCallObj, envPtr, sb, midSbAppI, 42);
+        const builtStr = emu.call(fnCallObj, envPtr, sb, midSbToStr);
+        if (emu.jni.getString(builtStr) !== "hi_42") {
+            throw new Error("StringBuilder failed: " + emu.jni.getString(builtStr));
+        }
+
+        const clsStr = emu.call(fnFindClass, envPtr, ws("java/lang/String"));
+        const midToChars = emu.call(fnGetMethodID, envPtr, clsStr, ws("toCharArray"), ws("()[C"));
+        const midCharAt = emu.call(fnGetMethodID, envPtr, clsStr, ws("charAt"), ws("(I)C"));
+        const midSub = emu.call(fnGetMethodID, envPtr, clsStr, ws("substring"), ws("(II)Ljava/lang/String;"));
+        const charsRef = emu.call(fnCallObj, envPtr, builtStr, midToChars);
+        const chars = emu.jni.getChars(charsRef);
+        if (!chars || chars.length !== 5 || chars[0] !== 0x68 || chars[4] !== 0x32) {
+            throw new Error("String.toCharArray failed");
+        }
+        if (emu.call(fnCallChar, envPtr, builtStr, midCharAt, 3) !== 0x34) {
+            throw new Error("String.charAt(3) expected '4'");
+        }
+        const subRef = emu.call(fnCallObj, envPtr, builtStr, midSub, 0, 2);
+        if (emu.jni.getString(subRef) !== "hi") {
+            throw new Error("String.substring(0,2) expected 'hi'");
+        }
+
+        // 2. ArrayList + Iterator
+        const clsList = emu.call(fnFindClass, envPtr, ws("java/util/ArrayList"));
+        const midListInit = emu.call(fnGetMethodID, envPtr, clsList, ws("<init>"), ws("()V"));
+        const midListAdd = emu.call(fnGetMethodID, envPtr, clsList, ws("add"), ws("(Ljava/lang/Object;)Z"));
+        const midListSize = emu.call(fnGetMethodID, envPtr, clsList, ws("size"), ws("()I"));
+        const midListIter = emu.call(fnGetMethodID, envPtr, clsList, ws("iterator"), ws("()Ljava/util/Iterator;"));
+        const list = emu.call(fnNewObject, envPtr, clsList, midListInit);
+        emu.call(fnCallBool, envPtr, list, midListAdd, emu.jni.newString("one"));
+        emu.call(fnCallBool, envPtr, list, midListAdd, emu.jni.newString("two"));
+        if (emu.call(fnCallInt, envPtr, list, midListSize) !== 2) {
+            throw new Error("ArrayList.size expected 2");
+        }
+        const clsIter = emu.call(fnFindClass, envPtr, ws("java/util/Iterator"));
+        const midHasNext = emu.call(fnGetMethodID, envPtr, clsIter, ws("hasNext"), ws("()Z"));
+        const midNext = emu.call(fnGetMethodID, envPtr, clsIter, ws("next"), ws("()Ljava/lang/Object;"));
+        const it = emu.call(fnCallObj, envPtr, list, midListIter);
+        const collected = [];
+        while (emu.call(fnCallBool, envPtr, it, midHasNext)) {
+            collected.push(emu.jni.getString(emu.call(fnCallObj, envPtr, it, midNext)));
+        }
+        if (collected.join(",") !== "one,two") {
+            throw new Error("Iterator mismatch: " + collected.join(","));
+        }
+
+        // 3. HashMap
+        const clsMap = emu.call(fnFindClass, envPtr, ws("java/util/HashMap"));
+        const midMapInit = emu.call(fnGetMethodID, envPtr, clsMap, ws("<init>"), ws("()V"));
+        const midMapPut = emu.call(fnGetMethodID, envPtr, clsMap, ws("put"), ws("(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;"));
+        const midMapGet = emu.call(fnGetMethodID, envPtr, clsMap, ws("get"), ws("(Ljava/lang/Object;)Ljava/lang/Object;"));
+        const map = emu.call(fnNewObject, envPtr, clsMap, midMapInit);
+        emu.call(fnCallObj, envPtr, map, midMapPut, emu.jni.newString("k"), emu.jni.newString("v"));
+        const gotV = emu.call(fnCallObj, envPtr, map, midMapGet, emu.jni.newString("k"));
+        if (emu.jni.getString(gotV) !== "v") {
+            throw new Error("HashMap.get mismatch");
+        }
+
+        // 4. Date + Random + System + Base64 + Settings$Secure
+        const clsDate = emu.call(fnFindClass, envPtr, ws("java/util/Date"));
+        const midDateInit = emu.call(fnGetMethodID, envPtr, clsDate, ws("<init>"), ws("()V"));
+        const midGetTime = emu.call(fnGetMethodID, envPtr, clsDate, ws("getTime"), ws("()J"));
+        const dateObj = emu.call(fnNewObject, envPtr, clsDate, midDateInit);
+        if (emu.call(fnCallLong, envPtr, dateObj, midGetTime) !== 1700000000000) {
+            throw new Error("Date.getTime mismatch");
+        }
+
+        const clsSys = emu.call(fnFindClass, envPtr, ws("java/lang/System"));
+        const midCurMs = emu.call(fnGetStaticMid, envPtr, clsSys, ws("currentTimeMillis"), ws("()J"));
+        const midGetProp = emu.call(fnGetStaticMid, envPtr, clsSys, ws("getProperty"), ws("(Ljava/lang/String;)Ljava/lang/String;"));
+        if (emu.call(fnCallStaticLong, envPtr, clsSys, midCurMs) !== 1700000000000) {
+            throw new Error("System.currentTimeMillis mismatch");
+        }
+        const archRef = emu.call(fnCallStaticObj, envPtr, clsSys, midGetProp, emu.jni.newString("os.arch"));
+        if (emu.jni.getString(archRef) !== "aarch64") {
+            throw new Error("System.getProperty(os.arch) mismatch");
+        }
+
+        const clsB64 = emu.call(fnFindClass, envPtr, ws("android/util/Base64"));
+        const midB64Enc = emu.call(fnGetStaticMid, envPtr, clsB64, ws("encodeToString"), ws("([BI)Ljava/lang/String;"));
+        const midB64Dec = emu.call(fnGetStaticMid, envPtr, clsB64, ws("decode"), ws("(Ljava/lang/String;I)[B"));
+        const rawBytes = emu.jni.newByteArray(new Uint8Array([0x41, 0x42, 0x43]));
+        const b64StrRef = emu.call(fnCallStaticObj, envPtr, clsB64, midB64Enc, rawBytes, 2); // NO_WRAP
+        if (emu.jni.getString(b64StrRef) !== "QUJD") {
+            throw new Error("Base64.encodeToString mismatch: " + emu.jni.getString(b64StrRef));
+        }
+        const decRef = emu.call(fnCallStaticObj, envPtr, clsB64, midB64Dec, b64StrRef, 0);
+        if (hex(emu.jni.getBytes(decRef)) !== "414243") {
+            throw new Error("Base64.decode mismatch");
+        }
+
+        const clsSec = emu.call(fnFindClass, envPtr, ws("android/provider/Settings$Secure"));
+        const midSecGet = emu.call(fnGetStaticMid, envPtr, clsSec, ws("getString"), ws("(Landroid/content/ContentResolver;Ljava/lang/String;)Ljava/lang/String;"));
+        const aidRef = emu.call(fnCallStaticObj, envPtr, clsSec, midSecGet, 0, emu.jni.newString("android_id"));
+        if (emu.jni.getString(aidRef) !== "9774d56d682e549c") {
+            throw new Error("Settings$Secure android_id mismatch");
+        }
+
+        // 5. 用户 emu.jni.hook 优先级高于内置模型
+        emu.jni.hookMethod("java/util/Date", { getTime() { return 1234567890; } });
+        if (emu.call(fnCallLong, envPtr, dateObj, midGetTime) !== 1234567890) {
+            throw new Error("user hook should override built-in Date.getTime");
+        }
+    "#;
+
+    JsRunner::run_source_with_args(script, &[]).expect("built-in JDK/Android models test failed");
+}
+

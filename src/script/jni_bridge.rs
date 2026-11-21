@@ -10,8 +10,9 @@ use rquickjs::{Ctx, Function, Object, Persistent, TypedArray, Value};
 use crate::crash::BreadcrumbRing;
 use crate::diag::EnvDiag;
 use crate::jni::handler::{
-    default_call_boolean_method, default_call_int_method, default_call_object_method,
-    default_call_static_object_method,
+    default_call_boolean_method, default_call_char_method, default_call_int_method,
+    default_call_long_method, default_call_object_method, default_call_static_long_method,
+    default_call_static_object_method, default_call_void_method,
 };
 use crate::jni::{
     FieldDesc, JObjectRef, JValue, JniContext, JniHandler, MethodDesc, ObjectTable,
@@ -626,12 +627,18 @@ impl JniHandler for JsJniHandler {
         method: &MethodDesc,
         args: &[JValue],
     ) -> u16 {
-        let cls = method.class_name.clone();
+        let cls = ctx
+            .objects
+            .get(obj)
+            .map(|o| o.class_name().to_string())
+            .unwrap_or_else(|| method.class_name.clone());
         let mut out = 0u16;
-        self.invoke_js(ctx, "CallCharMethod", &cls, Some(obj), method, args, |_, v, _| {
+        if self.invoke_js(ctx, "CallCharMethod", &cls, Some(obj), method, args, |_, v, _| {
             out = js_to_i64(&v) as u16;
-        });
-        out
+        }) {
+            return out;
+        }
+        default_call_char_method(ctx, obj, method, args)
     }
 
     fn call_short_method(
@@ -677,12 +684,18 @@ impl JniHandler for JsJniHandler {
         method: &MethodDesc,
         args: &[JValue],
     ) -> i64 {
-        let cls = method.class_name.clone();
+        let cls = ctx
+            .objects
+            .get(obj)
+            .map(|o| o.class_name().to_string())
+            .unwrap_or_else(|| method.class_name.clone());
         let mut out = 0i64;
-        self.invoke_js(ctx, "CallLongMethod", &cls, Some(obj), method, args, |_, v, _| {
+        if self.invoke_js(ctx, "CallLongMethod", &cls, Some(obj), method, args, |_, v, _| {
             out = js_to_i64(&v);
-        });
-        out
+        }) {
+            return out;
+        }
+        default_call_long_method(ctx, obj, method, args)
     }
 
     fn call_float_method(
@@ -722,8 +735,15 @@ impl JniHandler for JsJniHandler {
         method: &MethodDesc,
         args: &[JValue],
     ) {
-        let cls = method.class_name.clone();
-        self.invoke_js(ctx, "CallVoidMethod", &cls, Some(obj), method, args, |_, _, _| {});
+        let cls = ctx
+            .objects
+            .get(obj)
+            .map(|o| o.class_name().to_string())
+            .unwrap_or_else(|| method.class_name.clone());
+        if self.invoke_js(ctx, "CallVoidMethod", &cls, Some(obj), method, args, |_, _, _| {}) {
+            return;
+        }
+        default_call_void_method(ctx, obj, method, args);
     }
 
     fn call_static_byte_method(
@@ -790,10 +810,12 @@ impl JniHandler for JsJniHandler {
         args: &[JValue],
     ) -> i64 {
         let mut out = 0i64;
-        self.invoke_js(ctx, "CallStaticLongMethod", class_name, None, method, args, |_, v, _| {
+        if self.invoke_js(ctx, "CallStaticLongMethod", class_name, None, method, args, |_, v, _| {
             out = js_to_i64(&v);
-        });
-        out
+        }) {
+            return out;
+        }
+        default_call_static_long_method(ctx, class_name, method, args)
     }
 
     fn call_static_float_method(
