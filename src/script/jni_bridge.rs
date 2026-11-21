@@ -75,23 +75,139 @@ pub(crate) fn with_active_objects<R>(f: impl FnOnce(&mut ObjectTable) -> R) -> O
 }
 
 /// 存储每个模拟器实例注册的 JS JNI 回调表
+///
+/// 按 `field_hooks`（字段专属）、`method_hooks`（方法专属，支持精确签名重载）与
+/// `hooks`（历史兼容的按名通用表）分表存储，彻底消除同名字段与方法互相劫持。
 #[derive(Default)]
 pub(crate) struct JsHookTable {
     pub hooks: HashMap<(String, String), Persistent<Function<'static>>>,
+    pub field_hooks: HashMap<(String, String, Option<String>), Persistent<Function<'static>>>,
+    pub method_hooks: HashMap<(String, String, Option<String>), Persistent<Function<'static>>>,
     pub unhandled: Option<Persistent<Function<'static>>>,
     pub diag: EnvDiag,
     pub breadcrumbs: BreadcrumbRing,
 }
 
 impl JsHookTable {
+    /// 智能注册：
+    /// - 含 `(`（如 `"g()Lcas/c0;"`）→ 方法专属 + 精确签名；
+    /// - 含 `:`（如 `"g:[C"` 或 `"field:g"`）→ 字段专属（可选签名）；
+    /// - 纯名称（如 `"getValue"`）→ 兼容旧版通用表。
     pub fn insert_hook(
         &mut self,
         class_name: &str,
-        method_name: &str,
+        key: &str,
+        func: Persistent<Function<'static>>,
+    ) {
+        if key.contains('(') {
+            self.insert_method_hook(class_name, key, func);
+        } else if let Some(rest) = key.strip_prefix("field:") {
+            self.insert_field_hook(class_name, rest, func);
+        } else if key.contains(':') {
+            self.insert_field_hook(class_name, key, func);
+        } else {
+            let norm = class_name.replace('.', "/");
+            self.hooks.insert((norm, key.to_string()), func);
+        }
+    }
+
+    /// 显式注册字段 Hook（支持 `"name"` 或 `"name:sig"`，绝不劫持同名方法）
+    pub fn insert_field_hook(
+        &mut self,
+        class_name: &str,
+        key: &str,
         func: Persistent<Function<'static>>,
     ) {
         let norm = class_name.replace('.', "/");
-        self.hooks.insert((norm, method_name.to_string()), func);
+        let (name, sig) = match key.split_once(':') {
+            Some((n, s)) if !s.is_empty() => (n.to_string(), Some(s.to_string())),
+            _ => (key.to_string(), None),
+        };
+        self.field_hooks.insert((norm, name, sig), func);
+    }
+
+    /// 显式注册方法 Hook（支持 `"name"` 或 `"name(args)ret"` 精确重载签名，绝不劫持同名字段）
+    pub fn insert_method_hook(
+        &mut self,
+        class_name: &str,
+        key: &str,
+        func: Persistent<Function<'static>>,
+    ) {
+        let norm = class_name.replace('.', "/");
+        let (name, sig) = match key.find('(') {
+            Some(idx) => (key[..idx].to_string(), Some(key[idx..].to_string())),
+            None => (key.to_string(), None),
+        };
+        self.method_hooks.insert((norm, name, sig), func);
+    }
+
+    /// 查找字段或方法 Hook（按 精确签名 > 同类无签名 > 声明类精确签名 > 声明类无签名 > 旧版通用表）
+    pub fn lookup(
+        &self,
+        norm_cls: &str,
+        decl_cls: &str,
+        name: &str,
+        sig: &str,
+        is_field: bool,
+    ) -> Option<Persistent<Function<'static>>> {
+        let typed_map = if is_field {
+            &self.field_hooks
+        } else {
+            &self.method_hooks
+        };
+        let sig_opt = (!sig.is_empty()).then(|| sig.to_string());
+        if let Some(ref s) = sig_opt {
+            if let Some(f) = typed_map.get(&(norm_cls.to_string(), name.to_string(), Some(s.clone()))) {
+                return Some(f.clone());
+            }
+        }
+        if let Some(f) = typed_map.get(&(norm_cls.to_string(), name.to_string(), None)) {
+            return Some(f.clone());
+        }
+        if decl_cls != norm_cls {
+            if let Some(ref s) = sig_opt {
+                if let Some(f) = typed_map.get(&(decl_cls.to_string(), name.to_string(), Some(s.clone()))) {
+                    return Some(f.clone());
+                }
+            }
+            if let Some(f) = typed_map.get(&(decl_cls.to_string(), name.to_string(), None)) {
+                return Some(f.clone());
+            }
+        }
+        if let Some(f) = self.hooks.get(&(norm_cls.to_string(), name.to_string())) {
+            return Some(f.clone());
+        }
+        if decl_cls != norm_cls {
+            if let Some(f) = self.hooks.get(&(decl_cls.to_string(), name.to_string())) {
+                return Some(f.clone());
+            }
+        }
+        None
+    }
+
+    /// 枚举全部已注册 Hook（返回 `(kind, class_name, name, sig)`，已排序）
+    pub fn list_hooks(&self) -> Vec<(&'static str, String, String, Option<String>)> {
+        let mut out = Vec::with_capacity(
+            self.field_hooks.len() + self.method_hooks.len() + self.hooks.len(),
+        );
+        for (cls, name, sig) in self.field_hooks.keys() {
+            out.push(("field", cls.clone(), name.clone(), sig.clone()));
+        }
+        for (cls, name, sig) in self.method_hooks.keys() {
+            out.push(("method", cls.clone(), name.clone(), sig.clone()));
+        }
+        for (cls, name) in self.hooks.keys() {
+            out.push(("any", cls.clone(), name.clone(), None));
+        }
+        out.sort();
+        out
+    }
+
+    pub fn clear_all(&mut self) {
+        self.hooks.clear();
+        self.field_hooks.clear();
+        self.method_hooks.clear();
+        self.unhandled = None;
     }
 
     pub fn set_unhandled(&mut self, func: Persistent<Function<'static>>) {
@@ -123,19 +239,11 @@ impl JsJniHandler {
         };
         let norm_cls = class_name.replace('.', "/");
         let decl_cls = method.class_name.replace('.', "/");
-        let hook_fn = {
-            let tbl = self.table.borrow();
-            tbl.hooks
-                .get(&(norm_cls.clone(), method.name.clone()))
-                .or_else(|| {
-                    if decl_cls != norm_cls {
-                        tbl.hooks.get(&(decl_cls.clone(), method.name.clone()))
-                    } else {
-                        None
-                    }
-                })
-                .cloned()
-        };
+        let is_field = !method.sig.starts_with('(');
+        let hook_fn = self
+            .table
+            .borrow()
+            .lookup(&norm_cls, &decl_cls, &method.name, &method.sig, is_field);
         let Some(pfn) = hook_fn else {
             return false;
         };

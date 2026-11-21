@@ -202,8 +202,7 @@ impl Drop for JsSession {
         let mut h = self.host.borrow_mut();
         h.module_cache.clear();
         for entry in &mut h.emus {
-            entry.hooks.borrow_mut().hooks.clear();
-            entry.hooks.borrow_mut().unhandled = None;
+            entry.hooks.borrow_mut().clear_all();
             entry.emu.jni_mut().jni_tracer.set_listener(None);
             entry.native_hooks.borrow_mut().clear_all(entry.emu.uc_mut());
         }

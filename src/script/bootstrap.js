@@ -506,6 +506,31 @@
               __native.jniHook(emuId, String(className), methodName, fn);
             }
           },
+          hookField(className, fields) {
+            if (!fields || typeof fields !== "object") {
+              throw new TypeError("jni.hookField(className, fields) expects an object of functions");
+            }
+            for (const [fieldKey, fn] of Object.entries(fields)) {
+              if (typeof fn !== "function") {
+                throw new TypeError(`jni.hookField: ${className}.${fieldKey} must be a function`);
+              }
+              __native.jniHookField(emuId, String(className), fieldKey, fn);
+            }
+          },
+          hookMethod(className, methods) {
+            if (!methods || typeof methods !== "object") {
+              throw new TypeError("jni.hookMethod(className, methods) expects an object of functions");
+            }
+            for (const [methodKey, fn] of Object.entries(methods)) {
+              if (typeof fn !== "function") {
+                throw new TypeError(`jni.hookMethod: ${className}.${methodKey} must be a function`);
+              }
+              __native.jniHookMethod(emuId, String(className), methodKey, fn);
+            }
+          },
+          listHooks() {
+            return __native.jniListHooks(emuId);
+          },
           onUnhandled(fn) {
             if (typeof fn !== "function") {
               throw new TypeError("jni.onUnhandled expects a function");

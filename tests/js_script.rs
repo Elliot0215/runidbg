@@ -987,3 +987,82 @@ fn js_jni_hook_interface_dispatch_and_per_instance_this() {
         .expect("JNI interface hook & per-instance this dispatch test failed");
 }
 
+#[test]
+fn js_jni_hook_field_vs_method_and_overload_isolation() {
+    let script = r#"
+        const emu = Emu.create({ packageName: "com.test.hookiso", hleAccel: true });
+        const envPtr = emu.jni.envPtr;
+        const vtable = Number(emu.mem.readU64(envPtr));
+        const fnFindClass = Number(emu.mem.readU64(vtable + 6 * 8));
+        const fnGetMethodID = Number(emu.mem.readU64(vtable + 33 * 8));
+        const fnCallObjectMethod = Number(emu.mem.readU64(vtable + 34 * 8));
+        const fnGetFieldID = Number(emu.mem.readU64(vtable + 94 * 8));
+        const fnGetObjectField = Number(emu.mem.readU64(vtable + 95 * 8));
+
+        const buf = emu.mem.alloc(256);
+        const ws = (off, s) => { emu.mem.writeCString(buf + off, s); return buf + off; };
+
+        const c0Obj = emu.jni.newObject("cas/c0");
+        const g0Obj = emu.jni.newObject("cas/g0");
+        const a1Obj = emu.jni.newObject("cas/a1");
+
+        // 1. 同类 cas/g0 上同时注册同名字段 g、无参方法 g()Lcas/c0;、重载方法 g(I)Ljava/lang/String;
+        emu.jni.hookField("cas/g0", {
+            g() { return "field-g-val"; },
+        });
+        emu.jni.hookMethod("cas/g0", {
+            "g()Lcas/c0;"() { return c0Obj; },
+            "g(I)Ljava/lang/String;"(self, n) { return "overload-int:" + n; },
+        });
+
+        // 2. cas/a1 只注册字段 a，绝不能劫持同名方法 a()
+        emu.jni.hookField("cas/a1", {
+            "a:Ljava/lang/String;"() { return "only-field-a"; },
+        });
+
+        const clsG0 = emu.call(fnFindClass, envPtr, ws(0, "cas/g0"));
+        const clsA1 = emu.call(fnFindClass, envPtr, ws(16, "cas/a1"));
+        const fidG0G = emu.call(fnGetFieldID, envPtr, clsG0, ws(32, "g"), ws(40, "Ljava/lang/String;"));
+        const midG0G0 = emu.call(fnGetMethodID, envPtr, clsG0, ws(32, "g"), ws(64, "()Lcas/c0;"));
+        const midG0G1 = emu.call(fnGetMethodID, envPtr, clsG0, ws(32, "g"), ws(80, "(I)Ljava/lang/String;"));
+        const fidA1A = emu.call(fnGetFieldID, envPtr, clsA1, ws(112, "a"), ws(40, "Ljava/lang/String;"));
+        const midA1A = emu.call(fnGetMethodID, envPtr, clsA1, ws(112, "a"), ws(120, "()Ljava/lang/String;"));
+
+        const gotFieldG = emu.call(fnGetObjectField, envPtr, g0Obj, fidG0G);
+        if (emu.jni.getString(gotFieldG) !== "field-g-val") {
+            throw new Error("field g hijacked or wrong: " + emu.jni.getString(gotFieldG));
+        }
+        const gotMethodG0 = emu.call(fnCallObjectMethod, envPtr, g0Obj, midG0G0);
+        if (gotMethodG0 !== c0Obj) {
+            throw new Error(`method g() expected c0Obj=${c0Obj}, got ${gotMethodG0}`);
+        }
+        const gotMethodG1 = emu.call(fnCallObjectMethod, envPtr, g0Obj, midG0G1, 7);
+        if (emu.jni.getString(gotMethodG1) !== "overload-int:7") {
+            throw new Error("overload g(I) wrong: " + emu.jni.getString(gotMethodG1));
+        }
+
+        const gotA1Field = emu.call(fnGetObjectField, envPtr, a1Obj, fidA1A);
+        if (emu.jni.getString(gotA1Field) !== "only-field-a") {
+            throw new Error("cas/a1.a field hook failed");
+        }
+        const gotA1Method = emu.call(fnCallObjectMethod, envPtr, a1Obj, midA1A);
+        if (gotA1Method !== 0) {
+            throw new Error("cas/a1.a() method should NOT be hijacked by field hook, got " + gotA1Method);
+        }
+
+        // 3. listHooks() 枚举已注册类别与签名
+        const hooks = emu.jni.listHooks();
+        if (hooks.length !== 4) {
+            throw new Error("expected 4 hooks, got " + JSON.stringify(hooks));
+        }
+        const hasFieldG = hooks.some((h) => h.kind === "field" && h.className === "cas/g0" && h.name === "g");
+        const hasMethodG0 = hooks.some((h) => h.kind === "method" && h.className === "cas/g0" && h.name === "g" && h.sig === "()Lcas/c0;");
+        if (!hasFieldG || !hasMethodG0) {
+            throw new Error("listHooks missing expected entries: " + JSON.stringify(hooks));
+        }
+    "#;
+
+    JsRunner::run_source_with_args(script, &[])
+        .expect("JNI hook field/method/overload isolation test failed");
+}
+

@@ -250,15 +250,29 @@ interface JniTraceNamespace {
   onEvent(cb: ((ev: JniTraceEvent) => void) | null): void;
 }
 
+interface JniRegisteredHookInfo {
+  readonly kind: "field" | "method" | "any";
+  readonly className: string;
+  readonly name: string;
+  readonly sig: string | null;
+}
+
 interface JniNamespace {
   readonly envPtr: number;
   /**
    * 拦截指定类（或接口/父类）的 JNI 方法或字段读取（支持运行时子类自动回退到声明接口/父类）。
-   * - 实例方法：第 1 个实参为 `self`（`this` 的 `jobject` 句柄），后续为 Java 实参；同时 JS `this` 绑定为 `{ ref, className, declaringClass, name, sig, isStatic }`。
-   * - 静态方法：实参直接为 Java 实参。
-   * - 优先级：用户 `emu.jni.hook` > 内置 Java 模型 > `onUnhandled`。
+   * - 带 `(` 的键（如 `"g()Lcas/c0;"`）自动注册为**方法专属 + 精确签名**；
+   * - 带 `:` 的键（如 `"g:Ljava/lang/String;"` / `"field:g"`）自动注册为**字段专属**；
+   * - 纯名称键注册到兼容通用表（建议存在字段/方法同名冲突时直接使用 `hookField` / `hookMethod`）。
+   * - 优先级：精确签名专属 Hook > 无签名专属 Hook > 声明类专属 Hook > 通用 Hook > 内置模型 > `onUnhandled`。
    */
   hook(className: string, methods: Record<string, (...args: any[]) => any>): void;
+  /** 显式注册**字段专属** Hook（支持 `"g"` 或 `"g:[C"`，绝不劫持同名方法） */
+  hookField(className: string, fields: Record<string, (...args: any[]) => any>): void;
+  /** 显式注册**方法专属** Hook（支持 `"g"` 或 `"g()Lcas/c0;"` 精确重载签名，绝不劫持同名字段） */
+  hookMethod(className: string, methods: Record<string, (...args: any[]) => any>): void;
+  /** 列出全部已注册的 JNI Hook（含类别 `field`/`method`/`any` 与签名，便于排查命中问题） */
+  listHooks(): JniRegisteredHookInfo[];
   onUnhandled(callback: (info: UnhandledJniInfo) => any): void;
   registeredNatives(): RegisteredNativeInfo[];
   /**

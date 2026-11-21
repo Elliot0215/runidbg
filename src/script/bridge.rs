@@ -602,6 +602,84 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
+    // jniHookField(emuId, className, fieldKey, fn)
+    {
+        let handles_table = Rc::clone(&handles_table);
+        native.set(
+            "jniHookField",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      cls: String,
+                      field_key: String,
+                      func: Function<'js>|
+                      -> rquickjs::Result<()> {
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
+                    let pfn = Persistent::save(&ctx, func);
+                    handles
+                        .jni_hooks
+                        .borrow_mut()
+                        .insert_field_hook(&cls, &field_key, pfn);
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    // jniHookMethod(emuId, className, methodKey, fn)
+    {
+        let handles_table = Rc::clone(&handles_table);
+        native.set(
+            "jniHookMethod",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      cls: String,
+                      method_key: String,
+                      func: Function<'js>|
+                      -> rquickjs::Result<()> {
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
+                    let pfn = Persistent::save(&ctx, func);
+                    handles
+                        .jni_hooks
+                        .borrow_mut()
+                        .insert_method_hook(&cls, &method_key, pfn);
+                    Ok(())
+                },
+            )?,
+        )?;
+    }
+
+    // jniListHooks(emuId) -> Array<{ kind, className, name, sig }>
+    {
+        let handles_table = Rc::clone(&handles_table);
+        native.set(
+            "jniListHooks",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize| -> rquickjs::Result<Array<'js>> {
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
+                    let list = handles.jni_hooks.borrow().list_hooks();
+                    let arr = Array::new(ctx.clone())?;
+                    for (i, (kind, cls, name, sig)) in list.into_iter().enumerate() {
+                        let obj = Object::new(ctx.clone())?;
+                        obj.set("kind", kind)?;
+                        obj.set("className", cls)?;
+                        obj.set("name", name)?;
+                        match sig {
+                            Some(s) => obj.set("sig", s)?,
+                            None => obj.set("sig", Value::new_null(ctx.clone()))?,
+                        }
+                        arr.set(i, obj)?;
+                    }
+                    Ok(arr)
+                },
+            )?,
+        )?;
+    }
+
     // jniOnUnhandled(emuId, fn)
     {
         let handles_table = Rc::clone(&handles_table);
