@@ -237,6 +237,10 @@ interface JniTraceEvent {
   readonly args: string[];
   readonly ret: string;
   readonly isNull: boolean;
+  /** 本次调用是否命中了用户通过 `hook`/`hookField`/`hookMethod` 注册的 JS Hook */
+  readonly handled: boolean;
+  /** 命中的 Hook 唯一 ID（对应 `listHooks()[i].id`）；未命中 Hook 时为 `null` */
+  readonly hookId: number | null;
 }
 
 interface JniTraceNamespace {
@@ -251,10 +255,12 @@ interface JniTraceNamespace {
 }
 
 interface JniRegisteredHookInfo {
+  readonly id: number;
   readonly kind: "field" | "method" | "any";
   readonly className: string;
   readonly name: string;
   readonly sig: string | null;
+  readonly hits: number;
 }
 
 interface JniNamespace {
@@ -295,7 +301,7 @@ interface JniNamespace {
   ): number;
   findClass(className: string): number;
   newString(value: string): number;
-  newByteArray(bytes: Uint8Array): number;
+  newByteArray(bytes: Uint8Array | number[]): number;
   /** 创建 `[C` (`jcharArray`, UTF-16) 对象 */
   newCharArray(input: string | Uint16Array | number[]): number;
   /** 创建 `[I` (`jintArray`) 对象 */
@@ -309,15 +315,23 @@ interface JniNamespace {
   getObjectArray(ref: number | bigint): number[] | null;
   getString(ref: number | bigint): string | null;
   getBytes(ref: number | bigint): Uint8Array | null;
-  /** 读取 `[C` (`jcharArray`, UTF-16) 内容 */
+  /** 读取 `[C` (`jcharArray`, UTF-16) 内容（TypedArray 视图，支持在 Hook 回调内重入） */
   getChars(ref: number | bigint): Uint16Array | null;
-  /** 读取 `[I` (`jintArray`) 内容 */
+  /** 读取 `[I` (`jintArray`) 内容（TypedArray 视图，支持在 Hook 回调内重入） */
   getInts(ref: number | bigint): Int32Array | null;
-  /** 读取 `[J` (`jlongArray`) 内容 */
+  /** 读取 `[J` (`jlongArray`) 内容（TypedArray 视图，支持在 Hook 回调内重入） */
   getLongs(ref: number | bigint): BigInt64Array | null;
-  /** 设置实例对象字段（支持基本类型、string、TypedArray、jobject 句柄及可选 JNI 签名 `sig`） */
+  /** 读取 `[B` (`jbyteArray`) 为普通 `number[]`（无效/非数组句柄返回 `[]`，支持在 Hook 回调内重入） */
+  getByteArray(ref: number | bigint): number[];
+  /** 读取 `[I` (`jintArray`) 为普通 `number[]`（无效/非数组句柄返回 `[]`，支持在 Hook 回调内重入） */
+  getIntArray(ref: number | bigint): number[];
+  /** 读取 `[J` (`jlongArray`) 为普通 `number[]`（无效/非数组句柄返回 `[]`，支持在 Hook 回调内重入） */
+  getLongArray(ref: number | bigint): number[];
+  /** 读取 `[C` (`jcharArray`, UTF-16) 为 JS 字符串（无效/非数组句柄返回 `""`，支持在 Hook 回调内重入） */
+  getCharArray(ref: number | bigint): string;
+  /** 设置实例对象字段（支持基本类型、string、TypedArray、jobject 句柄及可选 JNI 签名 `sig`；支持在 Hook 回调内重入） */
   setField(objRef: number | bigint, fieldName: string, value: unknown, sig?: string): void;
-  /** 查询实例对象字段：基本类型返回原值，对象/数组字段返回 `jobject` 句柄（配合 `getString`/`getBytes`/`getChars`/`getInts` 读取内容），未设置返回 `null` */
+  /** 查询实例对象字段：基本类型返回原值，对象/数组字段返回 `jobject` 句柄，未设置返回 `null`；支持在 Hook 回调内重入 */
   getField(objRef: number | bigint, fieldName: string): unknown;
   /** 设置类静态字段（支持基本类型、string、Uint8Array(`[B`)、Uint16Array(`[C`)、Int32Array(`[I`)、BigInt64Array(`[J`)、jobject 句柄及可选 JNI 签名 `sig`） */
   setStaticField(className: string, fieldName: string, value: unknown, sig?: string): void;

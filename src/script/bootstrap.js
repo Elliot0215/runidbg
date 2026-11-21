@@ -566,8 +566,11 @@
             return __native.jniNewString(emuId, String(s));
           },
           newByteArray(bytes) {
+            if (Array.isArray(bytes)) {
+              bytes = new Uint8Array(bytes);
+            }
             if (!(bytes instanceof Uint8Array)) {
-              throw new TypeError("jni.newByteArray expects a Uint8Array");
+              throw new TypeError("jni.newByteArray expects a Uint8Array or number[]");
             }
             return __native.jniNewByteArray(emuId, bytes);
           },
@@ -618,6 +621,27 @@
           },
           getLongs(ref) {
             return __native.jniGetLongs(emuId, toAddr(ref)) ?? null;
+          },
+          getByteArray(ref) {
+            const ta = __native.jniGetBytes(emuId, toAddr(ref));
+            return ta ? Array.from(ta) : [];
+          },
+          getIntArray(ref) {
+            const ta = __native.jniGetInts(emuId, toAddr(ref));
+            return ta ? Array.from(ta) : [];
+          },
+          getLongArray(ref) {
+            const ta = __native.jniGetLongs(emuId, toAddr(ref));
+            return ta ? Array.from(ta, Number) : [];
+          },
+          getCharArray(ref) {
+            const ta = __native.jniGetChars(emuId, toAddr(ref));
+            if (!ta || ta.length === 0) return "";
+            let out = "";
+            for (let i = 0; i < ta.length; i += 4096) {
+              out += String.fromCharCode(...ta.subarray(i, Math.min(i + 4096, ta.length)));
+            }
+            return out;
           },
           setField(objRef, fieldName, value, sig) {
             __native.jniSetField(

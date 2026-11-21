@@ -38,7 +38,12 @@ fn with_uc<R>(
     if let Some(res) = with_active_uc(|uc| (f.take().unwrap())(uc)) {
         return res;
     }
-    let mut h = host.borrow_mut();
+    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
     let entry = h
         .emus
         .get_mut(emu_id)
@@ -67,7 +72,7 @@ fn js_val_to_jvalue(v: &Value<'_>) -> JValue {
 fn js_field_val_to_jvalue<'js>(
     val: Value<'js>,
     sig_str: &str,
-    vm: &mut crate::jni::JniVm,
+    objects: &mut crate::jni::ObjectTable,
 ) -> rquickjs::Result<JValue> {
     if val.is_null() || val.is_undefined() {
         Ok(JValue::Object(JObjectRef::NULL))
@@ -76,16 +81,13 @@ fn js_field_val_to_jvalue<'js>(
     } else if let Some(s) = val.as_string() {
         let rust_s = s.to_string()?;
         let r = if sig_str == "[C" {
-            vm.objects
-                .add_char_array(rust_s.encode_utf16().collect::<Vec<u16>>())
+            objects.add_char_array(rust_s.encode_utf16().collect::<Vec<u16>>())
         } else {
-            vm.objects.add_string(rust_s)
+            objects.add_string(rust_s)
         };
         Ok(JValue::Object(r))
     } else if let Ok(ta) = TypedArray::<u8>::from_value(val.clone()) {
-        let r = vm
-            .objects
-            .add_byte_array(ta.as_bytes().unwrap_or(&[]).to_vec());
+        let r = objects.add_byte_array(ta.as_bytes().unwrap_or(&[]).to_vec());
         Ok(JValue::Object(r))
     } else if let Ok(ta) = TypedArray::<u16>::from_value(val.clone()) {
         let chars: Vec<u16> = ta
@@ -96,7 +98,7 @@ fn js_field_val_to_jvalue<'js>(
             .iter()
             .map(|&c| u16::from_le_bytes(c))
             .collect();
-        let r = vm.objects.add_char_array(chars);
+        let r = objects.add_char_array(chars);
         Ok(JValue::Object(r))
     } else if let Ok(ta) = TypedArray::<i32>::from_value(val.clone()) {
         let ints: Vec<i32> = ta
@@ -107,7 +109,7 @@ fn js_field_val_to_jvalue<'js>(
             .iter()
             .map(|&c| i32::from_le_bytes(c))
             .collect();
-        let r = vm.objects.add_int_array(ints);
+        let r = objects.add_int_array(ints);
         Ok(JValue::Object(r))
     } else if let Ok(ta) = TypedArray::<i64>::from_value(val.clone()) {
         let longs: Vec<i64> = ta
@@ -118,7 +120,7 @@ fn js_field_val_to_jvalue<'js>(
             .iter()
             .map(|&c| i64::from_le_bytes(c))
             .collect();
-        let r = vm.objects.add_long_array(longs);
+        let r = objects.add_long_array(longs);
         Ok(JValue::Object(r))
     } else if let Some(bi) = val.as_big_int() {
         Ok(JValue::Long(bi.clone().to_i64().unwrap_or(0)))
@@ -134,7 +136,7 @@ fn js_field_val_to_jvalue<'js>(
             "D" => JValue::Double(n),
             _ => {
                 let cand = JObjectRef(n as u64);
-                if vm.objects.get(cand).is_some() {
+                if objects.get(cand).is_some() {
                     JValue::Object(cand)
                 } else {
                     JValue::Int(n as i32)
@@ -204,6 +206,11 @@ fn jni_trace_event_to_js<'js>(
     obj.set("args", args)?;
     obj.set("ret", ev.ret.as_str())?;
     obj.set("isNull", ev.is_null)?;
+    obj.set("handled", ev.handled)?;
+    match ev.hook_id {
+        Some(id) => obj.set("hookId", id as f64)?,
+        None => obj.set("hookId", Value::new_null(ctx.clone()))?,
+    }
     Ok(obj)
 }
 
@@ -339,7 +346,12 @@ pub(super) fn register_native_bridge<'js>(
                         hb.diag = emu.diag().clone();
                         hb.breadcrumbs = emu.breadcrumbs().clone();
                     }
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let id = h.emus.len();
                     handles_table.borrow_mut().push(EmuSharedHandles {
                         jni_hooks: Rc::clone(&hooks),
@@ -372,7 +384,12 @@ pub(super) fn register_native_bridge<'js>(
                       run_init: bool|
                       -> rquickjs::Result<Object<'js>> {
                     let _guard = JsCtxGuard::enter(&ctx);
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -404,7 +421,12 @@ pub(super) fn register_native_bridge<'js>(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, emu_id: usize, mod_id: usize| -> rquickjs::Result<()> {
                     let _guard = JsCtxGuard::enter(&ctx);
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -436,7 +458,12 @@ pub(super) fn register_native_bridge<'js>(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, emu_id: usize, mod_id: usize| -> rquickjs::Result<i32> {
                     let _guard = JsCtxGuard::enter(&ctx);
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -515,7 +542,12 @@ pub(super) fn register_native_bridge<'js>(
                       raw_args: Vec<f64>|
                       -> rquickjs::Result<f64> {
                     let _guard = JsCtxGuard::enter(&ctx);
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -557,7 +589,12 @@ pub(super) fn register_native_bridge<'js>(
                       raw_args: Vec<f64>|
                       -> rquickjs::Result<f64> {
                     let _guard = JsCtxGuard::enter(&ctx);
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -652,7 +689,7 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
-    // jniListHooks(emuId) -> Array<{ kind, className, name, sig }>
+    // jniListHooks(emuId) -> Array<{ id, kind, className, name, sig, hits }>
     {
         let handles_table = Rc::clone(&handles_table);
         native.set(
@@ -663,15 +700,17 @@ pub(super) fn register_native_bridge<'js>(
                     let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
                     let list = handles.jni_hooks.borrow().list_hooks();
                     let arr = Array::new(ctx.clone())?;
-                    for (i, (kind, cls, name, sig)) in list.into_iter().enumerate() {
+                    for (i, info) in list.into_iter().enumerate() {
                         let obj = Object::new(ctx.clone())?;
-                        obj.set("kind", kind)?;
-                        obj.set("className", cls)?;
-                        obj.set("name", name)?;
-                        match sig {
+                        obj.set("id", info.id as f64)?;
+                        obj.set("kind", info.kind)?;
+                        obj.set("className", info.class_name)?;
+                        obj.set("name", info.name)?;
+                        match info.sig {
                             Some(s) => obj.set("sig", s)?,
                             None => obj.set("sig", Value::new_null(ctx.clone()))?,
                         }
+                        obj.set("hits", info.hits as f64)?;
                         arr.set(i, obj)?;
                     }
                     Ok(arr)
@@ -740,7 +779,12 @@ pub(super) fn register_native_bridge<'js>(
                       this_obj: f64|
                       -> rquickjs::Result<f64> {
                     let _guard = JsCtxGuard::enter(&ctx);
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -779,7 +823,12 @@ pub(super) fn register_native_bridge<'js>(
                     if let Some(r) = with_active_objects(|objs| objs.add_string(s.clone())) {
                         return Ok(r.0 as f64);
                     }
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -965,7 +1014,12 @@ pub(super) fn register_native_bridge<'js>(
                     if let Some(r) = with_active_objects(|objs| objs.add_local(jobj.clone())) {
                         return Ok(r.0 as f64);
                     }
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -1013,7 +1067,12 @@ pub(super) fn register_native_bridge<'js>(
                     if let Some(r) = with_active_objects(|objs| objs.find_or_create_class(&norm)) {
                         return Ok(r.0 as f64);
                     }
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -1040,7 +1099,12 @@ pub(super) fn register_native_bridge<'js>(
                     if let Some(r) = with_active_objects(build) {
                         return Ok(r.0 as f64);
                     }
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -1109,7 +1173,12 @@ pub(super) fn register_native_bridge<'js>(
                     {
                         return Ok(r.0 as f64);
                     }
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -1294,7 +1363,7 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
-    // jniSetField(emuId, objRef, fieldName, val, sig?) -> void
+    // jniSetField(emuId, objRef, fieldName, val, sig?) -> void（支持在 JNI 回调内重入调用）
     {
         let host = Rc::clone(host);
         native.set(
@@ -1308,10 +1377,32 @@ pub(super) fn register_native_bridge<'js>(
                       val: Value<'js>,
                       sig: Option<String>|
                       -> rquickjs::Result<()> {
+                    let jref = JObjectRef(obj_ref as u64);
+                    let sig_str = sig.as_deref().unwrap_or("");
+                    let mut val_opt = Some(val);
+                    if let Some(res) = with_active_objects(|objs| {
+                        let jval =
+                            js_field_val_to_jvalue(val_opt.take().unwrap(), sig_str, objs)?;
+                        if let JValue::Object(r) = jval {
+                            if !r.is_null() {
+                                objs.new_global(r);
+                            }
+                        }
+                        if let Some(JObject::Custom { fields, .. }) = objs.get_mut(jref) {
+                            fields.insert(field_name.clone(), jval);
+                        }
+                        Ok(())
+                    }) {
+                        return res;
+                    }
                     with_uc(&ctx, &host, emu_id, |uc| {
                         let vm = &mut uc.get_data_mut().jni;
-                        let jval = js_field_val_to_jvalue(val, sig.as_deref().unwrap_or(""), vm)?;
-                        vm.set_instance_field(JObjectRef(obj_ref as u64), &field_name, jval);
+                        let jval = js_field_val_to_jvalue(
+                            val_opt.take().unwrap(),
+                            sig_str,
+                            &mut vm.objects,
+                        )?;
+                        vm.set_instance_field(jref, &field_name, jval);
                         Ok(())
                     })
                 },
@@ -1319,7 +1410,7 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
-    // jniGetField(emuId, objRef, fieldName) -> Value
+    // jniGetField(emuId, objRef, fieldName) -> Value（支持在 JNI 回调内重入调用）
     {
         let host = Rc::clone(host);
         native.set(
@@ -1331,12 +1422,20 @@ pub(super) fn register_native_bridge<'js>(
                       obj_ref: f64,
                       field_name: String|
                       -> rquickjs::Result<Value<'js>> {
-                    let stored = with_uc(&ctx, &host, emu_id, |uc| {
-                        Ok(uc
-                            .get_data()
-                            .jni
-                            .get_instance_field(JObjectRef(obj_ref as u64), &field_name))
-                    })?;
+                    let jref = JObjectRef(obj_ref as u64);
+                    let stored = if let Some(res) = with_active_objects(|objs| {
+                        if let Some(JObject::Custom { fields, .. }) = objs.get(jref) {
+                            fields.get(&field_name).copied()
+                        } else {
+                            None
+                        }
+                    }) {
+                        res
+                    } else {
+                        with_uc(&ctx, &host, emu_id, |uc| {
+                            Ok(uc.get_data().jni.get_instance_field(jref, &field_name))
+                        })?
+                    };
                     jvalue_opt_to_js(&ctx, stored)
                 },
             )?,
@@ -1359,7 +1458,11 @@ pub(super) fn register_native_bridge<'js>(
                       -> rquickjs::Result<()> {
                     with_uc(&ctx, &host, emu_id, |uc| {
                         let vm = &mut uc.get_data_mut().jni;
-                        let jval = js_field_val_to_jvalue(val, sig.as_deref().unwrap_or(""), vm)?;
+                        let jval = js_field_val_to_jvalue(
+                            val,
+                            sig.as_deref().unwrap_or(""),
+                            &mut vm.objects,
+                        )?;
                         vm.set_static_field(&cls, &field_name, jval);
                         Ok(())
                     })
@@ -1871,7 +1974,12 @@ pub(super) fn register_native_bridge<'js>(
         native.set(
             "jniPushLocalFrame",
             Function::new(ctx.clone(), move |ctx: Ctx<'_>, emu_id: usize| -> rquickjs::Result<()> {
-                let mut h = host.borrow_mut();
+                let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                 let entry = h
                     .emus
                     .get_mut(emu_id)
@@ -2244,7 +2352,12 @@ pub(super) fn register_native_bridge<'js>(
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, emu_id: usize, k: String, v: String| -> rquickjs::Result<()> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2267,7 +2380,12 @@ pub(super) fn register_native_bridge<'js>(
                       path: String,
                       text: String|
                       -> rquickjs::Result<()> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2290,7 +2408,12 @@ pub(super) fn register_native_bridge<'js>(
                       path: String,
                       bytes: TypedArray<'js, u8>|
                       -> rquickjs::Result<()> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2340,7 +2463,12 @@ pub(super) fn register_native_bridge<'js>(
                       guest_dir: String,
                       host_dir: String|
                       -> rquickjs::Result<()> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2359,7 +2487,12 @@ pub(super) fn register_native_bridge<'js>(
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, emu_id: usize, unix_secs: f64| -> rquickjs::Result<()> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2379,7 +2512,12 @@ pub(super) fn register_native_bridge<'js>(
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'js>, emu_id: usize, opts: Value<'js>| -> rquickjs::Result<()> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2419,7 +2557,12 @@ pub(super) fn register_native_bridge<'js>(
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'js>, emu_id: usize, obj: Object<'js>| -> rquickjs::Result<()> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2492,7 +2635,12 @@ pub(super) fn register_native_bridge<'js>(
         native.set(
             "netClearPackets",
             Function::new(ctx.clone(), move |ctx: Ctx<'_>, emu_id: usize| -> rquickjs::Result<()> {
-                let mut h = host.borrow_mut();
+                let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                 let entry = h
                     .emus
                     .get_mut(emu_id)
@@ -2514,7 +2662,12 @@ pub(super) fn register_native_bridge<'js>(
                       is_send: bool,
                       cb: Option<Function<'js>>|
                       -> rquickjs::Result<()> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2570,7 +2723,12 @@ pub(super) fn register_native_bridge<'js>(
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, emu_id: usize, enabled: bool| -> rquickjs::Result<()> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2645,7 +2803,12 @@ pub(super) fn register_native_bridge<'js>(
                     } else {
                         return Err(throw_err(&ctx, "vfs.setDevice 参数必须为预设名称字符串或配置对象"));
                     };
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2725,7 +2888,12 @@ pub(super) fn register_native_bridge<'js>(
                       end: f64,
                       capacity: usize|
                       -> rquickjs::Result<()> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2779,7 +2947,12 @@ pub(super) fn register_native_bridge<'js>(
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'js>, emu_id: usize| -> rquickjs::Result<Object<'js>> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2805,7 +2978,12 @@ pub(super) fn register_native_bridge<'js>(
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, emu_id: usize| -> rquickjs::Result<usize> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2829,7 +3007,12 @@ pub(super) fn register_native_bridge<'js>(
             Function::new(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, emu_id: usize, snap_id: usize| -> rquickjs::Result<()> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -2959,7 +3142,12 @@ pub(super) fn register_native_bridge<'js>(
                       timeout_ms: f64,
                       max_insns: f64|
                       -> rquickjs::Result<()> {
-                    let mut h = host.borrow_mut();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                     let entry = h
                         .emus
                         .get_mut(emu_id)
@@ -3170,7 +3358,12 @@ pub(super) fn register_native_bridge<'js>(
                 move |ctx: Ctx<'js>, emu_id: usize, path: String| -> rquickjs::Result<Object<'js>> {
                     #[cfg(feature = "apk")]
                     {
-                        let mut h = host.borrow_mut();
+                        let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                         let entry = h
                             .emus
                             .get_mut(emu_id)
@@ -3229,7 +3422,12 @@ pub(super) fn register_native_bridge<'js>(
                     #[cfg(feature = "apk")]
                     {
                         let _guard = JsCtxGuard::enter(&ctx);
-                        let mut h = host.borrow_mut();
+                        let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            &ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用（请改用支持重入的 getString/getField/setField/getByteArray/newString/describeObject 等接口）",
+        )
+    })?;
                         let entry = h
                             .emus
                             .get_mut(emu_id)

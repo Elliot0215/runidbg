@@ -76,21 +76,48 @@ pub(crate) fn with_active_objects<R>(f: impl FnOnce(&mut ObjectTable) -> R) -> O
     crate::script::hooks::with_active_uc(|uc| f(&mut uc.get_data_mut().jni.objects))
 }
 
+/// `list_hooks()` 返回的已注册 Hook 摘要
+pub(crate) struct RegisteredHookInfo {
+    pub id: u64,
+    pub kind: &'static str,
+    pub class_name: String,
+    pub name: String,
+    pub sig: Option<String>,
+    pub hits: u64,
+}
+
+/// 单条已注册 JS JNI Hook 元数据（携带唯一 ID 与命中计数）
+pub(crate) struct HookEntry {
+    pub id: u64,
+    pub func: Persistent<Function<'static>>,
+    pub hits: Cell<u64>,
+}
+
 /// 存储每个模拟器实例注册的 JS JNI 回调表
 ///
 /// 按 `field_hooks`（字段专属）、`method_hooks`（方法专属，支持精确签名重载）与
 /// `hooks`（历史兼容的按名通用表）分表存储，彻底消除同名字段与方法互相劫持。
 #[derive(Default)]
 pub(crate) struct JsHookTable {
-    pub hooks: HashMap<(String, String), Persistent<Function<'static>>>,
-    pub field_hooks: HashMap<(String, String, Option<String>), Persistent<Function<'static>>>,
-    pub method_hooks: HashMap<(String, String, Option<String>), Persistent<Function<'static>>>,
+    pub hooks: HashMap<(String, String), HookEntry>,
+    pub field_hooks: HashMap<(String, String, Option<String>), HookEntry>,
+    pub method_hooks: HashMap<(String, String, Option<String>), HookEntry>,
+    next_hook_id: u64,
     pub unhandled: Option<Persistent<Function<'static>>>,
     pub diag: EnvDiag,
     pub breadcrumbs: BreadcrumbRing,
 }
 
 impl JsHookTable {
+    fn alloc_entry(&mut self, func: Persistent<Function<'static>>) -> HookEntry {
+        self.next_hook_id += 1;
+        HookEntry {
+            id: self.next_hook_id,
+            func,
+            hits: Cell::new(0),
+        }
+    }
+
     /// 智能注册：
     /// - 含 `(`（如 `"g()Lcas/c0;"`）→ 方法专属 + 精确签名；
     /// - 含 `:`（如 `"g:[C"` 或 `"field:g"`）→ 字段专属（可选签名）；
@@ -109,7 +136,8 @@ impl JsHookTable {
             self.insert_field_hook(class_name, key, func);
         } else {
             let norm = class_name.replace('.', "/");
-            self.hooks.insert((norm, key.to_string()), func);
+            let entry = self.alloc_entry(func);
+            self.hooks.insert((norm, key.to_string()), entry);
         }
     }
 
@@ -125,7 +153,8 @@ impl JsHookTable {
             Some((n, s)) if !s.is_empty() => (n.to_string(), Some(s.to_string())),
             _ => (key.to_string(), None),
         };
-        self.field_hooks.insert((norm, name, sig), func);
+        let entry = self.alloc_entry(func);
+        self.field_hooks.insert((norm, name, sig), entry);
     }
 
     /// 显式注册方法 Hook（支持 `"name"` 或 `"name(args)ret"` 精确重载签名，绝不劫持同名字段）
@@ -140,10 +169,12 @@ impl JsHookTable {
             Some(idx) => (key[..idx].to_string(), Some(key[idx..].to_string())),
             None => (key.to_string(), None),
         };
-        self.method_hooks.insert((norm, name, sig), func);
+        let entry = self.alloc_entry(func);
+        self.method_hooks.insert((norm, name, sig), entry);
     }
 
     /// 查找字段或方法 Hook（按 精确签名 > 同类无签名 > 声明类精确签名 > 声明类无签名 > 旧版通用表）
+    /// 命中时自动累加命中计数并返回 `(hook_id, func)`
     pub fn lookup(
         &self,
         norm_cls: &str,
@@ -151,7 +182,11 @@ impl JsHookTable {
         name: &str,
         sig: &str,
         is_field: bool,
-    ) -> Option<Persistent<Function<'static>>> {
+    ) -> Option<(u64, Persistent<Function<'static>>)> {
+        let hit = |entry: &HookEntry| -> (u64, Persistent<Function<'static>>) {
+            entry.hits.set(entry.hits.get() + 1);
+            (entry.id, entry.func.clone())
+        };
         let typed_map = if is_field {
             &self.field_hooks
         } else {
@@ -159,49 +194,70 @@ impl JsHookTable {
         };
         let sig_opt = (!sig.is_empty()).then(|| sig.to_string());
         if let Some(ref s) = sig_opt {
-            if let Some(f) = typed_map.get(&(norm_cls.to_string(), name.to_string(), Some(s.clone()))) {
-                return Some(f.clone());
+            if let Some(e) = typed_map.get(&(norm_cls.to_string(), name.to_string(), Some(s.clone()))) {
+                return Some(hit(e));
             }
         }
-        if let Some(f) = typed_map.get(&(norm_cls.to_string(), name.to_string(), None)) {
-            return Some(f.clone());
+        if let Some(e) = typed_map.get(&(norm_cls.to_string(), name.to_string(), None)) {
+            return Some(hit(e));
         }
         if decl_cls != norm_cls {
             if let Some(ref s) = sig_opt {
-                if let Some(f) = typed_map.get(&(decl_cls.to_string(), name.to_string(), Some(s.clone()))) {
-                    return Some(f.clone());
+                if let Some(e) = typed_map.get(&(decl_cls.to_string(), name.to_string(), Some(s.clone()))) {
+                    return Some(hit(e));
                 }
             }
-            if let Some(f) = typed_map.get(&(decl_cls.to_string(), name.to_string(), None)) {
-                return Some(f.clone());
+            if let Some(e) = typed_map.get(&(decl_cls.to_string(), name.to_string(), None)) {
+                return Some(hit(e));
             }
         }
-        if let Some(f) = self.hooks.get(&(norm_cls.to_string(), name.to_string())) {
-            return Some(f.clone());
+        if let Some(e) = self.hooks.get(&(norm_cls.to_string(), name.to_string())) {
+            return Some(hit(e));
         }
         if decl_cls != norm_cls {
-            if let Some(f) = self.hooks.get(&(decl_cls.to_string(), name.to_string())) {
-                return Some(f.clone());
+            if let Some(e) = self.hooks.get(&(decl_cls.to_string(), name.to_string())) {
+                return Some(hit(e));
             }
         }
         None
     }
 
-    /// 枚举全部已注册 Hook（返回 `(kind, class_name, name, sig)`，已排序）
-    pub fn list_hooks(&self) -> Vec<(&'static str, String, String, Option<String>)> {
+    /// 枚举全部已注册 Hook（按 ID 升序）
+    pub fn list_hooks(&self) -> Vec<RegisteredHookInfo> {
         let mut out = Vec::with_capacity(
             self.field_hooks.len() + self.method_hooks.len() + self.hooks.len(),
         );
-        for (cls, name, sig) in self.field_hooks.keys() {
-            out.push(("field", cls.clone(), name.clone(), sig.clone()));
+        for ((cls, name, sig), e) in &self.field_hooks {
+            out.push(RegisteredHookInfo {
+                id: e.id,
+                kind: "field",
+                class_name: cls.clone(),
+                name: name.clone(),
+                sig: sig.clone(),
+                hits: e.hits.get(),
+            });
         }
-        for (cls, name, sig) in self.method_hooks.keys() {
-            out.push(("method", cls.clone(), name.clone(), sig.clone()));
+        for ((cls, name, sig), e) in &self.method_hooks {
+            out.push(RegisteredHookInfo {
+                id: e.id,
+                kind: "method",
+                class_name: cls.clone(),
+                name: name.clone(),
+                sig: sig.clone(),
+                hits: e.hits.get(),
+            });
         }
-        for (cls, name) in self.hooks.keys() {
-            out.push(("any", cls.clone(), name.clone(), None));
+        for ((cls, name), e) in &self.hooks {
+            out.push(RegisteredHookInfo {
+                id: e.id,
+                kind: "any",
+                class_name: cls.clone(),
+                name: name.clone(),
+                sig: None,
+                hits: e.hits.get(),
+            });
         }
-        out.sort();
+        out.sort_by_key(|item| item.id);
         out
     }
 
@@ -237,16 +293,18 @@ impl JsJniHandler {
         f: impl FnOnce(&Ctx<'js>, Value<'js>, &mut ObjectTable),
     ) -> bool {
         let Some(raw_ctx) = CURRENT_JS_CTX.with(Cell::get) else {
+            crate::jni::env::set_last_jni_hook_id(None);
             return false;
         };
         let norm_cls = class_name.replace('.', "/");
         let decl_cls = method.class_name.replace('.', "/");
         let is_field = !method.sig.starts_with('(');
-        let hook_fn = self
+        let hook_match = self
             .table
             .borrow()
             .lookup(&norm_cls, &decl_cls, &method.name, &method.sig, is_field);
-        let Some(pfn) = hook_fn else {
+        let Some((hook_id, pfn)) = hook_match else {
+            crate::jni::env::set_last_jni_hook_id(None);
             return false;
         };
 
@@ -263,6 +321,7 @@ impl JsJniHandler {
                 let _ = this_meta.set("name", method.name.as_str());
                 let _ = this_meta.set("sig", method.sig.as_str());
                 let _ = this_meta.set("isStatic", method.is_static);
+                let _ = this_meta.set("hookId", hook_id as f64);
                 let _ = call_args.this(this_meta);
             }
             if let Some(this_obj) = obj {
@@ -276,6 +335,7 @@ impl JsJniHandler {
             match func.call_arg::<Value<'js>>(call_args) {
                 Ok(ret) => {
                     f(&js_ctx, ret, ctx_jni.objects);
+                    crate::jni::env::set_last_jni_hook_id(Some(hook_id));
                     return true;
                 }
                 Err(err) => {
@@ -287,10 +347,12 @@ impl JsJniHandler {
                         error = %err,
                         "JS JNI 回调异常"
                     );
+                    crate::jni::env::set_last_jni_hook_id(Some(hook_id));
                     return true;
                 }
             }
         }
+        crate::jni::env::set_last_jni_hook_id(None);
         false
     }
 

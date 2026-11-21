@@ -36,6 +36,21 @@ const ENV_TRAMPOLINE_SLOT_OFFSET: usize = 16;
 /// ARM64 `RET` 机器码
 const ARM64_RET_INSN: u32 = 0xD65F_03C0;
 
+// 线程局部记录最近一次 JNI 回调是否命中已注册 JS Hook 及其唯一 ID（零分配、关闭 trace 时零开销）
+thread_local! {
+    static LAST_JNI_HOOK_ID: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// 由 `JniHandler` 实现（如 `JsJniHandler`）在回调结束时写入命中的 Hook ID（未命中写入 `None`）
+pub fn set_last_jni_hook_id(id: Option<u64>) {
+    LAST_JNI_HOOK_ID.with(|cell| cell.set(id));
+}
+
+/// 取出并清空最近一次 JNI Hook 命中 ID
+pub fn take_last_jni_hook_id() -> Option<u64> {
+    LAST_JNI_HOOK_ID.with(|cell| cell.replace(None))
+}
+
 /// 单条结构化 JNI 调用事件（供全量导出与实时订阅，默认关闭零开销）
 #[derive(Debug, Clone)]
 pub struct JniTraceEvent {
@@ -48,6 +63,8 @@ pub struct JniTraceEvent {
     pub args: Vec<String>,
     pub ret: String,
     pub is_null: bool,
+    pub handled: bool,
+    pub hook_id: Option<u64>,
 }
 
 pub type JniTraceListener = Box<dyn FnMut(&JniTraceEvent)>;
@@ -84,6 +101,7 @@ impl JniTracer {
         self.enabled = true;
         self.max_str_len = max_str_len.max(8);
         self.max_events = max_events;
+        set_last_jni_hook_id(None);
     }
 
     pub fn stop(&mut self) {
@@ -121,6 +139,8 @@ impl JniTracer {
         if !self.enabled {
             return;
         }
+        let hook_id = take_last_jni_hook_id();
+        let handled = hook_id.is_some();
         let seq = self.next_seq;
         self.next_seq += 1;
         let ev = JniTraceEvent {
@@ -133,6 +153,8 @@ impl JniTracer {
             args,
             ret: ret.into(),
             is_null,
+            handled,
+            hook_id,
         };
         if let Some(mut cb) = self.listener.take() {
             cb(&ev);
