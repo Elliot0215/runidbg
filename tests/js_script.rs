@@ -1197,7 +1197,45 @@ fn js_builtin_jdk_and_android_models() {
             throw new Error("Settings$Secure android_id mismatch");
         }
 
-        // 5. 用户 emu.jni.hook 优先级高于内置模型
+        // 5. Kotlin 标准库：Lazy (内置 value 字段免 Hook)、Pair、EmptyList.INSTANCE、CollectionsKt.joinToString
+        const clsLazy = emu.call(fnFindClass, envPtr, ws("kotlin/Lazy"));
+        const midLazyGet = emu.call(fnGetMethodID, envPtr, clsLazy, ws("getValue"), ws("()Ljava/lang/Object;"));
+        const midLazyInit = emu.call(fnGetMethodID, envPtr, clsLazy, ws("isInitialized"), ws("()Z"));
+        const lazyHolder = emu.jni.newObject("kotlin/SynchronizedLazyImpl");
+        const w0 = emu.jni.newObject("cas/w0");
+        emu.jni.setField(lazyHolder, "value", w0);
+        if (!emu.call(fnCallBool, envPtr, lazyHolder, midLazyInit)) {
+            throw new Error("Lazy.isInitialized expected true");
+        }
+        if (emu.call(fnCallObj, envPtr, lazyHolder, midLazyGet) !== w0) {
+            throw new Error("built-in Lazy.getValue should return fields.value");
+        }
+
+        const clsPair = emu.call(fnFindClass, envPtr, ws("kotlin/Pair"));
+        const midPairInit = emu.call(fnGetMethodID, envPtr, clsPair, ws("<init>"), ws("(Ljava/lang/Object;Ljava/lang/Object;)V"));
+        const midFirst = emu.call(fnGetMethodID, envPtr, clsPair, ws("getFirst"), ws("()Ljava/lang/Object;"));
+        const pair = emu.call(fnNewObject, envPtr, clsPair, midPairInit, emu.jni.newString("lhs"), emu.jni.newString("rhs"));
+        if (emu.jni.getString(emu.call(fnCallObj, envPtr, pair, midFirst)) !== "lhs") {
+            throw new Error("kotlin/Pair.getFirst mismatch");
+        }
+
+        const clsColKt = emu.call(fnFindClass, envPtr, ws("kotlin/collections/CollectionsKt"));
+        const midJoin = emu.call(fnGetStaticMid, envPtr, clsColKt, ws("joinToString"), ws("(Ljava/lang/Iterable;Ljava/lang/CharSequence;Ljava/lang/CharSequence;Ljava/lang/CharSequence;)Ljava/lang/String;"));
+        const joinedRef = emu.call(fnCallStaticObj, envPtr, clsColKt, midJoin, list, emu.jni.newString("|"), emu.jni.newString("["), emu.jni.newString("]"));
+        if (emu.jni.getString(joinedRef) !== "[one|two]") {
+            throw new Error("CollectionsKt.joinToString mismatch: " + emu.jni.getString(joinedRef));
+        }
+
+        const fnGetStaticFid = slot(144);
+        const fnGetStaticObj = slot(145);
+        const clsEmptyList = emu.call(fnFindClass, envPtr, ws("kotlin/collections/EmptyList"));
+        const fidInst = emu.call(fnGetStaticFid, envPtr, clsEmptyList, ws("INSTANCE"), ws("Lkotlin/collections/EmptyList;"));
+        const emptyInst = emu.call(fnGetStaticObj, envPtr, clsEmptyList, fidInst);
+        if (!emptyInst || emu.call(fnCallInt, envPtr, emptyInst, midListSize) !== 0) {
+            throw new Error("EmptyList.INSTANCE mismatch");
+        }
+
+        // 6. 用户 emu.jni.hook 优先级高于内置模型
         emu.jni.hookMethod("java/util/Date", { getTime() { return 1234567890; } });
         if (emu.call(fnCallLong, envPtr, dateObj, midGetTime) !== 1234567890) {
             throw new Error("user hook should override built-in Date.getTime");

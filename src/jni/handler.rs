@@ -814,6 +814,40 @@ pub fn default_call_object_method(
             }
             JObjectRef::NULL
         }
+        (Some(JObject::Custom { class_name, fields }), "getValue")
+            if class_name == "kotlin/Lazy"
+                || class_name.ends_with("LazyImpl")
+                || method.class_name == "kotlin/Lazy" =>
+        {
+            fields
+                .get("value")
+                .and_then(|v| v.as_object())
+                .unwrap_or(JObjectRef::NULL)
+        }
+        (Some(JObject::Custom { class_name, fields }), "getFirst" | "component1")
+            if class_name == "kotlin/Pair" || class_name == "kotlin/Triple" =>
+        {
+            fields
+                .get("first")
+                .and_then(|v| v.as_object())
+                .unwrap_or(JObjectRef::NULL)
+        }
+        (Some(JObject::Custom { class_name, fields }), "getSecond" | "component2")
+            if class_name == "kotlin/Pair" || class_name == "kotlin/Triple" =>
+        {
+            fields
+                .get("second")
+                .and_then(|v| v.as_object())
+                .unwrap_or(JObjectRef::NULL)
+        }
+        (Some(JObject::Custom { class_name, fields }), "getThird" | "component3")
+            if class_name == "kotlin/Triple" =>
+        {
+            fields
+                .get("third")
+                .and_then(|v| v.as_object())
+                .unwrap_or(JObjectRef::NULL)
+        }
         (Some(JObject::Context { package_name }), "getPackageName") => {
             ctx.objects.add_string(package_name)
         }
@@ -1191,6 +1225,13 @@ pub fn default_call_boolean_method(
                 .any(|(k, _)| jobject_keys_equal(ctx.objects, *k, key))
         }
         (Some(JObject::Iterator { items, pos }), "hasNext") => pos < items.len(),
+        (Some(JObject::Custom { class_name, fields }), "isInitialized")
+            if class_name == "kotlin/Lazy"
+                || class_name.ends_with("LazyImpl")
+                || method.class_name == "kotlin/Lazy" =>
+        {
+            fields.contains_key("value")
+        }
         (Some(JObject::Custom { fields, .. }), "booleanValue") => match fields.get("value") {
             Some(JValue::Boolean(v)) => *v,
             _ => false,
@@ -1324,6 +1365,127 @@ pub fn default_call_static_object_method(
                 })
                 .unwrap_or_default();
             Some(ctx.objects.add_byte_array(android_base64_decode(&raw)))
+        }
+        ("kotlin/collections/CollectionsKt", "emptyList") => Some(ctx.objects.add_local(
+            JObject::List {
+                class_name: "kotlin/collections/EmptyList".to_string(),
+                items: Vec::new(),
+            },
+        )),
+        ("kotlin/collections/CollectionsKt", "emptySet") => Some(ctx.objects.add_local(
+            JObject::List {
+                class_name: "kotlin/collections/EmptySet".to_string(),
+                items: Vec::new(),
+            },
+        )),
+        ("kotlin/collections/CollectionsKt", "emptyMap") => Some(ctx.objects.add_local(
+            JObject::Map {
+                class_name: "kotlin/collections/EmptyMap".to_string(),
+                entries: Vec::new(),
+            },
+        )),
+        ("kotlin/collections/CollectionsKt", "listOf" | "mutableListOf") => {
+            let items = match args.first().and_then(|v| v.as_object()) {
+                Some(r) => match ctx.objects.get(r) {
+                    Some(JObject::ObjectArray(elems)) => elems.clone(),
+                    _ => vec![r],
+                },
+                None => Vec::new(),
+            };
+            Some(ctx.objects.add_local(JObject::List {
+                class_name: "java/util/ArrayList".to_string(),
+                items,
+            }))
+        }
+        ("kotlin/collections/CollectionsKt", "first" | "firstOrNull") => {
+            let res = args
+                .first()
+                .and_then(|v| v.as_object())
+                .and_then(|r| match ctx.objects.get(r) {
+                    Some(JObject::List { items, .. }) => items.first().copied(),
+                    Some(JObject::ObjectArray(items)) => items.first().copied(),
+                    _ => None,
+                })
+                .unwrap_or(JObjectRef::NULL);
+            Some(res)
+        }
+        ("kotlin/collections/CollectionsKt", "last" | "lastOrNull") => {
+            let res = args
+                .first()
+                .and_then(|v| v.as_object())
+                .and_then(|r| match ctx.objects.get(r) {
+                    Some(JObject::List { items, .. }) => items.last().copied(),
+                    Some(JObject::ObjectArray(items)) => items.last().copied(),
+                    _ => None,
+                })
+                .unwrap_or(JObjectRef::NULL);
+            Some(res)
+        }
+        ("kotlin/collections/CollectionsKt", "joinToString" | "joinToString$default") => {
+            let items: Vec<JObjectRef> = args
+                .first()
+                .and_then(|v| v.as_object())
+                .and_then(|r| match ctx.objects.get(r) {
+                    Some(JObject::List { items, .. }) => Some(items.clone()),
+                    Some(JObject::ObjectArray(items)) => Some(items.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let sep = args
+                .get(1)
+                .and_then(|v| v.as_object())
+                .and_then(|r| ctx.objects.get_string(r))
+                .unwrap_or(", ")
+                .to_string();
+            let prefix = args
+                .get(2)
+                .and_then(|v| v.as_object())
+                .and_then(|r| ctx.objects.get_string(r))
+                .unwrap_or("")
+                .to_string();
+            let postfix = args
+                .get(3)
+                .and_then(|v| v.as_object())
+                .and_then(|r| ctx.objects.get_string(r))
+                .unwrap_or("")
+                .to_string();
+            let parts: Vec<String> = items
+                .iter()
+                .map(|&r| jvalue_to_java_string(ctx, &JValue::Object(r)))
+                .collect();
+            Some(
+                ctx.objects
+                    .add_string(format!("{prefix}{}{postfix}", parts.join(&sep))),
+            )
+        }
+        ("kotlin/text/StringsKt", "encodeToByteArray") => {
+            let s = args
+                .first()
+                .and_then(|v| v.as_object())
+                .and_then(|r| ctx.objects.get_string(r))
+                .unwrap_or("")
+                .as_bytes()
+                .to_vec();
+            Some(ctx.objects.add_byte_array(s))
+        }
+        ("kotlin/text/StringsKt", "decodeToString") => {
+            let s = args
+                .first()
+                .and_then(|v| v.as_object())
+                .and_then(|r| ctx.objects.get_bytes(r))
+                .map(|b| String::from_utf8_lossy(b).into_owned())
+                .unwrap_or_default();
+            Some(ctx.objects.add_string(s))
+        }
+        ("kotlin/text/StringsKt", "trim") => {
+            let s = args
+                .first()
+                .and_then(|v| v.as_object())
+                .and_then(|r| ctx.objects.get_string(r))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            Some(ctx.objects.add_string(s))
         }
         ("java/lang/Boolean", "valueOf") => {
             let mut fields = HashMap::new();
@@ -1518,6 +1680,45 @@ pub fn default_new_object(
             .unwrap_or(1_700_000_000_000);
         let mut fields = HashMap::new();
         fields.insert("time".to_string(), JValue::Long(ms));
+        return ctx.objects.add_local(JObject::Custom {
+            class_name: class_name.to_string(),
+            fields,
+        });
+    }
+    if class_name == "kotlin/Pair" {
+        let mut fields = HashMap::new();
+        if let Some(first) = args.first().copied() {
+            fields.insert("first".to_string(), first);
+        }
+        if let Some(second) = args.get(1).copied() {
+            fields.insert("second".to_string(), second);
+        }
+        return ctx.objects.add_local(JObject::Custom {
+            class_name: class_name.to_string(),
+            fields,
+        });
+    }
+    if class_name == "kotlin/Triple" {
+        let mut fields = HashMap::new();
+        if let Some(first) = args.first().copied() {
+            fields.insert("first".to_string(), first);
+        }
+        if let Some(second) = args.get(1).copied() {
+            fields.insert("second".to_string(), second);
+        }
+        if let Some(third) = args.get(2).copied() {
+            fields.insert("third".to_string(), third);
+        }
+        return ctx.objects.add_local(JObject::Custom {
+            class_name: class_name.to_string(),
+            fields,
+        });
+    }
+    if class_name == "kotlin/InitializedLazyImpl" {
+        let mut fields = HashMap::new();
+        if let Some(val) = args.first().copied() {
+            fields.insert("value".to_string(), val);
+        }
         return ctx.objects.add_local(JObject::Custom {
             class_name: class_name.to_string(),
             fields,

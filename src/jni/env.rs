@@ -2305,6 +2305,23 @@ fn resolve_builtin_build_object_field(
                 fields,
             })
         }
+        // Kotlin 标准库单例常量
+        ("kotlin/collections/EmptyList", "INSTANCE") => objects.add_local(JObject::List {
+            class_name: "kotlin/collections/EmptyList".to_string(),
+            items: Vec::new(),
+        }),
+        ("kotlin/collections/EmptySet", "INSTANCE") => objects.add_local(JObject::List {
+            class_name: "kotlin/collections/EmptySet".to_string(),
+            items: Vec::new(),
+        }),
+        ("kotlin/collections/EmptyMap", "INSTANCE") => objects.add_local(JObject::Map {
+            class_name: "kotlin/collections/EmptyMap".to_string(),
+            entries: Vec::new(),
+        }),
+        ("kotlin/Unit", "INSTANCE") => objects.add_local(JObject::Custom {
+            class_name: "kotlin/Unit".to_string(),
+            fields: HashMap::new(),
+        }),
         _ => JObjectRef::NULL,
     }
 }
