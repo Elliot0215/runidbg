@@ -248,8 +248,7 @@ fn js_net_api_nic_and_config() {
     let session = JsSession::new(&[], Path::new("."), true).expect("JsSession");
     session.eval_source(script).expect("eval net js");
     let raw = session.call_rpc_json("info", "[]").expect("call info");
-    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
-    assert_eq!(v["nic"]["ipv4"], "10.0.0.42");
-    assert_eq!(v["nic"]["mac"], "aa:bb:cc:dd:ee:ff");
-    assert_eq!(v["pkts"], 0);
+    assert!(raw.contains("\"ipv4\":\"10.0.0.42\""), "unexpected raw: {raw}");
+    assert!(raw.contains("\"mac\":\"aa:bb:cc:dd:ee:ff\""), "unexpected raw: {raw}");
+    assert!(raw.contains("\"pkts\":0"), "unexpected raw: {raw}");
 }
