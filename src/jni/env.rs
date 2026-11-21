@@ -33,6 +33,15 @@ const ENV_TRAMPOLINE_SLOT_OFFSET: usize = 16;
 /// ARM64 `RET` 机器码
 const ARM64_RET_INSN: u32 = 0xD65F_03C0;
 
+/// JNI 运行时可变状态快照（供 `EmuSnapshot` 完整回滚对象表与临时缓冲映射）
+#[derive(Debug, Clone)]
+pub struct JniSnapshot {
+    pub objects: ObjectTable,
+    pub pending_exception: JObjectRef,
+    pub utf_buffers: HashMap<u64, JObjectRef>,
+    pub array_buffers: HashMap<u64, (JObjectRef, usize)>,
+}
+
 /// 纯 Rust 伪造的 Dalvik/ART JNI 虚拟机桥接层
 pub struct JniVm {
     pub objects: ObjectTable,
@@ -83,6 +92,52 @@ impl JniVm {
             handler,
             initialized: false,
         }
+    }
+
+    /// 捕获 JNI 对象引用表与临时缓冲区映射快照
+    pub fn snapshot_state(&self) -> JniSnapshot {
+        JniSnapshot {
+            objects: self.objects.clone(),
+            pending_exception: self.pending_exception,
+            utf_buffers: self.utf_buffers.clone(),
+            array_buffers: self.array_buffers.clone(),
+        }
+    }
+
+    /// 恢复 JNI 对象引用表与临时缓冲区映射快照
+    pub fn restore_state(&mut self, snap: &JniSnapshot) {
+        self.objects = snap.objects.clone();
+        self.pending_exception = snap.pending_exception;
+        self.utf_buffers = snap.utf_buffers.clone();
+        self.array_buffers = snap.array_buffers.clone();
+    }
+
+    /// 弹出 JNI 局部引用帧，并顺带回收帧内已销毁 `jstring`/`jarray` 遗留的未释放 guest 缓冲区
+    pub fn pop_local_frame(&mut self, mem: &mut MemoryManager, keep: JObjectRef) -> usize {
+        let removed = self.objects.pop_local_frame(keep);
+        let orphan_utf: Vec<u64> = self
+            .utf_buffers
+            .iter()
+            .filter_map(|(&addr, &obj_ref)| {
+                self.objects.get(obj_ref).is_none().then_some(addr)
+            })
+            .collect();
+        for addr in orphan_utf {
+            self.utf_buffers.remove(&addr);
+            mem.free_heap(addr);
+        }
+        let orphan_arr: Vec<u64> = self
+            .array_buffers
+            .iter()
+            .filter_map(|(&addr, &(obj_ref, _))| {
+                self.objects.get(obj_ref).is_none().then_some(addr)
+            })
+            .collect();
+        for addr in orphan_arr {
+            self.array_buffers.remove(&addr);
+            mem.free_heap(addr);
+        }
+        removed
     }
 
     pub fn with_package_name(mut self, pkg: impl Into<String>) -> Self {
@@ -449,11 +504,24 @@ where
             0
         }
 
-        // 19: PushLocalFrame / 26: EnsureLocalCapacity
-        19 | 26 => JNI_OK as u64,
+        // 19: PushLocalFrame
+        19 => {
+            get_state(uc.get_data_mut()).0.objects.push_local_frame();
+            JNI_OK as u64
+        }
 
-        // 20: PopLocalFrame / 25: NewLocalRef
-        20 | 25 => x1,
+        // 26: EnsureLocalCapacity
+        26 => JNI_OK as u64,
+
+        // 20: PopLocalFrame
+        20 => {
+            let (vm, mem) = get_state(uc.get_data_mut());
+            vm.pop_local_frame(mem, JObjectRef(x1));
+            x1
+        }
+
+        // 25: NewLocalRef
+        25 => x1,
 
         // 21: NewGlobalRef / 226: NewWeakGlobalRef
         21 | 226 => get_state(uc.get_data_mut())
@@ -954,7 +1022,10 @@ where
 
         // 170: ReleaseStringUTFChars
         170 => {
-            get_state(uc.get_data_mut()).0.utf_buffers.remove(&x2);
+            let (vm, mem) = get_state(uc.get_data_mut());
+            if vm.utf_buffers.remove(&x2).is_some() {
+                mem.free_heap(x2);
+            }
             0
         }
 
@@ -1060,6 +1131,7 @@ where
                         }
                     }
                 }
+                get_state(uc.get_data_mut()).1.free_heap(x2);
             }
             0
         }

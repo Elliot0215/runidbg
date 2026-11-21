@@ -277,12 +277,15 @@ pub struct RegisteredNative {
 }
 
 /// JNI 对象引用表：统一管理 LocalRef 与 GlobalRef 生命周期
+#[derive(Debug, Clone)]
 pub struct ObjectTable {
     next_handle: u64,
     objects: HashMap<u64, JObject>,
     local_refs: HashSet<u64>,
     global_refs: HashMap<u64, usize>,
     class_cache: HashMap<String, JObjectRef>,
+    /// `PushLocalFrame` / `PopLocalFrame` 帧水位栈（记录进入帧时的 `next_handle`）
+    local_frames: Vec<u64>,
 }
 
 impl Default for ObjectTable {
@@ -299,7 +302,98 @@ impl ObjectTable {
             local_refs: HashSet::new(),
             global_refs: HashMap::new(),
             class_cache: HashMap::new(),
+            local_frames: Vec::new(),
         }
+    }
+
+    /// 压入一层 JNI 局部引用帧（与 `pop_local_frame` 配对，用于常驻 RPC 批量回收单次请求产生的临时 LocalRef）
+    pub fn push_local_frame(&mut self) {
+        self.local_frames.push(self.next_handle);
+    }
+
+    /// 弹出当前局部引用帧，回收该帧内创建的全部无 GlobalRef 持有的 LocalRef（可选保留一个返回值句柄 `keep`）
+    pub fn pop_local_frame(&mut self, keep: JObjectRef) -> usize {
+        let Some(watermark) = self.local_frames.pop() else {
+            return 0;
+        };
+        let keep_id = keep.0;
+        let to_drop_local: Vec<u64> = self
+            .local_refs
+            .iter()
+            .copied()
+            .filter(|&h| h >= watermark && h != keep_id)
+            .collect();
+        for &h in &to_drop_local {
+            self.local_refs.remove(&h);
+        }
+
+        // 若保留对象是容器（如 ObjectArray），保护其内部元素不被清理
+        let mut protected: HashSet<u64> = HashSet::new();
+        if keep_id != 0 {
+            protected.insert(keep_id);
+            if let Some(obj) = self.objects.get(&keep_id) {
+                match obj {
+                    JObject::ObjectArray(elems) => {
+                        for e in elems {
+                            if !e.is_null() {
+                                protected.insert(e.0);
+                            }
+                        }
+                    }
+                    JObject::Custom { fields, .. } => {
+                        for v in fields.values() {
+                            if let Some(r) = v.as_object() {
+                                if !r.is_null() {
+                                    protected.insert(r.0);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        // 也保护仍被帧外对象或 GlobalRef 引用的对象
+        for (&id, obj) in &self.objects {
+            if id < watermark || self.global_refs.contains_key(&id) {
+                match obj {
+                    JObject::ObjectArray(elems) => {
+                        for e in elems {
+                            if !e.is_null() {
+                                protected.insert(e.0);
+                            }
+                        }
+                    }
+                    JObject::Custom { fields, .. } => {
+                        for v in fields.values() {
+                            if let Some(r) = v.as_object() {
+                                if !r.is_null() {
+                                    protected.insert(r.0);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let mut removed = 0usize;
+        let candidates: Vec<u64> = self
+            .objects
+            .keys()
+            .copied()
+            .filter(|&h| h >= watermark && h != keep_id)
+            .collect();
+        for h in candidates {
+            if !self.global_refs.contains_key(&h)
+                && !protected.contains(&h)
+                && self.objects.remove(&h).is_some()
+            {
+                removed += 1;
+            }
+        }
+        removed
     }
 
     /// 分配一个 LocalRef 句柄

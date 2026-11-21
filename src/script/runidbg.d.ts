@@ -195,10 +195,16 @@ interface JniNamespace {
   getObjectArray(ref: number | bigint): number[] | null;
   getString(ref: number | bigint): string | null;
   getBytes(ref: number | bigint): Uint8Array | null;
+  pushLocalFrame(): void;
+  popLocalFrame(keepRef?: number | bigint): number;
+  withLocalFrame<T>(fn: () => T): T;
+  objectCount(): number;
 }
 
 interface MemNamespace {
   alloc(size: number): number;
+  free(addr: number | bigint): boolean;
+  heapUsed(): number;
   readBytes(addr: number | bigint, len: number): Uint8Array;
   writeBytes(addr: number | bigint, bytes: Uint8Array): void;
   readCString(addr: number | bigint, maxLen?: number): string;

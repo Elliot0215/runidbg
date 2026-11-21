@@ -747,6 +747,56 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
+    // jniPushLocalFrame(emuId) -> void
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniPushLocalFrame",
+            Function::new(ctx.clone(), move |ctx: Ctx<'_>, emu_id: usize| -> rquickjs::Result<()> {
+                let mut h = host.borrow_mut();
+                let entry = h
+                    .emus
+                    .get_mut(emu_id)
+                    .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                entry.emu.jni_mut().objects.push_local_frame();
+                Ok(())
+            })?,
+        )?;
+    }
+
+    // jniPopLocalFrame(emuId, keepRef) -> number (removed count)
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniPopLocalFrame",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, keep_ref: f64| -> rquickjs::Result<usize> {
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        let d = uc.get_data_mut();
+                        Ok(d.jni.pop_local_frame(&mut d.mem, JObjectRef(keep_ref as u64)))
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    // jniObjectCount(emuId) -> number
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniObjectCount",
+            Function::new(ctx.clone(), move |ctx: Ctx<'_>, emu_id: usize| -> rquickjs::Result<usize> {
+                let h = host.borrow();
+                let entry = h
+                    .emus
+                    .get(emu_id)
+                    .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                Ok(entry.emu.jni().objects.len())
+            })?,
+        )?;
+    }
+
     // ---- Memory APIs (支持原生 Hook 内重入) ----
     {
         let host = Rc::clone(host);
@@ -762,6 +812,36 @@ pub(super) fn register_native_bridge<'js>(
                             .alloc_heap((size as u64).max(1))
                             .map_err(|e| throw_err(&ctx, e))?;
                         Ok(addr as f64)
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "memFree",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, addr: f64| -> rquickjs::Result<bool> {
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc.get_data_mut().mem.hle_free(addr as u64))
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "memHeapUsed",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize| -> rquickjs::Result<f64> {
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc.get_data().mem.heap_used() as f64)
                     })
                 },
             )?,

@@ -153,3 +153,67 @@ fn native_hook_can_read_jni_objects_and_build_fields_match_device_profile() {
     assert_eq!(v["model"].as_str(), Some("Pixel 8 Pro"));
     assert_eq!(v["sdkInt"].as_u64(), Some(34));
 }
+
+#[test]
+fn heap_freelist_local_frame_and_snapshot_restore_reclaim_memory() {
+    let script = r#"
+        const emu = Emu.create({ packageName: "com.example.heaptest" });
+        const baselineHeap = emu.mem.heapUsed();
+        const baselineObjs = emu.jni.objectCount();
+
+        // 1. 反复 alloc + free 1000 次（4KB * 1000 = 4MB），验证空闲链表合并复用不会涨堆
+        for (let i = 0; i < 1000; i++) {
+            const p = emu.mem.alloc(4096);
+            if (!emu.mem.free(p)) throw new Error("free failed at " + i);
+        }
+        const afterAllocFreeHeap = emu.mem.heapUsed();
+
+        // 2. 反复在 withLocalFrame 内创建 JNI 字符串与数组，验证对象表恒定不涨
+        for (let i = 0; i < 200; i++) {
+            emu.jni.withLocalFrame(() => {
+                emu.jni.newString("tmp_" + i);
+                emu.jni.newStringArray(["k1", "v1", "k2", "v2"]);
+            });
+        }
+        const afterLocalFrameObjs = emu.jni.objectCount();
+
+        // 3. 验证 snapshot() + restore() 会同时重置模拟堆分配器与 JNI 引用表
+        const snap = emu.snapshot();
+        const leakedPtr = emu.mem.alloc(65536);
+        emu.jni.newString("leaked_before_restore");
+        const beforeRestoreHeap = emu.mem.heapUsed();
+        const beforeRestoreObjs = emu.jni.objectCount();
+
+        emu.restore(snap);
+        const afterRestoreHeap = emu.mem.heapUsed();
+        const afterRestoreObjs = emu.jni.objectCount();
+
+        rpc.exports = {
+            report() {
+                return {
+                    baselineHeap,
+                    afterAllocFreeHeap,
+                    baselineObjs,
+                    afterLocalFrameObjs,
+                    leakedPtr,
+                    beforeRestoreHeap,
+                    afterRestoreHeap,
+                    beforeRestoreObjs,
+                    afterRestoreObjs,
+                };
+            },
+        };
+    "#;
+
+    let session = JsSession::new(&[], Path::new("."), true).expect("create JsSession");
+    session.eval_source(script).expect("eval heap/snapshot test");
+    let raw = session.call_rpc_json("report", "[]").expect("call report");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("parse report json");
+
+    assert_eq!(v["afterAllocFreeHeap"], v["baselineHeap"]);
+    assert_eq!(v["afterLocalFrameObjs"], v["baselineObjs"]);
+    assert!(v["beforeRestoreHeap"].as_u64().unwrap() >= v["baselineHeap"].as_u64().unwrap() + 65536);
+    assert_eq!(v["afterRestoreHeap"], v["baselineHeap"]);
+    assert_eq!(v["beforeRestoreObjs"].as_u64().unwrap(), v["baselineObjs"].as_u64().unwrap() + 1);
+    assert_eq!(v["afterRestoreObjs"], v["baselineObjs"]);
+}

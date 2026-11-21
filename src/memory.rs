@@ -49,13 +49,20 @@ impl VmaRegion {
     }
 }
 
-/// 极简线性堆分配器 (Bump Allocator)
-/// 适用于短生命周期模拟执行、分配参数缓冲区以及伪造 JNIEnv / 跳板表
-#[derive(Debug)]
+/// 带空闲块合并（Coalescing Free-List）的模拟堆分配器
+/// 保留 `BumpAllocator` 类型名以兼容已有导出 API；支持 `free()` 真实回收复用与前后空闲块合并，
+/// 防止 `serve` 常驻多轮调用时堆游标单向耗尽。
+#[derive(Debug, Clone)]
 pub struct BumpAllocator {
     base: u64,
     size: u64,
     cursor: u64,
+    /// 按地址有序的空闲块表：`start -> size`（始终保持相邻块已合并）
+    free_blocks: BTreeMap<u64, u64>,
+    /// 当前存活的已分配块表：`start -> size`（防重复 free 与越界 free）
+    allocated: BTreeMap<u64, u64>,
+    /// 当前实际存活的已分配字节数
+    in_use: u64,
 }
 
 impl BumpAllocator {
@@ -64,14 +71,57 @@ impl BumpAllocator {
             base,
             size,
             cursor: base,
+            free_blocks: BTreeMap::new(),
+            allocated: BTreeMap::new(),
+            in_use: 0,
         }
     }
 
-    /// 按指定对齐要求分配内存（ARM64 ABI 建议默认 16 字节对齐）
+    /// 按指定对齐要求分配内存（优先复用空闲链表中合适块，不足时再推进游标）
     pub fn alloc(&mut self, size: u64, align: u64) -> EmuResult<u64> {
         let align = align.max(1).next_power_of_two();
+        let alloc_size = align_up(size.max(1), 16);
+
+        // 1. 优先从 free_blocks 查找满足对齐与大小的空闲块（Best-Fit 降低碎片）
+        let mut best: Option<(u64, u64, u64)> = None; // (block_start, block_size, aligned_start)
+        for (&b_start, &b_size) in &self.free_blocks {
+            let aligned = align_up(b_start, align);
+            let b_end = b_start.saturating_add(b_size);
+            let req_end = aligned.saturating_add(alloc_size);
+            if req_end <= b_end {
+                let waste = b_size - alloc_size;
+                if best.is_none_or(|(_, prev_sz, _)| b_size < prev_sz) {
+                    best = Some((b_start, b_size, aligned));
+                    if waste == 0 {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some((b_start, b_size, aligned)) = best {
+            self.free_blocks.remove(&b_start);
+            let b_end = b_start + b_size;
+            let req_end = aligned + alloc_size;
+            // 前置对齐空隙放回空闲表
+            if aligned > b_start {
+                self.free_blocks.insert(b_start, aligned - b_start);
+            }
+            // 后置剩余块 >= 16 字节则切分放回空闲表，否则并入本次分配避免极小碎片
+            let actual_size = if b_end - req_end >= 16 {
+                self.free_blocks.insert(req_end, b_end - req_end);
+                alloc_size
+            } else {
+                b_end - aligned
+            };
+            self.allocated.insert(aligned, actual_size);
+            self.in_use = self.in_use.saturating_add(actual_size);
+            return Ok(aligned);
+        }
+
+        // 2. 空闲链表无可用块时，从线性前沿 cursor 分配
         let aligned = align_up(self.cursor, align);
-        let end = aligned.saturating_add(size);
+        let end = aligned.saturating_add(alloc_size);
         let limit = self.base + self.size;
 
         if end > limit {
@@ -81,8 +131,48 @@ impl BumpAllocator {
             });
         }
 
+        // 若因高对齐跳过了前段空隙，顺手纳入空闲表供小块复用
+        if aligned > self.cursor && aligned - self.cursor >= 16 {
+            self.insert_and_coalesce(self.cursor, aligned - self.cursor);
+        }
+
         self.cursor = end;
+        self.allocated.insert(aligned, alloc_size);
+        self.in_use = self.in_use.saturating_add(alloc_size);
         Ok(aligned)
+    }
+
+    /// 回收先前分配的块并与前后相邻空闲块自动合并；若触达堆顶则同步回缩 `cursor`
+    pub fn free(&mut self, ptr: u64) -> bool {
+        let Some(block_size) = self.allocated.remove(&ptr) else {
+            return false;
+        };
+        self.in_use = self.in_use.saturating_sub(block_size);
+        self.insert_and_coalesce(ptr, block_size);
+        true
+    }
+
+    fn insert_and_coalesce(&mut self, mut start: u64, mut size: u64) {
+        // 向前合并
+        if let Some((&prev_start, &prev_size)) = self.free_blocks.range(..start).next_back() {
+            if prev_start.saturating_add(prev_size) == start {
+                self.free_blocks.remove(&prev_start);
+                start = prev_start;
+                size = size.saturating_add(prev_size);
+            }
+        }
+        // 向后合并
+        let end = start.saturating_add(size);
+        if let Some(&next_size) = self.free_blocks.get(&end) {
+            self.free_blocks.remove(&end);
+            size = size.saturating_add(next_size);
+        }
+        // 若合并后的空闲块紧贴 cursor，直接回缩前沿
+        if start.saturating_add(size) == self.cursor {
+            self.cursor = start;
+        } else {
+            self.free_blocks.insert(start, size);
+        }
     }
 
     pub const fn base(&self) -> u64 {
@@ -93,9 +183,22 @@ impl BumpAllocator {
         self.size
     }
 
+    /// 当前实际存活字节数（已扣除 `free()` 回收部分）
     pub const fn used(&self) -> u64 {
+        self.in_use
+    }
+
+    /// 堆游标水位（距堆基址的高水位偏移）
+    pub const fn high_water_mark(&self) -> u64 {
         self.cursor - self.base
     }
+}
+
+/// 模拟堆元数据快照（供 `EmuSnapshot` 完整保存与恢复堆状态）
+#[derive(Debug, Clone)]
+pub struct HeapSnapshot {
+    pub heap: BumpAllocator,
+    pub brk_cursor: u64,
 }
 
 /// 模拟器 MMU 内存管理器
@@ -395,13 +498,34 @@ impl MemoryManager {
         self.heap.alloc(size, align)
     }
 
-    /// 带块头元数据的 HLE `malloc`（支持 `realloc` 读取原块大小）
+    /// 释放由 `alloc_heap` / `alloc_heap_aligned` 分配的原始堆块
+    pub fn free_heap(&mut self, ptr: u64) -> bool {
+        if ptr == 0 {
+            return false;
+        }
+        self.heap.free(ptr)
+    }
+
+    /// 带块头元数据的 HLE `malloc`（支持 `realloc` 读取原块大小，并可被 `hle_free` 回收复用）
     pub fn hle_malloc<D>(&mut self, uc: &mut Unicorn<'_, D>, size: u64) -> EmuResult<u64> {
         let alloc_sz = size.max(1);
         let raw_addr = self.heap.alloc(HEAP_HEADER_SIZE + alloc_sz, 16)?;
         self.write_u64(uc, raw_addr, HEAP_BLOCK_MAGIC)?;
         self.write_u64(uc, raw_addr + 8, alloc_sz)?;
         Ok(raw_addr + HEAP_HEADER_SIZE)
+    }
+
+    /// 释放由 `hle_malloc` / `hle_calloc` / `hle_realloc`（或原始 `alloc_heap`）分配的块
+    pub fn hle_free(&mut self, ptr: u64) -> bool {
+        if ptr == 0 {
+            return false;
+        }
+        if ptr >= self.heap.base() + HEAP_HEADER_SIZE
+            && self.heap.free(ptr - HEAP_HEADER_SIZE)
+        {
+            return true;
+        }
+        self.heap.free(ptr)
     }
 
     /// 带零初始化的 HLE `calloc`
@@ -418,7 +542,7 @@ impl MemoryManager {
         Ok(ptr)
     }
 
-    /// HLE `realloc`（读取 16 字节块头原大小并拷贝数据到新块）
+    /// HLE `realloc`（读取 16 字节块头原大小并拷贝数据到新块，同时回收旧块）
     pub fn hle_realloc<D>(
         &mut self,
         uc: &mut Unicorn<'_, D>,
@@ -427,6 +551,10 @@ impl MemoryManager {
     ) -> EmuResult<u64> {
         if old_ptr == 0 {
             return self.hle_malloc(uc, new_size);
+        }
+        if new_size == 0 {
+            self.hle_free(old_ptr);
+            return Ok(0);
         }
         let new_ptr = self.hle_malloc(uc, new_size)?;
         if old_ptr >= self.heap.base() + HEAP_HEADER_SIZE {
@@ -440,7 +568,22 @@ impl MemoryManager {
                 }
             }
         }
+        self.hle_free(old_ptr);
         Ok(new_ptr)
+    }
+
+    /// 捕获模拟堆元数据快照（含空闲链表与已分配块表）
+    pub fn heap_snapshot(&self) -> HeapSnapshot {
+        HeapSnapshot {
+            heap: self.heap.clone(),
+            brk_cursor: self.brk_cursor,
+        }
+    }
+
+    /// 恢复模拟堆元数据快照
+    pub fn restore_heap_snapshot(&mut self, snap: &HeapSnapshot) {
+        self.heap = snap.heap.clone();
+        self.brk_cursor = snap.brk_cursor;
     }
 
     /// 读取指定地址内存到新 Vec

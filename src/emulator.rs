@@ -465,14 +465,15 @@ impl AndroidEmulator {
         self.uc.get_data_mut().tracer.finalize()
     }
 
-    /// 捕获完整 CPU + 可写内存快照（供批量回放）
+    /// 捕获完整 CPU + 可写内存 + 模拟堆分配器 + JNI 引用表快照（供批量回放或常驻重置）
     pub fn capture_snapshot(&self) -> EmuResult<EmuSnapshot> {
-        EmuSnapshot::capture(&self.uc, &self.uc.get_data().mem)
+        let data = self.uc.get_data();
+        EmuSnapshot::capture_full(&self.uc, &data.mem, &data.jni)
     }
 
-    /// 回滚至指定快照状态
+    /// 完整回滚至指定快照状态（同步恢复 CPU、可写内存、堆指针/空闲链表与 JNI 引用表）
     pub fn restore_snapshot(&mut self, snapshot: &EmuSnapshot) -> EmuResult<()> {
-        snapshot.restore(&mut self.uc)
+        snapshot.restore_full(&mut self.uc, |d| (&mut d.mem, &mut d.jni))
     }
 
     /// 便捷创建 `jstring`

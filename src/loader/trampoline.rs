@@ -988,7 +988,14 @@ where
                 12 // ENOMEM
             }
         }
-        HleBuiltin::Free | HleBuiltin::CxaAtexit | HleBuiltin::NoopZero => 0,
+        HleBuiltin::Free => {
+            if x0 != 0 {
+                let (_, mem, _) = get_state(uc.get_data_mut());
+                mem.hle_free(x0);
+            }
+            0
+        }
+        HleBuiltin::CxaAtexit | HleBuiltin::NoopZero => 0,
         HleBuiltin::Memcpy | HleBuiltin::Memmove => {
             let len = x2 as usize;
             if len > 0 {

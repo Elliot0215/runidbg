@@ -76,9 +76,11 @@ function pairsToMap(arr) {
 }
 
 function sign(url, opcode = 50331649, headers = ["cookie", "sessionid=demo", "user-agent", "ua"]) {
-  const headersArr = emu.jni.newStringArray(headers);
-  const ret = callNativeA(opcode, 0, 0, url, headersArr);
-  return pairsToMap(emu.jni.getStringArray(ret));
+  return emu.jni.withLocalFrame(() => {
+    const headersArr = emu.jni.newStringArray(headers);
+    const ret = callNativeA(opcode, 0, 0, url, headersArr);
+    return pairsToMap(emu.jni.getStringArray(ret));
+  });
 }
 
 rpc.exports = {

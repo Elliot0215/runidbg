@@ -287,6 +287,12 @@
           const hasVal = retval !== undefined;
           return __native.memRet(emuId, toAddr(addr), hasVal, hasVal ? retval : 0);
         },
+        free(addr) {
+          return __native.memFree(emuId, toAddr(addr));
+        },
+        heapUsed() {
+          return __native.memHeapUsed(emuId);
+        },
       };
       emuMemMap.set(emuId, memNs);
       if (opts.device !== undefined) {
@@ -505,6 +511,26 @@
           },
           getBytes(ref) {
             return __native.jniGetBytes(emuId, toAddr(ref)) ?? null;
+          },
+          pushLocalFrame() {
+            __native.jniPushLocalFrame(emuId);
+          },
+          popLocalFrame(keepRef = 0) {
+            return __native.jniPopLocalFrame(emuId, toAddr(keepRef));
+          },
+          withLocalFrame(fn) {
+            if (typeof fn !== "function") {
+              throw new TypeError("jni.withLocalFrame expects a function");
+            }
+            __native.jniPushLocalFrame(emuId);
+            try {
+              return fn();
+            } finally {
+              __native.jniPopLocalFrame(emuId, 0);
+            }
+          },
+          objectCount() {
+            return __native.jniObjectCount(emuId);
           },
         },
         mem: memNs,
