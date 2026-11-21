@@ -1,0 +1,731 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>runidbg · Inspector</title>
+<style>
+  :root {
+    --bg: #09090b;
+    --surface: #111114;
+    --surface-2: #18181c;
+    --surface-hover: #202026;
+    --border: #27272a;
+    --border-strong: #3f3f46;
+    --text: #fafafa;
+    --text-2: #a1a1aa;
+    --text-3: #71717a;
+    --accent: #f97316;
+    --accent-soft: rgba(249, 115, 22, 0.14);
+    --blue: #60a5fa;
+    --blue-soft: rgba(96, 165, 250, 0.14);
+    --cyan: #22d3ee;
+    --green: #4ade80;
+    --green-soft: rgba(74, 222, 128, 0.13);
+    --amber: #fbbf24;
+    --amber-soft: rgba(251, 191, 36, 0.13);
+    --purple: #c084fc;
+    --purple-soft: rgba(192, 132, 252, 0.14);
+    --rose: #fb7185;
+    --rose-soft: rgba(251, 113, 133, 0.14);
+    --mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Inter", "PingFang SC", "Helvetica Neue", sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 13px; -webkit-font-smoothing: antialiased; overflow: hidden; }
+  body { display: flex; flex-direction: column; }
+
+  /* Scrollbars */
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #27272a; border-radius: 999px; }
+  ::-webkit-scrollbar-thumb:hover { background: #3f3f46; }
+
+  /* Header */
+  header {
+    height: 48px; padding: 0 16px; background: var(--surface); border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between; gap: 16px; flex: 0 0 auto;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
+  .logo {
+    display: inline-flex; align-items: center; gap: 7px; font-weight: 700; font-size: 14px;
+    letter-spacing: -0.02em; white-space: nowrap; flex-shrink: 0; color: #fff;
+  }
+  .logo-dot { width: 8px; height: 8px; border-radius: 999px; background: var(--accent); box-shadow: 0 0 10px rgba(249,115,22,.8); }
+  .badge {
+    font-family: var(--mono); font-size: 10.5px; font-weight: 600; padding: 2px 7px;
+    border-radius: 5px; background: var(--surface-2); border: 1px solid var(--border);
+    color: var(--text-2); white-space: nowrap; flex-shrink: 0; letter-spacing: 0.03em;
+  }
+  .badge.live { color: var(--green); border-color: rgba(74,222,128,.3); background: var(--green-soft); }
+  .badge.trace { color: var(--accent); border-color: rgba(249,115,22,.3); background: var(--accent-soft); }
+  #metaSummary {
+    font-family: var(--mono); font-size: 11.5px; color: var(--text-3);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
+  }
+
+  .nav-pills {
+    display: flex; gap: 2px; background: var(--bg); padding: 3px; border-radius: 8px;
+    border: 1px solid var(--border); flex-shrink: 0;
+  }
+  .tab {
+    background: transparent; border: none; color: var(--text-2); padding: 5px 12px;
+    border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 500;
+    white-space: nowrap; transition: all .15s ease;
+  }
+  .tab:hover { color: var(--text); }
+  .tab.active { background: var(--surface-2); color: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.4); }
+
+  main { flex: 1; overflow: hidden; display: flex; }
+  .view { display: none; width: 100%; height: 100%; }
+  .view.active { display: flex; }
+
+  /* Trace Explorer */
+  .sidebar {
+    width: 310px; min-width: 260px; max-width: 360px; background: var(--surface);
+    border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden;
+  }
+  .side-header {
+    display: flex; padding: 8px 10px 0; gap: 4px; border-bottom: 1px solid var(--border);
+  }
+  .side-tab {
+    flex: 1; padding: 7px 6px; background: none; border: none; border-bottom: 2px solid transparent;
+    color: var(--text-3); cursor: pointer; font-size: 12px; font-weight: 600; transition: all .15s;
+  }
+  .side-tab:hover { color: var(--text-2); }
+  .side-tab.active { color: #fff; border-bottom-color: var(--accent); }
+  .side-body { flex: 1; overflow-y: auto; padding: 10px; display: flex; flex-direction: column; gap: 6px; }
+
+  .side-card {
+    padding: 8px 10px; border-radius: 7px; background: var(--surface-2);
+    border: 1px solid transparent; cursor: pointer; font-family: var(--mono); font-size: 11.5px;
+    transition: border-color .12s, background .12s;
+  }
+  .side-card:hover { background: var(--surface-hover); border-color: var(--border-strong); }
+  .side-card-top { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+  .side-card-sub { color: var(--text-3); font-size: 10.5px; margin-top: 4px; display: flex; justify-content: space-between; }
+
+  .pill {
+    display: inline-flex; align-items: center; padding: 1px 6px; border-radius: 4px;
+    font-size: 10.5px; font-weight: 600; font-family: var(--mono); letter-spacing: 0.01em;
+  }
+  .pill-md5 { background: var(--amber-soft); color: var(--amber); }
+  .pill-sha { background: var(--blue-soft); color: var(--blue); }
+  .pill-sm3 { background: var(--purple-soft); color: var(--purple); }
+  .pill-aes { background: var(--rose-soft); color: var(--rose); }
+  .pill-ok  { background: var(--green-soft); color: var(--green); }
+  .pill-dim { background: rgba(161,161,170,.12); color: var(--text-2); }
+
+  .workspace { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+
+  /* Visual Timeline Strip */
+  .timeline-wrap {
+    padding: 8px 14px; background: var(--surface); border-bottom: 1px solid var(--border);
+    display: flex; flex-direction: column; gap: 5px;
+  }
+  .timeline-meta { display: flex; justify-content: space-between; font-family: var(--mono); font-size: 10.5px; color: var(--text-3); }
+  .timeline-bar {
+    position: relative; height: 18px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 5px; cursor: crosshair; overflow: hidden;
+  }
+  .tl-marker {
+    position: absolute; top: 2px; bottom: 2px; min-width: 3px; border-radius: 2px; opacity: .88;
+    transition: opacity .1s;
+  }
+  .tl-marker:hover { opacity: 1; transform: scaleY(1.15); }
+  .tl-cursor {
+    position: absolute; top: 0; bottom: 0; width: 2px; background: #fff;
+    box-shadow: 0 0 8px #fff; pointer-events: none;
+  }
+
+  /* Toolbar */
+  .toolbar {
+    display: flex; align-items: center; justify-content: space-between; gap: 10px;
+    padding: 8px 14px; background: var(--bg); border-bottom: 1px solid var(--border); flex-wrap: wrap;
+  }
+  .tool-group { display: flex; align-items: center; gap: 6px; }
+  input, select, textarea {
+    background: var(--surface); border: 1px solid var(--border); color: var(--text);
+    padding: 5px 9px; border-radius: 6px; font-family: var(--mono); font-size: 12px; outline: none;
+    transition: border-color .15s;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--border-strong); background: var(--surface-2); }
+  .btn {
+    background: var(--surface); border: 1px solid var(--border); color: var(--text-2);
+    padding: 5px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: 500;
+    transition: all .12s; white-space: nowrap;
+  }
+  .btn:hover { background: var(--surface-2); color: #fff; border-color: var(--border-strong); }
+  .btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  .btn.primary:hover { filter: brightness(1.08); }
+  .kbd {
+    font-family: var(--mono); font-size: 10px; color: var(--text-3); background: var(--surface-2);
+    border: 1px solid var(--border); padding: 1px 5px; border-radius: 4px;
+  }
+
+  /* Disassembly Stream */
+  .trace-list {
+    flex: 1; overflow: auto; padding: 8px 0; font-family: var(--mono); font-size: 12px;
+    line-height: 1.6; font-variant-numeric: tabular-nums;
+  }
+  .insn-row {
+    display: flex; align-items: baseline; padding: 1px 14px; white-space: pre;
+    border-left: 2px solid transparent;
+  }
+  .insn-row:hover { background: rgba(255, 255, 255, 0.03); }
+  .insn-row.target { background: rgba(249, 115, 22, 0.11); border-left-color: var(--accent); }
+  .col-seq { color: var(--text-3); width: 70px; flex-shrink: 0; user-select: none; }
+  .col-off { color: var(--purple); width: 108px; flex-shrink: 0; }
+  .col-pc  { color: #52525b; width: 148px; flex-shrink: 0; font-size: 11.5px; }
+  .col-asm { width: 320px; flex-shrink: 0; }
+  .mnem-branch { color: var(--rose); font-weight: 600; }
+  .mnem-mem    { color: var(--blue); }
+  .mnem-alu    { color: var(--cyan); }
+  .mnem-other  { color: #e4e4e7; }
+  .op-reg { color: #d4d4d8; }
+  .op-imm { color: var(--amber); }
+  .col-regs { display: flex; gap: 10px; flex-wrap: nowrap; }
+  .reg-chip {
+    color: var(--green); cursor: pointer; padding: 0 4px; border-radius: 4px;
+    transition: background .1s;
+  }
+  .reg-chip:hover { background: var(--green-soft); }
+  .ascii-hint { color: var(--amber); margin-left: 4px; }
+  .mem-row {
+    padding: 0 14px 1px 192px; font-size: 11.5px; color: var(--text-2); white-space: pre;
+  }
+  .mem-r { color: #93c5fd; }
+  .mem-w { color: #fcd34d; }
+  .search-hit {
+    margin: 4px 14px; padding: 7px 11px; border-radius: 6px; background: var(--surface);
+    border: 1px solid var(--border); cursor: pointer; white-space: pre; overflow-x: auto;
+  }
+  .search-hit:hover { border-color: var(--accent); background: var(--surface-2); }
+
+  /* Page Layout (RPC & Diag) */
+  .page { flex: 1; overflow-y: auto; padding: 20px 24px; display: flex; flex-direction: column; gap: 18px; max-width: 1360px; width: 100%; margin: 0 auto; }
+  .page-head { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .page-title { font-size: 16px; font-weight: 700; letter-spacing: -0.02em; }
+  .kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; }
+  .kpi {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 14px 16px; display: flex; flex-direction: column; gap: 6px;
+  }
+  .kpi-lbl { font-size: 11.5px; color: var(--text-3); font-weight: 500; }
+  .kpi-val { font-size: 22px; font-weight: 700; font-family: var(--mono); font-variant-numeric: tabular-nums; color: #fff; }
+  .split2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px; display: flex; flex-direction: column; gap: 12px;
+  }
+  .card-head { display: flex; justify-content: space-between; align-items: center; font-size: 13.5px; font-weight: 600; color: #fff; }
+  pre.code-box {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 12px 14px; font-family: var(--mono); font-size: 11.5px; line-height: 1.55;
+    overflow: auto; max-height: 360px; white-space: pre-wrap; word-break: break-all; color: #d4d4d8;
+  }
+  .bar-row { display: flex; align-items: center; gap: 10px; font-family: var(--mono); font-size: 11.5px; margin-bottom: 7px; }
+  .bar-track { flex: 1; height: 10px; background: var(--bg); border-radius: 999px; overflow: hidden; border: 1px solid var(--border); }
+  .bar-fill { height: 100%; background: linear-gradient(90deg, #ea580c, #f97316); border-radius: 999px; }
+  .muted { color: var(--text-3); font-size: 12px; }
+  .empty { padding: 36px 16px; text-align: center; color: var(--text-3); font-size: 12.5px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo"><span class="logo-dot"></span>runidbg</span>
+    <span class="badge" id="modeBadge">INIT</span>
+    <span id="metaSummary"></span>
+  </div>
+  <div class="nav-pills">
+    <button class="tab active" data-tab="trace">Trace 分析</button>
+    <button class="tab" data-tab="rpc">RPC 看板</button>
+    <button class="tab" data-tab="diag">EnvDiag 诊断</button>
+  </div>
+</header>
+
+<main>
+  <!-- Tab 1: Trace Explorer -->
+  <section id="view-trace" class="view active">
+    <aside class="sidebar">
+      <div class="side-header">
+        <button class="side-tab active" data-side="crypto">密码学</button>
+        <button class="side-tab" data-side="calltree">调用树</button>
+        <button class="side-tab" data-side="stats">热点</button>
+      </div>
+      <div class="side-body" id="sideBody"><div class="empty">加载中...</div></div>
+    </aside>
+
+    <div class="workspace">
+      <div class="timeline-wrap" id="timelineWrap" style="display:none">
+        <div class="timeline-meta">
+          <span>执行时间轴（点击任意位置跳转 · 彩色块为检出的密码学算法窗口）</span>
+          <span id="tlPosLabel">#0 / 0</span>
+        </div>
+        <div class="timeline-bar" id="timelineBar">
+          <div class="tl-cursor" id="tlCursor" style="left:0%"></div>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div class="tool-group">
+          <span class="muted">#</span>
+          <input id="inpSkip" type="number" value="0" style="width:92px" />
+          <input id="inpLimit" type="number" value="120" style="width:64px" title="每页指令数" />
+          <button class="btn" id="btnPrev" title="快捷键: [">←</button>
+          <button class="btn" id="btnNext" title="快捷键: ]">→</button>
+          <button class="btn" id="btnJump">跳转</button>
+        </div>
+        <div class="tool-group">
+          <select id="selSearchKind">
+            <option value="val">寄存器值 (hex)</option>
+            <option value="ascii">内存写入 ASCII</option>
+            <option value="bytes">内存写入 Bytes</option>
+            <option value="addr">访存地址 (hex)</option>
+          </select>
+          <input id="inpSearch" placeholder="按 / 聚焦检索，如 0x67452301 或 8404" style="width:240px" />
+          <button class="btn primary" id="btnSearch">检索</button>
+          <button class="btn" id="btnClearSearch" style="display:none">返回 Dump <span class="kbd">Esc</span></button>
+        </div>
+      </div>
+
+      <div class="trace-list" id="traceList">
+        <div class="empty">未加载离线 Trace（请使用 <code>runidbg-cli ui &lt;trace.idx&gt; --base 0x40000000</code> 启动）</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Tab 2: RPC Dashboard -->
+  <section id="view-rpc" class="view">
+    <div class="page">
+      <div class="page-head">
+        <div>
+          <div class="page-title">RPC 服务实时看板</div>
+          <div class="muted" id="rpcStatusLine" style="margin-top:3px">正在检测当前服务的 /health 与 /metrics ...</div>
+        </div>
+        <div class="tool-group">
+          <button class="btn" id="btnRefreshRpc">刷新</button>
+          <button class="btn primary" id="btnHotReload">滚动热重载</button>
+        </div>
+      </div>
+      <div class="kpi-grid" id="rpcKpis"></div>
+      <div class="split2">
+        <div class="card">
+          <div class="card-head"><span>延迟分布（ms）</span><span class="muted">自动每 2.5s 刷新</span></div>
+          <div id="rpcLatencyBars" class="muted">暂无请求数据</div>
+        </div>
+        <div class="card">
+          <div class="card-head"><span>在线调试</span><span class="muted">POST /call/&lt;method&gt;</span></div>
+          <div class="tool-group">
+            <select id="rpcMethodSel" style="flex:1"></select>
+            <button class="btn primary" id="btnRpcCall">调用</button>
+          </div>
+          <textarea id="rpcArgsInp" rows="3" placeholder='JSON 参数数组，例如 ["https://example.com"]'>[]</textarea>
+          <pre class="code-box" id="rpcCallOut">等待调用...</pre>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Tab 3: EnvDiag Workbench -->
+  <section id="view-diag" class="view">
+    <div class="page">
+      <div class="page-head">
+        <div>
+          <div class="page-title">EnvDiag 缺环境诊断与补丁生成</div>
+          <div class="muted" style="margin-top:3px">粘贴 <code>emu.diag.report()</code> 输出，一键生成可运行的 QuickJS 补环境模板</div>
+        </div>
+      </div>
+      <div class="split2">
+        <div class="card">
+          <div class="card-head">
+            <span>诊断 JSON 输入</span>
+            <button class="btn primary" id="btnParseDiag">解析生成补丁</button>
+          </div>
+          <textarea id="diagInput" rows="13" placeholder='{
+  "missingFiles": { "/proc/self/exe": 1 },
+  "missingProperties": { "ro.build.tags": 2 },
+  "missingSyscalls": { "167": 1 },
+  "missingJni": { "com/example/App.getSig()Ljava/lang/String;": 1 }
+}'></textarea>
+          <div id="diagCards" style="display:flex;flex-wrap:wrap;gap:6px"></div>
+        </div>
+        <div class="card">
+          <div class="card-head">
+            <span>生成的 QuickJS 补丁</span>
+            <button class="btn" id="btnCopyPatch">复制代码</button>
+          </div>
+          <pre class="code-box" id="diagPatchOut" style="min-height:280px">// 在左侧粘贴 EnvDiag JSON 后点击「解析生成补丁」</pre>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let appMode = "unknown";
+let currentSide = "crypto";
+let traceTotal = 0;
+let currentTargetIdx = -1;
+let sideCache = { crypto: null, calltree: null, stats: null };
+
+document.querySelectorAll(".tab").forEach((btn) => {
+  btn.onclick = () => {
+    document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
+    document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
+    btn.classList.add("active");
+    $("view-" + btn.dataset.tab).classList.add("active");
+    if (btn.dataset.tab === "rpc") refreshRpc();
+  };
+});
+
+document.querySelectorAll(".side-tab").forEach((btn) => {
+  btn.onclick = () => {
+    document.querySelectorAll(".side-tab").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    currentSide = btn.dataset.side;
+    renderSide();
+  };
+});
+
+function esc(s) {
+  return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+}
+
+function algoPillClass(algo) {
+  const a = String(algo).toUpperCase();
+  if (a.includes("MD5")) return "pill-md5";
+  if (a.includes("SHA")) return "pill-sha";
+  if (a.includes("SM3") || a.includes("SM4")) return "pill-sm3";
+  if (a.includes("AES")) return "pill-aes";
+  return "pill-ok";
+}
+
+function algoColor(algo) {
+  const a = String(algo).toUpperCase();
+  if (a.includes("MD5")) return "#fbbf24";
+  if (a.includes("SHA")) return "#60a5fa";
+  if (a.includes("SM3") || a.includes("SM4")) return "#c084fc";
+  if (a.includes("AES")) return "#fb7185";
+  return "#4ade80";
+}
+
+function highlightAsm(asm) {
+  const sp = asm.indexOf(" ");
+  const mnem = sp === -1 ? asm : asm.slice(0, sp);
+  const ops = sp === -1 ? "" : asm.slice(sp);
+  let cls = "mnem-other";
+  if (/^(b|bl|blr|br|ret|cbz|cbnz|tbz|tbnz|b\.)/i.test(mnem)) cls = "mnem-branch";
+  else if (/^(ldr|ldp|ldur|ldrb|ldrh|str|stp|stur|strb|strh)/i.test(mnem)) cls = "mnem-mem";
+  else if (/^(eor|and|orr|orn|bic|lsl|lsr|asr|ror|rev|add|sub|mul|madd|ubfx|bfi|mov|movk|movz)/i.test(mnem)) cls = "mnem-alu";
+  const opsHtml = esc(ops).replace(/(#-?0x[0-9a-f]+|#-?\d+)/gi, '<span class="op-imm">$1</span>');
+  return `<span class="${cls}">${esc(mnem)}</span><span class="op-reg">${opsHtml}</span>`;
+}
+
+async function init() {
+  try {
+    const r = await fetch("/api/info");
+    if (r.ok) {
+      const info = await r.json();
+      if (info.mode === "trace") {
+        appMode = "trace";
+        traceTotal = info.totalRecords || 0;
+        const shortName = String(info.tracePath || "").split(/[\\/]/).pop();
+        $("modeBadge").textContent = "TRACE";
+        $("modeBadge").classList.add("trace");
+        $("metaSummary").textContent = `${shortName} · ${traceTotal.toLocaleString()} insns · ${info.totalExtRecords.toLocaleString()} ext · base ${info.baseHex}`;
+        $("metaSummary").title = info.tracePath || "";
+        $("timelineWrap").style.display = "flex";
+        loadDump(0);
+        renderSide();
+        return;
+      }
+    }
+  } catch (_) {}
+
+  try {
+    const h = await fetch("/health");
+    if (h.ok) {
+      appMode = "rpc";
+      $("modeBadge").textContent = "RPC LIVE";
+      $("modeBadge").classList.add("live");
+      document.querySelector('.tab[data-tab="rpc"]').click();
+      setInterval(() => {
+        if ($("view-rpc").classList.contains("active")) refreshRpc();
+      }, 2500);
+      return;
+    }
+  } catch (_) {}
+  $("modeBadge").textContent = "OFFLINE";
+}
+
+function updateTimelineCursor(idx) {
+  if (!traceTotal) return;
+  const pct = Math.max(0, Math.min(100, (idx / traceTotal) * 100));
+  $("tlCursor").style.left = pct.toFixed(3) + "%";
+  $("tlPosLabel").textContent = `#${idx.toLocaleString()} / ${traceTotal.toLocaleString()} (${pct.toFixed(1)}%)`;
+}
+
+function renderTimelineMarkers(groups) {
+  const bar = $("timelineBar");
+  bar.querySelectorAll(".tl-marker").forEach(el => el.remove());
+  if (!traceTotal || !groups) return;
+  for (const g of groups) {
+    const left = (g.startIdx / traceTotal) * 100;
+    const width = Math.max(0.35, ((g.endIdx - g.startIdx + 1) / traceTotal) * 100);
+    const el = document.createElement("div");
+    el.className = "tl-marker";
+    el.style.left = left.toFixed(3) + "%";
+    el.style.width = width.toFixed(3) + "%";
+    el.style.background = algoColor(g.algorithm);
+    el.title = `${g.algorithm} ${g.firstPcOffset || g.firstPcHex} (#${g.startIdx}..#${g.endIdx})`;
+    el.onclick = (ev) => { ev.stopPropagation(); jumpTo(g.startIdx); };
+    bar.appendChild(el);
+  }
+}
+
+$("timelineBar").onclick = (ev) => {
+  if (!traceTotal) return;
+  const rect = $("timelineBar").getBoundingClientRect();
+  const ratio = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+  jumpTo(Math.floor(ratio * traceTotal));
+};
+
+async function loadDump(skip, highlightIdx = -1) {
+  const limit = Math.min(Math.max(Number($("inpLimit").value) || 120, 10), 500);
+  skip = Math.max(0, Math.min(skip, Math.max(0, traceTotal - 1)));
+  currentTargetIdx = highlightIdx;
+  $("inpSkip").value = skip;
+  $("btnClearSearch").style.display = "none";
+  updateTimelineCursor(highlightIdx >= 0 ? highlightIdx : skip);
+
+  const r = await fetch(`/api/trace/dump?skip=${skip}&limit=${limit}`);
+  const data = await r.json();
+  const rows = [];
+  for (const item of data.items) {
+    const isTarget = item.idx === currentTargetIdx ? " target" : "";
+    const off = item.offset ? `[${esc(item.offset)}]` : "";
+    let regHtml = "";
+    if (item.regs && item.regs.length > 0) {
+      regHtml = '<span class="col-regs">' + item.regs.map(rg => {
+        const hint = rg.ascii ? `<span class="ascii-hint">${esc(rg.ascii)}</span>` : "";
+        return `<span class="reg-chip" title="点击检索此值" onclick="quickSearchVal('${rg.valHex}')">${esc(rg.name)}=${esc(rg.valHex)}${hint}</span>`;
+      }).join("") + "</span>";
+    }
+    rows.push(
+      `<div class="insn-row${isTarget}" id="row-${item.idx}">` +
+      `<span class="col-seq">#${String(item.idx).padStart(6,"0")}</span>` +
+      `<span class="col-off">${off}</span>` +
+      `<span class="col-pc">${esc(item.pcHex)}</span>` +
+      `<span class="col-asm">${highlightAsm(item.asm)}</span>` +
+      regHtml +
+      `</div>`
+    );
+    if (item.mems) {
+      for (const m of item.mems) {
+        const cls = m.includes("[MEM W") ? "mem-w" : "mem-r";
+        rows.push(`<div class="mem-row"><span class="${cls}">${esc(m)}</span></div>`);
+      }
+    }
+  }
+  $("traceList").innerHTML = rows.join("") || '<div class="empty">无记录</div>';
+  $("traceList").scrollTop = 0;
+}
+
+window.quickSearchVal = function(hexVal) {
+  $("selSearchKind").value = "val";
+  $("inpSearch").value = hexVal;
+  runSearch();
+};
+
+window.jumpTo = function(idx) {
+  loadDump(Math.max(0, idx - 4), idx);
+};
+
+async function runSearch() {
+  const kind = $("selSearchKind").value;
+  const q = $("inpSearch").value.trim();
+  if (!q) return;
+  $("btnClearSearch").style.display = "inline-block";
+  $("traceList").innerHTML = '<div class="empty">检索中...</div>';
+  const r = await fetch(`/api/trace/search?${kind}=${encodeURIComponent(q)}&limit=150`);
+  const data = await r.json();
+  const rows = [`<div style="padding:4px 14px 8px" class="muted">命中 <strong style="color:#fff">${data.total}</strong> 条（展示前 ${data.hits.length} 条），点击任意行定位上下文：</div>`];
+  for (const h of data.hits) {
+    const click = h.idx !== null && h.idx !== undefined ? `onclick="jumpTo(${h.idx})"` : "";
+    rows.push(`<div class="search-hit" ${click}>${esc(h.text)}</div>`);
+  }
+  $("traceList").innerHTML = rows.join("");
+}
+
+async function renderSide() {
+  if (appMode !== "trace") {
+    $("sideBody").innerHTML = '<div class="empty">Trace 模式可用</div>';
+    return;
+  }
+  $("sideBody").innerHTML = '<div class="empty">分析中...</div>';
+  if (currentSide === "crypto") {
+    if (!sideCache.crypto) {
+      sideCache.crypto = await (await fetch("/api/trace/crypto")).json();
+      renderTimelineMarkers(sideCache.crypto.groups || []);
+    }
+    const g = sideCache.crypto.groups || [];
+    if (!g.length) { $("sideBody").innerHTML = '<div class="empty">未检出已知标准密码学常量</div>'; return; }
+    $("sideBody").innerHTML = g.map(x =>
+      `<div class="side-card" onclick="jumpTo(${x.startIdx})">
+        <div class="side-card-top">
+          <span class="pill ${algoPillClass(x.algorithm)}">${esc(x.algorithm)}</span>
+          <span style="color:var(--purple)">${esc(x.firstPcOffset || x.firstPcHex)}</span>
+        </div>
+        <div class="side-card-sub"><span>#${x.startIdx.toLocaleString()}..#${x.endIdx.toLocaleString()}</span><span>${x.hitCount} hits</span></div>
+      </div>`
+    ).join("");
+  } else if (currentSide === "calltree") {
+    if (!sideCache.calltree) {
+      sideCache.calltree = await (await fetch("/api/trace/calltree?maxDepth=6&minInsns=500")).json();
+    }
+    const nodes = sideCache.calltree.nodes || [];
+    $("sideBody").innerHTML = nodes.map(n =>
+      `<div class="side-card" style="margin-left:${Math.min(n.depth,5)*10}px" onclick="jumpTo(${n.startIdx})">
+        <div class="side-card-top">
+          <span style="color:var(--blue)">${esc(n.targetOffset || n.targetHex)}</span>
+          <span class="pill pill-dim">${n.percent}%</span>
+        </div>
+        <div class="side-card-sub"><span>#${n.startIdx.toLocaleString()}..#${n.endIdx.toLocaleString()}</span><span>${n.insnCount.toLocaleString()} insns</span></div>
+      </div>`
+    ).join("") || '<div class="empty">无调用节点</div>';
+  } else {
+    if (!sideCache.stats) {
+      sideCache.stats = await (await fetch("/api/trace/stats?top=20")).json();
+    }
+    const s = sideCache.stats;
+    let html = `<div class="muted" style="padding:2px 4px 6px">唯一 PC ${s.uniquePcs.toLocaleString()} · 唯一 BL ${s.uniqueBl.toLocaleString()}</div>`;
+    html += (s.topBl || []).map(x =>
+      `<div class="side-card" onclick="quickSearchVal('${x.addrHex}')">
+        <div class="side-card-top"><span style="color:var(--text)">BL ${esc(x.offset || x.addrHex)}</span><span class="pill pill-ok">×${x.count}</span></div>
+      </div>`
+    ).join("");
+    html += `<div class="muted" style="padding:10px 4px 4px">Top 热点 PC</div>`;
+    html += (s.topPc || []).slice(0, 10).map(x =>
+      `<div class="side-card">
+        <div class="side-card-top"><span style="color:var(--text-2)">${esc(x.offset || x.addrHex)}</span><span class="pill pill-md5">×${x.count}</span></div>
+      </div>`
+    ).join("");
+    $("sideBody").innerHTML = html;
+  }
+}
+
+$("btnJump").onclick = () => loadDump(Number($("inpSkip").value) || 0, Number($("inpSkip").value) || 0);
+$("btnPrev").onclick = () => loadDump((Number($("inpSkip").value) || 0) - (Number($("inpLimit").value) || 120));
+$("btnNext").onclick = () => loadDump((Number($("inpSkip").value) || 0) + (Number($("inpLimit").value) || 120));
+$("btnSearch").onclick = runSearch;
+$("btnClearSearch").onclick = () => loadDump(Number($("inpSkip").value) || 0, currentTargetIdx);
+$("inpSearch").addEventListener("keydown", (e) => { if (e.key === "Enter") runSearch(); });
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") {
+    if (e.key === "Escape") { e.target.blur(); $("btnClearSearch").click(); }
+    return;
+  }
+  if (e.key === "/") { e.preventDefault(); $("inpSearch").focus(); }
+  else if (e.key === "[") $("btnPrev").click();
+  else if (e.key === "]") $("btnNext").click();
+  else if (e.key === "Escape" && $("btnClearSearch").style.display !== "none") $("btnClearSearch").click();
+});
+
+async function refreshRpc() {
+  try {
+    const [h, m, ex] = await Promise.all([
+      fetch("/health").then(r => r.json()),
+      fetch("/metrics").then(r => r.json()),
+      fetch("/exports").then(r => r.json()),
+    ]);
+    $("rpcStatusLine").textContent = `状态 ${h.status} · Workers=${h.workers} · Reload Epoch=${m.reload_epoch ?? 0}`;
+    const kpis = [
+      ["总请求数", (m.requests_total ?? 0).toLocaleString()],
+      ["成功 / 失败", `${m.requests_ok ?? 0} / ${m.requests_err ?? 0}`],
+      ["超时 / 拒绝", `${m.requests_timeout ?? 0} / ${m.requests_rejected ?? 0}`],
+      ["平均延迟 (ms)", (m.latency_avg_ms ?? 0).toFixed(2)],
+      ["Worker 数", h.workers ?? 1],
+      ["队列深度", `${m.queue_len ?? 0} / ${m.queue_cap ?? 0}`],
+    ];
+    $("rpcKpis").innerHTML = kpis.map(([l, v]) => `<div class="kpi"><div class="kpi-lbl">${l}</div><div class="kpi-val">${v}</div></div>`).join("");
+
+    const buckets = m.latency_buckets_ms || {};
+    const maxV = Math.max(1, ...Object.values(buckets));
+    $("rpcLatencyBars").innerHTML = Object.entries(buckets).map(([k, v]) =>
+      `<div class="bar-row"><span style="width:76px;color:var(--text-2)">${k}</span><div class="bar-track"><div class="bar-fill" style="width:${(v/maxV)*100}%"></div></div><span style="width:44px;text-align:right;color:var(--text-2)">${v}</span></div>`
+    ).join("") || '<div class="muted">暂无请求</div>';
+
+    const sel = $("rpcMethodSel");
+    const cur = sel.value;
+    const list = ex.exports || [];
+    if (sel.options.length !== list.length) {
+      sel.innerHTML = list.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join("");
+      if (cur && list.includes(cur)) sel.value = cur;
+    }
+  } catch (_) {
+    $("rpcStatusLine").textContent = "未连接到 RPC 服务（通过 runidbg-cli serve 启动后访问 /ui 可用）";
+  }
+}
+
+$("btnRefreshRpc").onclick = refreshRpc;
+$("btnHotReload").onclick = async () => {
+  const r = await fetch("/admin/reload", { method: "POST" });
+  $("rpcCallOut").textContent = await r.text();
+  refreshRpc();
+};
+$("btnRpcCall").onclick = async () => {
+  const method = $("rpcMethodSel").value;
+  if (!method) return;
+  const t0 = performance.now();
+  try {
+    const r = await fetch(`/call/${encodeURIComponent(method)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: $("rpcArgsInp").value || "[]",
+    });
+    const txt = await r.text();
+    $("rpcCallOut").textContent = `HTTP ${r.status} (${(performance.now() - t0).toFixed(1)} ms)\n` + txt;
+    refreshRpc();
+  } catch (e) {
+    $("rpcCallOut").textContent = "Error: " + e;
+  }
+};
+
+$("btnParseDiag").onclick = () => {
+  try {
+    const d = JSON.parse($("diagInput").value);
+    const lines = ["// Auto-generated by runidbg Web UI"];
+    const cards = [];
+    for (const [k, cnt] of Object.entries(d.missingFiles || {})) {
+      cards.push(`<span class="pill pill-sha">FILE ${esc(k)} ×${cnt}</span>`);
+      lines.push(`emu.vfs.writeFile(${JSON.stringify(k)}, "");`);
+    }
+    for (const [k, cnt] of Object.entries(d.missingProperties || {})) {
+      cards.push(`<span class="pill pill-ok">PROP ${esc(k)} ×${cnt}</span>`);
+      lines.push(`emu.vfs.setProperty(${JSON.stringify(k)}, "");`);
+    }
+    for (const [k, cnt] of Object.entries(d.missingSyscalls || {})) {
+      cards.push(`<span class="pill pill-md5">SVC #${esc(k)} ×${cnt}</span>`);
+      lines.push(`emu.hook.syscall(${Number(k)}, (ctx, nr) => 0);`);
+    }
+    for (const [k, cnt] of Object.entries(d.missingJni || {})) {
+      cards.push(`<span class="pill pill-aes">JNI ${esc(k)} ×${cnt}</span>`);
+      lines.push(`// TODO JNI hook: ${k}`);
+    }
+    $("diagCards").innerHTML = cards.join("") || '<div class="muted">未发现缺失项</div>';
+    $("diagPatchOut").textContent = lines.join("\n");
+  } catch (e) {
+    $("diagPatchOut").textContent = "JSON 解析失败: " + e;
+  }
+};
+$("btnCopyPatch").onclick = () => {
+  navigator.clipboard?.writeText($("diagPatchOut").textContent);
+};
+
+init();
+</script>
+</body>
+</html>

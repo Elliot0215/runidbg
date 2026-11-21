@@ -49,3 +49,6 @@ jobs:
 
       - name: Clippy (mcp only)
         run: cargo clippy --no-default-features --features mcp --all-targets -- -D warnings
+
+      - name: Clippy & test (ui feature)
+        run: cargo clippy --features ui --all-targets -- -D warnings && cargo test --features ui --test ui_web

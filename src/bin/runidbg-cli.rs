@@ -54,6 +54,7 @@ fn print_usage() {
            runidbg-cli stats <trace.idx> [--base <hex>] [--top N]\n\
            runidbg-cli calltree <trace.idx> [--base <hex>] [--max-depth N] [--min-insns N]\n\
            runidbg-cli crypto-scan <trace.idx> [--ext <trace.ext>] [--base <hex>]\n\
+           runidbg-cli ui <trace.idx> [--ext <trace.ext>] [--base <hex>] [--listen 127.0.0.1:8088] [--open]\n\
            runidbg-cli export-ida <trace.idx> --base <hex> [--out <script.py>]\n\
            runidbg-cli export-bn  <trace.idx> --base <hex> [--out <script.py>]"
     );
@@ -231,6 +232,68 @@ fn init_types_command(_args: &[String]) -> Result<()> {
     bail!("当前构建未启用 QuickJS 脚本引擎，请使用默认 features 或 `--features js` 重新编译")
 }
 
+#[cfg(feature = "ui")]
+fn ui_command(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!("用法: runidbg-cli ui <trace.idx> [--ext <trace.ext>] [--base <hex>] [--listen 127.0.0.1:8088] [--open]");
+    }
+    let idx_path = PathBuf::from(&args[0]);
+    let mut ext_path: Option<PathBuf> = None;
+    let mut base_addr: u64 = 0;
+    let mut listen_addr = "127.0.0.1:8088".to_string();
+    let mut auto_open = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ext" if i + 1 < args.len() => {
+                ext_path = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--base" if i + 1 < args.len() => {
+                base_addr = parse_u64_hex_or_dec(&args[i + 1])?;
+                i += 2;
+            }
+            "--listen" if i + 1 < args.len() => {
+                listen_addr = args[i + 1].clone();
+                i += 2;
+            }
+            "--open" => {
+                auto_open = true;
+                i += 1;
+            }
+            other => bail!("ui 未知参数: {other}"),
+        }
+    }
+
+    if ext_path.is_none() {
+        let sibling = idx_path.with_extension("ext");
+        if sibling != idx_path && sibling.is_file() {
+            ext_path = Some(sibling);
+        }
+    }
+
+    let handle = runidbg_arm64_emu_tracer::ui::start_trace_ui_server(
+        &idx_path,
+        ext_path.as_deref(),
+        base_addr,
+        &listen_addr,
+    )?;
+    let url = format!("http://{}/", handle.local_addr());
+    println!("[runidbg-ui] Trace Web UI 已启动: {url}");
+    println!("[runidbg-ui] 按 Ctrl+C 退出");
+    if auto_open {
+        runidbg_arm64_emu_tracer::ui::open_in_browser(&url);
+    }
+    handle.wait();
+    Ok(())
+}
+
+#[cfg(not(feature = "ui"))]
+fn ui_command(_args: &[String]) -> Result<()> {
+    bail!("当前构建未启用 Web UI（默认关闭以保持精简），请使用 `cargo build --release --features ui` 重新编译")
+}
+
 fn debug_gdb_command(args: &[String]) -> Result<()> {
     if args.len() < 2 {
         bail!("用法: runidbg-cli debug <lib.so> <symbol|0xaddr> [--listen 127.0.0.1:1234] [--pkg com.example.app]");
@@ -318,6 +381,7 @@ fn main() -> Result<()> {
         "serve" => return serve_rpc_command(&args[2..]),
         "mcp" => return mcp_command(&args[2..]),
         "debug" => return debug_gdb_command(&args[2..]),
+        "ui" => return ui_command(&args[2..]),
         "init-types" => return init_types_command(&args[2..]),
         "-h" | "--help" | "help" => {
             print_usage();

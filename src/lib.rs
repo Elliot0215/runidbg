@@ -13,5 +13,7 @@ pub mod os;
 pub mod script;
 pub mod snapshot;
 pub mod tracer;
+#[cfg(feature = "ui")]
+pub mod ui;
 
 pub use emulator::{AndroidEmulator, AndroidEmulatorBuilder};

@@ -564,7 +564,7 @@ pub fn start_rpc_server(source: RpcSource, config: RpcServerConfig) -> Result<Rp
 }
 
 fn build_router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let router = Router::new()
         .route("/health", get(handle_health).options(handle_cors_preflight))
         .route(
             "/exports",
@@ -583,9 +583,10 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route(
             "/admin/reload",
             post(handle_reload).options(handle_cors_preflight),
-        )
-        .fallback(handle_not_found)
-        .with_state(state)
+        );
+    #[cfg(feature = "ui")]
+    let router = router.route("/ui", get(crate::ui::serve_spa_html));
+    router.fallback(handle_not_found).with_state(state)
 }
 
 fn with_cors(mut resp: Response) -> Response {
