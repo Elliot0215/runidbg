@@ -56,11 +56,18 @@ pub trait JniHandler {
 
     fn call_long_method(
         &mut self,
-        _ctx: &mut JniContext<'_>,
-        _obj: JObjectRef,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
         method: &MethodDesc,
         _args: &[JValue],
     ) -> i64 {
+        if method.name == "longValue" {
+            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(obj) {
+                if let Some(JValue::Long(v)) = fields.get("value") {
+                    return *v;
+                }
+            }
+        }
         tracing::warn!(target: "runidbg::jni", 
             "[JNI] 未处理的 CallLongMethod: {}.{}{}",
             method.class_name, method.name, method.sig
@@ -267,51 +274,86 @@ pub trait JniHandler {
 
     fn call_byte_method(
         &mut self,
-        _ctx: &mut JniContext<'_>,
-        _obj: JObjectRef,
-        _method: &MethodDesc,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        method: &MethodDesc,
         _args: &[JValue],
     ) -> i8 {
+        if method.name == "byteValue" {
+            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(obj) {
+                if let Some(JValue::Byte(v)) = fields.get("value") {
+                    return *v;
+                }
+            }
+        }
         0
     }
 
     fn call_char_method(
         &mut self,
-        _ctx: &mut JniContext<'_>,
-        _obj: JObjectRef,
-        _method: &MethodDesc,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        method: &MethodDesc,
         _args: &[JValue],
     ) -> u16 {
+        if method.name == "charValue" {
+            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(obj) {
+                if let Some(JValue::Char(v)) = fields.get("value") {
+                    return *v;
+                }
+            }
+        }
         0
     }
 
     fn call_short_method(
         &mut self,
-        _ctx: &mut JniContext<'_>,
-        _obj: JObjectRef,
-        _method: &MethodDesc,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        method: &MethodDesc,
         _args: &[JValue],
     ) -> i16 {
+        if method.name == "shortValue" {
+            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(obj) {
+                if let Some(JValue::Short(v)) = fields.get("value") {
+                    return *v;
+                }
+            }
+        }
         0
     }
 
     fn call_float_method(
         &mut self,
-        _ctx: &mut JniContext<'_>,
-        _obj: JObjectRef,
-        _method: &MethodDesc,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        method: &MethodDesc,
         _args: &[JValue],
     ) -> f32 {
+        if method.name == "floatValue" {
+            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(obj) {
+                if let Some(JValue::Float(v)) = fields.get("value") {
+                    return *v;
+                }
+            }
+        }
         0.0
     }
 
     fn call_double_method(
         &mut self,
-        _ctx: &mut JniContext<'_>,
-        _obj: JObjectRef,
-        _method: &MethodDesc,
+        ctx: &mut JniContext<'_>,
+        obj: JObjectRef,
+        method: &MethodDesc,
         _args: &[JValue],
     ) -> f64 {
+        if method.name == "doubleValue" {
+            if let Some(JObject::Custom { fields, .. }) = ctx.objects.get(obj) {
+                if let Some(JValue::Double(v)) = fields.get("value") {
+                    return *v;
+                }
+            }
+        }
         0.0
     }
 
@@ -594,6 +636,10 @@ pub fn default_call_int_method(
 ) -> i32 {
     match (ctx.objects.get(obj), method.name.as_str()) {
         (Some(JObject::String(s)), "length") => s.chars().count() as i32,
+        (Some(JObject::Custom { fields, .. }), "intValue") => match fields.get("value") {
+            Some(JValue::Int(v)) => *v,
+            _ => 0,
+        },
         _ => {
             tracing::warn!(target: "runidbg::jni", 
                 "[JNI] 未处理的 CallIntMethod: {}.{}{}",
@@ -619,6 +665,10 @@ pub fn default_call_boolean_method(
                 .and_then(|r| ctx.objects.get_string(r));
             rhs == Some(lhs.as_str())
         }
+        (Some(JObject::Custom { fields, .. }), "booleanValue") => match fields.get("value") {
+            Some(JValue::Boolean(v)) => *v,
+            _ => false,
+        },
         _ => {
             tracing::warn!(target: "runidbg::jni", 
                 "[JNI] 未处理的 CallBooleanMethod: {}.{}{}",
@@ -675,6 +725,33 @@ pub fn default_call_static_object_method(
             fields.insert("value".to_string(), v);
             Some(ctx.objects.add_local(JObject::Custom {
                 class_name: "java/lang/Boolean".to_string(),
+                fields,
+            }))
+        }
+        ("java/lang/Byte", "valueOf") => {
+            let mut fields = HashMap::new();
+            let v = args.first().cloned().unwrap_or(JValue::Byte(0));
+            fields.insert("value".to_string(), v);
+            Some(ctx.objects.add_local(JObject::Custom {
+                class_name: "java/lang/Byte".to_string(),
+                fields,
+            }))
+        }
+        ("java/lang/Character", "valueOf") => {
+            let mut fields = HashMap::new();
+            let v = args.first().cloned().unwrap_or(JValue::Char(0));
+            fields.insert("value".to_string(), v);
+            Some(ctx.objects.add_local(JObject::Custom {
+                class_name: "java/lang/Character".to_string(),
+                fields,
+            }))
+        }
+        ("java/lang/Short", "valueOf") => {
+            let mut fields = HashMap::new();
+            let v = args.first().cloned().unwrap_or(JValue::Short(0));
+            fields.insert("value".to_string(), v);
+            Some(ctx.objects.add_local(JObject::Custom {
+                class_name: "java/lang/Short".to_string(),
                 fields,
             }))
         }
@@ -768,6 +845,26 @@ pub fn default_new_object(
         if method.sig == "()V" {
             return ctx.objects.add_string("");
         }
+    }
+    if matches!(
+        class_name,
+        "java/lang/Boolean"
+            | "java/lang/Byte"
+            | "java/lang/Character"
+            | "java/lang/Short"
+            | "java/lang/Integer"
+            | "java/lang/Long"
+            | "java/lang/Float"
+            | "java/lang/Double"
+    ) {
+        let mut fields = HashMap::new();
+        if let Some(v) = args.first().cloned() {
+            fields.insert("value".to_string(), v);
+        }
+        return ctx.objects.add_local(JObject::Custom {
+            class_name: class_name.to_string(),
+            fields,
+        });
     }
     ctx.objects.add_local(JObject::Custom {
         class_name: class_name.to_string(),

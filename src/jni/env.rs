@@ -1503,6 +1503,32 @@ fn resolve_builtin_build_object_field(
         ("android/os/Build$VERSION", "INCREMENTAL") => objects.add_string(&dp.incremental),
         ("android/os/Build$VERSION", "SECURITY_PATCH") => objects.add_string(&dp.security_patch),
         ("android/os/Build$VERSION", "CODENAME") => objects.add_string("REL"),
+        // Java 基础包装类原始类型 Class 常量（JNA 等库在 JNI_OnLoad 阶段高频读取）
+        ("java/lang/Void", "TYPE") => objects.find_or_create_class("void"),
+        ("java/lang/Boolean", "TYPE") => objects.find_or_create_class("boolean"),
+        ("java/lang/Byte", "TYPE") => objects.find_or_create_class("byte"),
+        ("java/lang/Character", "TYPE") => objects.find_or_create_class("char"),
+        ("java/lang/Short", "TYPE") => objects.find_or_create_class("short"),
+        ("java/lang/Integer", "TYPE") => objects.find_or_create_class("int"),
+        ("java/lang/Long", "TYPE") => objects.find_or_create_class("long"),
+        ("java/lang/Float", "TYPE") => objects.find_or_create_class("float"),
+        ("java/lang/Double", "TYPE") => objects.find_or_create_class("double"),
+        ("java/lang/Boolean", "TRUE") => {
+            let mut fields = HashMap::new();
+            fields.insert("value".to_string(), JValue::Boolean(true));
+            objects.add_local(JObject::Custom {
+                class_name: "java/lang/Boolean".to_string(),
+                fields,
+            })
+        }
+        ("java/lang/Boolean", "FALSE") => {
+            let mut fields = HashMap::new();
+            fields.insert("value".to_string(), JValue::Boolean(false));
+            objects.add_local(JObject::Custom {
+                class_name: "java/lang/Boolean".to_string(),
+                fields,
+            })
+        }
         _ => JObjectRef::NULL,
     }
 }

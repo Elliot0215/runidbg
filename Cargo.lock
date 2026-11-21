@@ -777,7 +777,7 @@ dependencies = [
 
 [[package]]
 name = "runidbg-arm64-emu-tracer"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-channel",
