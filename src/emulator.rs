@@ -285,6 +285,25 @@ impl AndroidEmulator {
 
         let module = load_res?;
 
+        // 将所有新加载模块元数据同步到 TrampolineTable（供 dlopen/dlsym/dladdr/dl_iterate_phdr 使用）
+        {
+            let new_mods: Vec<crate::loader::trampoline::DlModuleEntry> = self.linker.load_order()
+                [prev_loaded..]
+                .iter()
+                .filter_map(|m| self.linker.get_module(m))
+                .map(|m| crate::loader::trampoline::DlModuleEntry {
+                    name: m.name.clone(),
+                    base_addr: m.base_addr,
+                    image_size: m.image_size,
+                    symbols: m.symbols.clone(),
+                })
+                .collect();
+            let tramp = &mut self.uc.get_data_mut().trampolines;
+            for entry in new_mods {
+                tramp.register_loaded_module(entry);
+            }
+        }
+
         if run_init_array {
             // 按依赖拓扑顺序依次执行所有新加载模块（含 DT_NEEDED 依赖）的 .init_array
             let init_fns: Vec<u64> = self.linker.load_order()[prev_loaded..]

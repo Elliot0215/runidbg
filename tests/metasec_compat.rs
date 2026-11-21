@@ -77,6 +77,7 @@ fn tiktok_metasec_offline_cylons_and_gorgon_family() {
                     khronosLen: (g["X-Khronos"] || "").length,
                     ladonLen: (g["X-Ladon"] || "").length,
                     missingJniCount: Object.keys(diag.missingJni).length,
+                    missingJni: diag.missingJni,
                 };
             },
         };
@@ -96,7 +97,12 @@ fn tiktok_metasec_offline_cylons_and_gorgon_family() {
     assert_eq!(v["gorgonPrefix"].as_str(), Some("8404"));
     assert_eq!(v["khronosLen"].as_u64(), Some(10));
     assert_eq!(v["ladonLen"].as_u64(), Some(48));
-    assert_eq!(v["missingJniCount"].as_u64(), Some(0));
+    assert_eq!(
+        v["missingJniCount"].as_u64(),
+        Some(0),
+        "unexpected missingJni: {}",
+        v["missingJni"]
+    );
 }
 
 #[test]

@@ -184,6 +184,22 @@ pub enum HleBuiltin {
     Mrand48,
     Srand48,
     Drand48,
+    // 动态链接器运行时 API
+    Dlopen,
+    Dlsym,
+    Dlclose,
+    Dlerror,
+    Dladdr,
+    DlIteratePhdr,
+    // 目录遍历 API
+    Opendir,
+    Readdir,
+    Closedir,
+    Rewinddir,
+    // Bionic 新版系统属性 API
+    SystemPropertyFind,
+    SystemPropertyRead,
+    SystemPropertyReadCallback,
     // 未实现的外部符号占位桩（触发时打印告警并返回 0，避免直接跳空指针崩溃）
     UnimplementedStub(String),
 }
@@ -368,6 +384,19 @@ impl HleBuiltin {
             "mrand48" => Some(Self::Mrand48),
             "srand48" => Some(Self::Srand48),
             "drand48" => Some(Self::Drand48),
+            "dlopen" | "android_dlopen_ext" => Some(Self::Dlopen),
+            "dlsym" => Some(Self::Dlsym),
+            "dlclose" => Some(Self::Dlclose),
+            "dlerror" => Some(Self::Dlerror),
+            "dladdr" => Some(Self::Dladdr),
+            "dl_iterate_phdr" => Some(Self::DlIteratePhdr),
+            "opendir" => Some(Self::Opendir),
+            "readdir" | "readdir64" => Some(Self::Readdir),
+            "closedir" => Some(Self::Closedir),
+            "rewinddir" => Some(Self::Rewinddir),
+            "__system_property_find" => Some(Self::SystemPropertyFind),
+            "__system_property_read" => Some(Self::SystemPropertyRead),
+            "__system_property_read_callback" => Some(Self::SystemPropertyReadCallback),
             "flock"
             | "fcntl"
             | "ioctl"
@@ -393,11 +422,8 @@ impl HleBuiltin {
             | "signal"
             | "alarm"
             | "prctl"
-            | "__system_property_find"
             | "eglGetProcAddress"
             | "android_set_abort_message"
-            | "dlopen"
-            | "dlsym"
             | "openlog"
             | "closelog"
             | "syslog"
@@ -445,6 +471,28 @@ struct StdioStream {
     ungetc_buf: Option<u8>,
 }
 
+struct DirStream {
+    entries: Vec<(String, u8)>,
+    cursor: usize,
+    dirent_buf: u64,
+}
+
+struct PropInfoEntry {
+    name: String,
+    value: String,
+    name_ptr: u64,
+    value_ptr: u64,
+}
+
+/// 供 `dlopen`/`dlsym`/`dladdr`/`dl_iterate_phdr` 使用的已加载模块镜像信息
+#[derive(Debug, Clone)]
+pub struct DlModuleEntry {
+    pub name: String,
+    pub base_addr: u64,
+    pub image_size: u64,
+    pub symbols: HashMap<String, u64>,
+}
+
 /// HLE 跳板表：将外部符号或热点函数映射到 `TRAMPOLINE_BASE + slot * 4`
 pub struct TrampolineTable {
     slots: Vec<HleBuiltin>,
@@ -453,6 +501,10 @@ pub struct TrampolineTable {
     next_pthread_key: u32,
     mmap_backings: HashMap<u64, MmapFileBacking>,
     stdio_streams: HashMap<u64, StdioStream>,
+    dir_streams: HashMap<u64, DirStream>,
+    prop_infos: HashMap<u64, PropInfoEntry>,
+    loaded_modules: Vec<DlModuleEntry>,
+    last_dlerror: Option<String>,
     lcg48_state: u64,
     unimplemented_hits: HashMap<String, u64>,
     pub errno_addr: u64,
@@ -475,6 +527,8 @@ impl Default for TrampolineTable {
 /// RET                         ; 0xD65F03C0
 /// ```
 const PTHREAD_ONCE_STUB_ADDR: u64 = TRAMPOLINE_BASE + PAGE_SIZE * 16 - 0x100;
+const PROP_CALLBACK_STUB_ADDR: u64 = TRAMPOLINE_BASE + PAGE_SIZE * 16 - 0xE0;
+const DL_ITERATE_STUB_ADDR: u64 = TRAMPOLINE_BASE + PAGE_SIZE * 16 - 0xC0;
 
 impl TrampolineTable {
     pub fn new() -> Self {
@@ -485,10 +539,27 @@ impl TrampolineTable {
             next_pthread_key: 1,
             mmap_backings: HashMap::new(),
             stdio_streams: HashMap::new(),
+            dir_streams: HashMap::new(),
+            prop_infos: HashMap::new(),
+            loaded_modules: Vec::new(),
+            last_dlerror: None,
             lcg48_state: 0x0000_1234_ABCD_330E,
             unimplemented_hits: HashMap::new(),
             errno_addr: crate::cpu::TLS_BASE + 0x100,
             initialized: false,
+        }
+    }
+
+    /// 同步已加载 ELF 模块元数据（供 `dlopen`/`dlsym`/`dladdr`/`dl_iterate_phdr` 查询）
+    pub fn register_loaded_module(&mut self, entry: DlModuleEntry) {
+        if let Some(existing) = self
+            .loaded_modules
+            .iter_mut()
+            .find(|m| m.base_addr == entry.base_addr || m.name == entry.name)
+        {
+            *existing = entry;
+        } else {
+            self.loaded_modules.push(entry);
         }
     }
 
@@ -539,6 +610,43 @@ impl TrampolineTable {
         ];
         for (i, insn) in stub_insns.iter().enumerate() {
             mem.write_u32(uc, PTHREAD_ONCE_STUB_ADDR + (i as u64) * 4, *insn)?;
+        }
+        // __system_property_read_callback 跳板：调用 x9(x0=cookie, x1=name, x2=value, x3=serial)
+        let prop_cb_insns: [u32; 4] = [
+            0xA9BF_7BFD, // stp x29, x30, [sp, #-16]!
+            0xD63F_0120, // blr x9
+            0xA8C1_7BFD, // ldp x29, x30, [sp], #16
+            ARM64_RET_INSN,
+        ];
+        for (i, insn) in prop_cb_insns.iter().enumerate() {
+            mem.write_u32(uc, PROP_CALLBACK_STUB_ADDR + (i as u64) * 4, *insn)?;
+        }
+        // dl_iterate_phdr 回调循环跳板：x0=cb, x1=data, x2=info_array, x3=count (stride=64)
+        let dl_iter_insns: [u32; 21] = [
+            0xA9BD_7BFD, // [0]  stp x29, x30, [sp, #-48]!
+            0xA901_53F3, // [1]  stp x19, x20, [sp, #16]
+            0xA902_5BF5, // [2]  stp x21, x22, [sp, #32]
+            0xAA00_03F3, // [3]  mov x19, x0 (cb)
+            0xAA01_03F4, // [4]  mov x20, x1 (data)
+            0xAA02_03F5, // [5]  mov x21, x2 (info ptr)
+            0xAA03_03F6, // [6]  mov x22, x3 (count)
+            0xD280_0000, // [7]  mov x0, #0
+            0xB400_0136, // [8]  cbz x22, [17] (done)
+            0xAA15_03E0, // [9]  mov x0, x21
+            0xD280_0801, // [10] mov x1, #64
+            0xAA14_03E2, // [11] mov x2, x20
+            0xD63F_0260, // [12] blr x19
+            0xB500_0080, // [13] cbnz x0, [17] (done)
+            0x9101_02B5, // [14] add x21, x21, #64
+            0xD100_06D6, // [15] sub x22, x22, #1
+            0x17FF_FFF8, // [16] b [8] (loop)
+            0xA942_5BF5, // [17] ldp x21, x22, [sp, #32]
+            0xA941_53F3, // [18] ldp x19, x20, [sp, #16]
+            0xA8C3_7BFD, // [19] ldp x29, x30, [sp], #48
+            ARM64_RET_INSN,
+        ];
+        for (i, insn) in dl_iter_insns.iter().enumerate() {
+            mem.write_u32(uc, DL_ITERATE_STUB_ADDR + (i as u64) * 4, *insn)?;
         }
         self.initialized = true;
         Ok(())
@@ -3046,6 +3154,423 @@ where
             let bits = val.to_bits();
             let _ = uc.reg_write(RegisterARM64::D0, bits);
             bits
+        }
+        // ---- 动态链接器运行时 API (dlopen / dlsym / dlclose / dlerror / dladdr / dl_iterate_phdr) ----
+        HleBuiltin::Dlopen => {
+            // void* dlopen(const char* filename, int flags)
+            const DL_HANDLE_MAIN: u64 = 0xD100_0000;
+            const DL_HANDLE_SYS: u64 = 0xD1FF_0001;
+            if x0 == 0 {
+                DL_HANDLE_MAIN
+            } else {
+                let raw = read_guest_cstr(uc, x0, 512);
+                let base = raw.rsplit('/').next().unwrap_or(&raw);
+                let (table, _, _) = get_state(uc.get_data_mut());
+                if let Some(idx) = table
+                    .loaded_modules
+                    .iter()
+                    .position(|m| m.name == raw || m.name == base)
+                {
+                    table.last_dlerror = None;
+                    DL_HANDLE_MAIN + 1 + (idx as u64)
+                } else if matches!(
+                    base,
+                    "libc.so"
+                        | "libm.so"
+                        | "libdl.so"
+                        | "liblog.so"
+                        | "libz.so"
+                        | "libandroid.so"
+                        | "libc++.so"
+                        | "libc++_shared.so"
+                        | "libstdc++.so"
+                        | "libnativewindow.so"
+                ) {
+                    table.last_dlerror = None;
+                    DL_HANDLE_SYS
+                } else {
+                    table.last_dlerror = Some(format!("library \"{raw}\" not found"));
+                    0
+                }
+            }
+        }
+        HleBuiltin::Dlsym => {
+            // void* dlsym(void* handle, const char* symbol)
+            const DL_HANDLE_MAIN: u64 = 0xD100_0000;
+            const DL_HANDLE_SYS: u64 = 0xD1FF_0001;
+            let sym = read_guest_cstr(uc, x1, 256);
+            if sym.is_empty() {
+                0
+            } else {
+                // 1. 先按句柄在已加载 ELF 模块中查找
+                let found_in_mod = {
+                    let (table, _, _) = get_state(uc.get_data_mut());
+                    if x0 > DL_HANDLE_MAIN && x0 < DL_HANDLE_SYS {
+                        let idx = (x0 - DL_HANDLE_MAIN - 1) as usize;
+                        table
+                            .loaded_modules
+                            .get(idx)
+                            .and_then(|m| m.symbols.get(&sym).copied())
+                    } else if x0 == 0 || x0 == DL_HANDLE_MAIN || x0 == (-1i64) as u64 {
+                        table
+                            .loaded_modules
+                            .iter()
+                            .find_map(|m| m.symbols.get(&sym).copied())
+                    } else {
+                        None
+                    }
+                };
+                if let Some(addr) = found_in_mod {
+                    addr
+                } else if x0 == 0
+                    || x0 == DL_HANDLE_MAIN
+                    || x0 == DL_HANDLE_SYS
+                    || x0 == (-1i64) as u64
+                {
+                    // 2. 回退到内置 HLE 跳板表（返回真实可调用的 ARM64 跳板地址）
+                    if HleBuiltin::from_symbol(&sym).is_some() {
+                        let existing = get_state(uc.get_data_mut()).0.get_addr(&sym);
+                        if let Some(addr) = existing {
+                            addr
+                        } else {
+                            // 动态分配新跳板槽位
+                            let (addr, ok) = {
+                                let (table, mem, _) = get_state(uc.get_data_mut());
+                                let slot_idx = table.slots.len() as u64;
+                                let a = TRAMPOLINE_BASE + slot_idx * 4;
+                                let action = HleBuiltin::from_symbol(&sym).unwrap();
+                                table.slots.push(action);
+                                table.name_to_addr.insert(sym.clone(), a);
+                                let _ = mem;
+                                (a, true)
+                            };
+                            if ok {
+                                let _ = uc.mem_write(addr, &ARM64_RET_INSN.to_le_bytes());
+                            }
+                            addr
+                        }
+                    } else {
+                        let (table, _, _) = get_state(uc.get_data_mut());
+                        table.last_dlerror = Some(format!("undefined symbol: {sym}"));
+                        0
+                    }
+                } else {
+                    0
+                }
+            }
+        }
+        HleBuiltin::Dlclose => 0,
+        HleBuiltin::Dlerror => {
+            let err_str = {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                table.last_dlerror.take()
+            };
+            if let Some(msg) = err_str {
+                let mut bytes = msg.into_bytes();
+                bytes.push(0);
+                let ptr = {
+                    let (_, mem, _) = get_state(uc.get_data_mut());
+                    mem.alloc_heap(bytes.len() as u64).unwrap_or(0)
+                };
+                if ptr != 0 {
+                    let _ = uc.mem_write(ptr, &bytes);
+                }
+                ptr
+            } else {
+                0
+            }
+        }
+        HleBuiltin::Dladdr => {
+            // int dladdr(const void* addr, Dl_info* info)
+            // ARM64 Dl_info (32 bytes): dli_fname(0), dli_fbase(8), dli_sname(16), dli_saddr(24)
+            if x1 == 0 {
+                0
+            } else {
+                let found = {
+                    let (table, _, _) = get_state(uc.get_data_mut());
+                    table
+                        .loaded_modules
+                        .iter()
+                        .find(|m| x0 >= m.base_addr && x0 < m.base_addr + m.image_size)
+                        .map(|m| {
+                            let best_sym = m
+                                .symbols
+                                .iter()
+                                .filter(|(_, &saddr)| saddr <= x0)
+                                .max_by_key(|(_, &saddr)| saddr)
+                                .map(|(sname, &saddr)| (sname.clone(), saddr));
+                            (m.name.clone(), m.base_addr, best_sym)
+                        })
+                };
+                if let Some((mod_name, fbase, best_sym)) = found {
+                    let mut fname_bytes = mod_name.into_bytes();
+                    fname_bytes.push(0);
+                    let (fname_ptr, sname_ptr, saddr) = {
+                        let (_, mem, _) = get_state(uc.get_data_mut());
+                        let fp = mem.alloc_heap(fname_bytes.len() as u64).unwrap_or(0);
+                        let (sp, sa) = if let Some((sn, sa)) = best_sym {
+                            let sp = mem.alloc_heap((sn.len() + 1) as u64).unwrap_or(0);
+                            (Some((sp, sn)), sa)
+                        } else {
+                            (None, 0)
+                        };
+                        (fp, sp, sa)
+                    };
+                    if fname_ptr != 0 {
+                        let _ = uc.mem_write(fname_ptr, &fname_bytes);
+                    }
+                    let sname_addr = if let Some((sp, sn)) = sname_ptr {
+                        if sp != 0 {
+                            let mut sb = sn.into_bytes();
+                            sb.push(0);
+                            let _ = uc.mem_write(sp, &sb);
+                        }
+                        sp
+                    } else {
+                        0
+                    };
+                    let mut info = [0u8; 32];
+                    info[0..8].copy_from_slice(&fname_ptr.to_le_bytes());
+                    info[8..16].copy_from_slice(&fbase.to_le_bytes());
+                    info[16..24].copy_from_slice(&sname_addr.to_le_bytes());
+                    info[24..32].copy_from_slice(&saddr.to_le_bytes());
+                    let _ = uc.mem_write(x1, &info);
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+        HleBuiltin::DlIteratePhdr => {
+            // int dl_iterate_phdr(int (*cb)(struct dl_phdr_info*, size_t, void*), void* data)
+            if x0 == 0 {
+                0
+            } else {
+                let mods: Vec<(String, u64)> = {
+                    let (table, _, _) = get_state(uc.get_data_mut());
+                    table
+                        .loaded_modules
+                        .iter()
+                        .map(|m| (m.name.clone(), m.base_addr))
+                        .collect()
+                };
+                if mods.is_empty() {
+                    0
+                } else {
+                    let count = mods.len();
+                    let arr_ptr = {
+                        let (_, mem, _) = get_state(uc.get_data_mut());
+                        mem.alloc_heap((count * 64) as u64).unwrap_or(0)
+                    };
+                    if arr_ptr == 0 {
+                        0
+                    } else {
+                        for (i, (name, base)) in mods.into_iter().enumerate() {
+                            let mut nb = name.into_bytes();
+                            nb.push(0);
+                            let nptr = {
+                                let (_, mem, _) = get_state(uc.get_data_mut());
+                                mem.alloc_heap(nb.len() as u64).unwrap_or(0)
+                            };
+                            if nptr != 0 {
+                                let _ = uc.mem_write(nptr, &nb);
+                            }
+                            // ARM64 struct dl_phdr_info: dlpi_addr @ +0, dlpi_name @ +8, dlpi_phdr @ +16, dlpi_phnum @ +24
+                            let mut entry = [0u8; 64];
+                            entry[0..8].copy_from_slice(&base.to_le_bytes());
+                            entry[8..16].copy_from_slice(&nptr.to_le_bytes());
+                            let _ = uc.mem_write(arr_ptr + (i as u64) * 64, &entry);
+                        }
+                        let _ = uc.reg_write(RegisterARM64::X2, arr_ptr);
+                        let _ = uc.reg_write(RegisterARM64::X3, count as u64);
+                        let _ = uc.reg_write(RegisterARM64::PC, DL_ITERATE_STUB_ADDR);
+                        return;
+                    }
+                }
+            }
+        }
+        // ---- 目录遍历 API (opendir / readdir / closedir / rewinddir) ----
+        HleBuiltin::Opendir => {
+            let path = read_guest_cstr(uc, x0, 512);
+            let entries = {
+                let (_, _, vfs) = get_state(uc.get_data_mut());
+                vfs.list_dir(&path)
+            };
+            if let Some(entries) = entries {
+                let (dir_ptr, dirent_buf) = {
+                    let (table, mem, _) = get_state(uc.get_data_mut());
+                    let dp = mem.alloc_heap(32).unwrap_or(0);
+                    let db = mem.alloc_heap(304).unwrap_or(0);
+                    if dp != 0 && db != 0 {
+                        table.dir_streams.insert(
+                            dp,
+                            DirStream {
+                                entries,
+                                cursor: 0,
+                                dirent_buf: db,
+                            },
+                        );
+                    }
+                    (dp, db)
+                };
+                if dir_ptr != 0 && dirent_buf != 0 {
+                    dir_ptr
+                } else {
+                    0
+                }
+            } else {
+                let (_, _, vfs) = get_state(uc.get_data_mut());
+                vfs.diag().record_missing_file(&path);
+                0
+            }
+        }
+        HleBuiltin::Readdir => {
+            let next_item = {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                if let Some(ds) = table.dir_streams.get_mut(&x0) {
+                    if ds.cursor < ds.entries.len() {
+                        let idx = ds.cursor;
+                        ds.cursor += 1;
+                        let (ref name, dtype) = ds.entries[idx];
+                        Some((ds.dirent_buf, idx as u64 + 1, dtype, name.clone()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+            if let Some((buf, ino, dtype, name)) = next_item {
+                // ARM64 Bionic struct dirent: u64 d_ino @ 0, i64 d_off @ 8, u16 d_reclen @ 16, u8 d_type @ 18, char d_name[256] @ 19
+                let mut raw = [0u8; 280];
+                let name_bytes = name.as_bytes();
+                let copy_len = name_bytes.len().min(255);
+                let reclen = ((19 + copy_len + 1 + 7) & !7) as u16;
+                raw[0..8].copy_from_slice(&ino.to_le_bytes());
+                raw[8..16].copy_from_slice(&(ino as i64).to_le_bytes());
+                raw[16..18].copy_from_slice(&reclen.to_le_bytes());
+                raw[18] = dtype;
+                raw[19..19 + copy_len].copy_from_slice(&name_bytes[..copy_len]);
+                raw[19 + copy_len] = 0;
+                let _ = uc.mem_write(buf, &raw);
+                buf
+            } else {
+                0
+            }
+        }
+        HleBuiltin::Closedir => {
+            let removed = {
+                let (table, mem, _) = get_state(uc.get_data_mut());
+                if let Some(ds) = table.dir_streams.remove(&x0) {
+                    mem.free_heap(ds.dirent_buf);
+                    mem.free_heap(x0);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed { 0 } else { (-1i64) as u64 }
+        }
+        HleBuiltin::Rewinddir => {
+            let (table, _, _) = get_state(uc.get_data_mut());
+            if let Some(ds) = table.dir_streams.get_mut(&x0) {
+                ds.cursor = 0;
+            }
+            0
+        }
+        // ---- Bionic 新版属性 API (__system_property_find / read / read_callback) ----
+        HleBuiltin::SystemPropertyFind => {
+            let key = read_guest_cstr(uc, x0, 256);
+            let val = {
+                let (_, _, vfs) = get_state(uc.get_data_mut());
+                let v = vfs.get_property(&key).map(str::to_string);
+                if v.is_none() {
+                    vfs.diag().record_missing_property(&key);
+                }
+                v
+            };
+            if let Some(value) = val {
+                let (pi, nptr, vptr) = {
+                    let (table, mem, _) = get_state(uc.get_data_mut());
+                    let pi = mem.alloc_heap(16).unwrap_or(0);
+                    let np = mem.alloc_heap((key.len() + 1) as u64).unwrap_or(0);
+                    let vp = mem.alloc_heap((value.len() + 1) as u64).unwrap_or(0);
+                    if pi != 0 {
+                        table.prop_infos.insert(
+                            pi,
+                            PropInfoEntry {
+                                name: key.clone(),
+                                value: value.clone(),
+                                name_ptr: np,
+                                value_ptr: vp,
+                            },
+                        );
+                    }
+                    (pi, np, vp)
+                };
+                if nptr != 0 {
+                    let mut nb = key.into_bytes();
+                    nb.push(0);
+                    let _ = uc.mem_write(nptr, &nb);
+                }
+                if vptr != 0 {
+                    let mut vb = value.into_bytes();
+                    vb.push(0);
+                    let _ = uc.mem_write(vptr, &vb);
+                }
+                pi
+            } else {
+                0
+            }
+        }
+        HleBuiltin::SystemPropertyRead => {
+            // int __system_property_read(const prop_info* pi, char* name, char* value)
+            let entry = {
+                let (table, _, _) = get_state(uc.get_data_mut());
+                table
+                    .prop_infos
+                    .get(&x0)
+                    .map(|p| (p.name.clone(), p.value.clone()))
+            };
+            if let Some((name, val)) = entry {
+                if x1 != 0 {
+                    let mut nb = name.into_bytes();
+                    nb.push(0);
+                    let _ = uc.mem_write(x1, &nb);
+                }
+                if x2 != 0 {
+                    let mut vb = val.as_bytes().to_vec();
+                    vb.push(0);
+                    let _ = uc.mem_write(x2, &vb);
+                }
+                val.len() as u64
+            } else {
+                0
+            }
+        }
+        HleBuiltin::SystemPropertyReadCallback => {
+            // void __system_property_read_callback(const prop_info* pi, void (*cb)(void* cookie, const char* name, const char* value, uint32_t serial), void* cookie)
+            if x1 == 0 {
+                0
+            } else {
+                let ptrs = {
+                    let (table, _, _) = get_state(uc.get_data_mut());
+                    table
+                        .prop_infos
+                        .get(&x0)
+                        .map(|p| (p.name_ptr, p.value_ptr))
+                };
+                if let Some((nptr, vptr)) = ptrs {
+                    let _ = uc.reg_write(RegisterARM64::X9, x1); // callback
+                    let _ = uc.reg_write(RegisterARM64::X0, x2); // cookie
+                    let _ = uc.reg_write(RegisterARM64::X1, nptr); // name
+                    let _ = uc.reg_write(RegisterARM64::X2, vptr); // value
+                    let _ = uc.reg_write(RegisterARM64::X3, 1); // serial
+                    let _ = uc.reg_write(RegisterARM64::PC, PROP_CALLBACK_STUB_ADDR);
+                    return;
+                }
+                0
+            }
         }
         HleBuiltin::UnimplementedStub(sym) => {
             let (table, _, vfs) = get_state(uc.get_data_mut());

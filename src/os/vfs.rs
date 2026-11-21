@@ -30,6 +30,11 @@ enum OpenFileKind {
     Urandom,
     /// 标准输出 / 标准错误
     StdStream { is_stderr: bool },
+    /// 虚拟/宿主机目录（供 `getdents64` 与 `opendir`/`readdir` 使用）
+    Directory {
+        entries: Vec<(String, u8)>,
+        cursor: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -452,6 +457,12 @@ impl VirtualFs {
         }
 
         self.diag.record_missing_file(&path);
+        // 5. 若目标为已知目录，返回目录 FD（支持 openat(..., O_DIRECTORY) + getdents64）
+        if let Some(entries) = self.list_dir(&path) {
+            return self.alloc_fd(path, OpenFileKind::Directory { entries, cursor: 0 });
+        }
+
+        self.diag.record_missing_file(&path);
         self.breadcrumbs.push(format!("[VFS ENOENT] open({path})"));
         tracing::debug!(target: "runidbg::syscall", path = %path, "open 返回 ENOENT");
         ENOENT
@@ -516,6 +527,7 @@ impl VirtualFs {
             }
             OpenFileKind::Overlay { .. } | OpenFileKind::Urandom => unreachable!(),
             OpenFileKind::StdStream { .. } => Ok(Vec::new()),
+            OpenFileKind::Directory { .. } => Err(EINVAL),
         }
     }
 
@@ -572,6 +584,7 @@ impl VirtualFs {
             }
             OpenFileKind::Overlay { .. } => unreachable!(),
             OpenFileKind::Urandom => bytes.len() as i64,
+            OpenFileKind::Directory { .. } => EBADF,
         }
     }
 
@@ -827,6 +840,178 @@ impl VirtualFs {
         } else {
             EBADF
         }
+    }
+
+    /// 枚举指定虚拟目录的直接子项 `(name, d_type)`（`4 = DT_DIR`, `8 = DT_REG`）
+    pub fn list_dir(&self, raw_path: &str) -> Option<Vec<(String, u8)>> {
+        let dir = self.normalize_path(raw_path);
+        let prefix = if dir == "/" {
+            "/".to_string()
+        } else {
+            format!("{dir}/")
+        };
+
+        let mut map: BTreeMap<String, u8> = BTreeMap::new();
+        let mut exists = dir == "/" || self.overlay_dirs.contains(&dir);
+
+        // 内置常见 Android/Linux 虚拟路径目录树
+        const BUILTIN_FILES: &[&str] = &[
+            "/proc/self/maps",
+            "/proc/self/status",
+            "/proc/self/cmdline",
+            "/proc/self/exe",
+            "/proc/cpuinfo",
+            "/proc/meminfo",
+            "/proc/version",
+            "/proc/net/route",
+            "/proc/net/if_inet6",
+            "/proc/net/arp",
+            "/sys/devices/system/cpu/online",
+            "/sys/devices/system/cpu/possible",
+            "/sys/class/net/lo/address",
+            "/sys/class/net/wlan0/address",
+            "/sys/class/net/wlan0/operstate",
+            "/dev/urandom",
+            "/dev/random",
+            "/dev/null",
+        ];
+        let mut add_path = |p: &str, is_dir: bool| {
+            if p == dir && is_dir {
+                exists = true;
+                return;
+            }
+            if let Some(rest) = p.strip_prefix(&prefix) {
+                if rest.is_empty() {
+                    return;
+                }
+                exists = true;
+                if let Some((child, _)) = rest.split_once('/') {
+                    map.insert(child.to_string(), 4); // DT_DIR
+                } else {
+                    map.entry(rest.to_string())
+                        .or_insert(if is_dir { 4 } else { 8 });
+                }
+            }
+        };
+
+        for &bp in BUILTIN_FILES {
+            add_path(bp, false);
+        }
+        for d in &self.overlay_dirs {
+            add_path(d, true);
+        }
+        for f in self.overlay_files.keys() {
+            add_path(f, false);
+        }
+        // `/proc/self/fd` 动态合成当前打开的 FD 列表
+        if dir == "/proc/self/fd" {
+            exists = true;
+            for &fd in self.fds.keys() {
+                map.insert(fd.to_string(), 10); // DT_LNK
+            }
+        } else if dir == "/proc/self" {
+            exists = true;
+            map.insert("fd".to_string(), 4);
+        }
+
+        // 只读宿主机挂载目录
+        for (mount_prefix, host_root) in &self.sysroot_mounts {
+            let norm_mount = mount_prefix.trim_end_matches('/');
+            if dir == norm_mount || dir.starts_with(&format!("{norm_mount}/")) {
+                let rel = dir
+                    .strip_prefix(norm_mount)
+                    .unwrap_or("")
+                    .trim_start_matches('/');
+                let host_dir = if rel.is_empty() {
+                    host_root.clone()
+                } else {
+                    host_root.join(rel)
+                };
+                if host_dir.is_dir() {
+                    exists = true;
+                    if let Ok(rd) = fs::read_dir(&host_dir) {
+                        for ent in rd.flatten() {
+                            if let Some(name) = ent.file_name().to_str() {
+                                let dtype = if ent.path().is_dir() { 4 } else { 8 };
+                                map.entry(name.to_string()).or_insert(dtype);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(rest) = norm_mount.strip_prefix(&prefix) {
+                if !rest.is_empty() {
+                    exists = true;
+                    let child = rest.split('/').next().unwrap_or(rest);
+                    map.insert(child.to_string(), 4);
+                }
+            }
+        }
+
+        if !exists {
+            return None;
+        }
+        let mut out = Vec::with_capacity(map.len() + 2);
+        out.push((".".to_string(), 4));
+        out.push(("..".to_string(), 4));
+        for (name, dtype) in map {
+            out.push((name, dtype));
+        }
+        Some(out)
+    }
+
+    /// 供 `SYS_GETDENTS64` 批量序列化目录项到 Linux `linux_dirent64` 缓冲区
+    pub fn read_getdents64(&mut self, fd: i32, max_bytes: usize) -> Result<Vec<u8>, i64> {
+        let OpenFile {
+            kind: OpenFileKind::Directory { entries, cursor },
+            ..
+        } = self.fds.get_mut(&fd).ok_or(EBADF)?
+        else {
+            return Err(EINVAL);
+        };
+        let mut out = Vec::new();
+        while *cursor < entries.len() {
+            let (ref name, d_type) = entries[*cursor];
+            let name_bytes = name.as_bytes();
+            let raw_len = 19 + name_bytes.len() + 1; // u64 ino + i64 off + u16 reclen + u8 type + name + NUL
+            let reclen = (raw_len + 7) & !7;
+            if out.len() + reclen > max_bytes {
+                if out.is_empty() {
+                    return Err(EINVAL);
+                }
+                break;
+            }
+            let ino = (*cursor as u64) + 1;
+            let next_off = (*cursor as i64) + 1;
+            out.extend_from_slice(&ino.to_le_bytes());
+            out.extend_from_slice(&next_off.to_le_bytes());
+            out.extend_from_slice(&(reclen as u16).to_le_bytes());
+            out.push(d_type);
+            out.extend_from_slice(name_bytes);
+            out.push(0);
+            let pad = reclen - raw_len;
+            out.resize(out.len() + pad, 0);
+            *cursor += 1;
+        }
+        Ok(out)
+    }
+
+    /// 按指定偏移读取文件（不改变当前游标，供 `SYS_PREAD64`）
+    pub fn pread(&self, fd: i32, offset: usize, count: usize) -> Result<Vec<u8>, i64> {
+        let file = self.fds.get(&fd).ok_or(EBADF)?;
+        let data: &[u8] = match &file.kind {
+            OpenFileKind::Buffer { data, .. } => data.as_slice(),
+            OpenFileKind::Overlay { .. } => self
+                .overlay_files
+                .get(&file.path)
+                .map(Vec::as_slice)
+                .ok_or(EBADF)?,
+            _ => return Err(EBADF),
+        };
+        if offset >= data.len() {
+            return Ok(Vec::new());
+        }
+        let avail = (data.len() - offset).min(count);
+        Ok(data[offset..offset + avail].to_vec())
     }
 
     /// 查询 FD 关联路径（调试日志与 `mmap` 写回用）

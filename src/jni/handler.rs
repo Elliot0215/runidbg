@@ -909,22 +909,22 @@ pub fn default_call_object_method(
     }
 }
 
-/// 内置高频 `CallIntMethod` 默认分发
-pub fn default_call_int_method(
+/// 尝试匹配内置 `CallIntMethod`（命中返回 `Some`）
+pub fn try_default_call_int_method(
     ctx: &mut JniContext<'_>,
     obj: JObjectRef,
     method: &MethodDesc,
     args: &[JValue],
-) -> i32 {
+) -> Option<i32> {
     let target = ctx.objects.get(obj).cloned();
     match (target, method.name.as_str()) {
-        (Some(JObject::String(s)), "length") => s.encode_utf16().count() as i32,
+        (Some(JObject::String(s)), "length") => Some(s.encode_utf16().count() as i32),
         (Some(JObject::String(s)), "hashCode") => {
             let mut h: i32 = 0;
             for u in s.encode_utf16() {
                 h = h.wrapping_mul(31).wrapping_add(i32::from(u));
             }
-            h
+            Some(h)
         }
         (Some(JObject::String(s)), "indexOf") => {
             if let Some(sub) = args
@@ -932,16 +932,20 @@ pub fn default_call_int_method(
                 .and_then(|v| v.as_object())
                 .and_then(|r| ctx.objects.get_string(r))
             {
-                s.find(sub)
-                    .map(|byte_idx| s[..byte_idx].encode_utf16().count() as i32)
-                    .unwrap_or(-1)
+                Some(
+                    s.find(sub)
+                        .map(|byte_idx| s[..byte_idx].encode_utf16().count() as i32)
+                        .unwrap_or(-1),
+                )
             } else if let Some(ch) = args.first().and_then(|v| v.as_int()) {
-                s.encode_utf16()
-                    .position(|u| i32::from(u) == ch)
-                    .map(|i| i as i32)
-                    .unwrap_or(-1)
+                Some(
+                    s.encode_utf16()
+                        .position(|u| i32::from(u) == ch)
+                        .map(|i| i as i32)
+                        .unwrap_or(-1),
+                )
             } else {
-                -1
+                Some(-1)
             }
         }
         (Some(JObject::String(s)), "compareTo") => {
@@ -950,43 +954,78 @@ pub fn default_call_int_method(
                 .and_then(|v| v.as_object())
                 .and_then(|r| ctx.objects.get_string(r))
             {
-                match s.as_str().cmp(other) {
+                Some(match s.as_str().cmp(other) {
                     std::cmp::Ordering::Less => -1,
                     std::cmp::Ordering::Equal => 0,
                     std::cmp::Ordering::Greater => 1,
-                }
+                })
             } else {
-                0
+                Some(0)
             }
         }
-        (Some(JObject::StringBuilder(s)), "length") => s.encode_utf16().count() as i32,
-        (Some(JObject::List { items, .. }), "size") => items.len() as i32,
-        (Some(JObject::Map { entries, .. }), "size") => entries.len() as i32,
+        (Some(JObject::StringBuilder(s)), "length") => Some(s.encode_utf16().count() as i32),
+        (Some(JObject::List { items, .. }), "size") => Some(items.len() as i32),
+        (Some(JObject::Map { entries, .. }), "size") => Some(entries.len() as i32),
         (Some(JObject::Custom { class_name, .. }), "nextInt")
             if class_name == "java/util/Random" =>
         {
             let bits = random_next_bits(ctx, obj, 31) as i32;
             if let Some(bound) = args.first().and_then(|v| v.as_int()) {
                 if bound > 0 {
-                    bits.abs() % bound
+                    Some(bits.abs() % bound)
                 } else {
-                    0
+                    Some(0)
                 }
             } else {
-                bits
+                Some(bits)
             }
         }
-        (Some(JObject::Custom { fields, .. }), "intValue") => match fields.get("value") {
+        (Some(JObject::Custom { fields, .. }), "intValue") => Some(match fields.get("value") {
             Some(JValue::Int(v)) => *v,
             _ => 0,
-        },
-        _ => {
-            tracing::warn!(target: "runidbg::jni", 
-                "[JNI] 未处理的 CallIntMethod: {}.{}{}",
-                method.class_name, method.name, method.sig
-            );
-            0
+        }),
+        _ => None,
+    }
+}
+
+/// 内置高频 `CallIntMethod` 默认分发
+pub fn default_call_int_method(
+    ctx: &mut JniContext<'_>,
+    obj: JObjectRef,
+    method: &MethodDesc,
+    args: &[JValue],
+) -> i32 {
+    if let Some(v) = try_default_call_int_method(ctx, obj, method, args) {
+        return v;
+    }
+    tracing::warn!(target: "runidbg::jni", 
+        "[JNI] 未处理的 CallIntMethod: {}.{}{}",
+        method.class_name, method.name, method.sig
+    );
+    0
+}
+
+/// 尝试匹配内置 `CallCharMethod`（命中返回 `Some`）
+pub fn try_default_call_char_method(
+    ctx: &mut JniContext<'_>,
+    obj: JObjectRef,
+    method: &MethodDesc,
+    args: &[JValue],
+) -> Option<u16> {
+    match (ctx.objects.get(obj), method.name.as_str()) {
+        (Some(JObject::String(s)) | Some(JObject::StringBuilder(s)), "charAt") => {
+            let idx = args.first().and_then(|v| v.as_int()).unwrap_or(-1);
+            if idx >= 0 {
+                Some(s.encode_utf16().nth(idx as usize).unwrap_or(0))
+            } else {
+                Some(0)
+            }
         }
+        (Some(JObject::Custom { fields, .. }), "charValue") => match fields.get("value") {
+            Some(JValue::Char(v)) => Some(*v),
+            _ => Some(0),
+        },
+        _ => None,
     }
 }
 
@@ -997,20 +1036,38 @@ pub fn default_call_char_method(
     method: &MethodDesc,
     args: &[JValue],
 ) -> u16 {
-    match (ctx.objects.get(obj), method.name.as_str()) {
-        (Some(JObject::String(s)) | Some(JObject::StringBuilder(s)), "charAt") => {
-            let idx = args.first().and_then(|v| v.as_int()).unwrap_or(-1);
-            if idx >= 0 {
-                s.encode_utf16().nth(idx as usize).unwrap_or(0)
-            } else {
-                0
-            }
+    try_default_call_char_method(ctx, obj, method, args).unwrap_or(0)
+}
+
+/// 尝试匹配内置 `CallLongMethod`（命中返回 `Some`）
+pub fn try_default_call_long_method(
+    ctx: &mut JniContext<'_>,
+    obj: JObjectRef,
+    method: &MethodDesc,
+    _args: &[JValue],
+) -> Option<i64> {
+    let target = ctx.objects.get(obj).cloned();
+    match (target, method.name.as_str()) {
+        (Some(JObject::Custom { class_name, fields }), "getTime")
+            if class_name == "java/util/Date" =>
+        {
+            Some(match fields.get("time") {
+                Some(JValue::Long(ms)) => *ms,
+                _ => 1_700_000_000_000,
+            })
         }
-        (Some(JObject::Custom { fields, .. }), "charValue") => match fields.get("value") {
-            Some(JValue::Char(v)) => *v,
+        (Some(JObject::Custom { class_name, .. }), "nextLong")
+            if class_name == "java/util/Random" =>
+        {
+            let hi = i64::from(random_next_bits(ctx, obj, 32) as i32);
+            let lo = i64::from(random_next_bits(ctx, obj, 32) as i32);
+            Some((hi << 32).wrapping_add(lo))
+        }
+        (Some(JObject::Custom { fields, .. }), "longValue") => Some(match fields.get("value") {
+            Some(JValue::Long(v)) => *v,
             _ => 0,
-        },
-        _ => 0,
+        }),
+        _ => None,
     }
 }
 
@@ -1019,66 +1076,63 @@ pub fn default_call_long_method(
     ctx: &mut JniContext<'_>,
     obj: JObjectRef,
     method: &MethodDesc,
-    _args: &[JValue],
+    args: &[JValue],
 ) -> i64 {
-    let target = ctx.objects.get(obj).cloned();
-    match (target, method.name.as_str()) {
-        (Some(JObject::Custom { class_name, fields }), "getTime")
-            if class_name == "java/util/Date" =>
-        {
-            match fields.get("time") {
-                Some(JValue::Long(ms)) => *ms,
-                _ => 1_700_000_000_000,
-            }
-        }
-        (Some(JObject::Custom { class_name, .. }), "nextLong")
-            if class_name == "java/util/Random" =>
-        {
-            let hi = i64::from(random_next_bits(ctx, obj, 32) as i32);
-            let lo = i64::from(random_next_bits(ctx, obj, 32) as i32);
-            (hi << 32).wrapping_add(lo)
-        }
-        (Some(JObject::Custom { fields, .. }), "longValue") => match fields.get("value") {
-            Some(JValue::Long(v)) => *v,
-            _ => 0,
-        },
-        _ => {
-            tracing::warn!(target: "runidbg::jni", 
-                "[JNI] 未处理的 CallLongMethod: {}.{}{}",
-                method.class_name, method.name, method.sig
-            );
-            0
-        }
+    if let Some(v) = try_default_call_long_method(ctx, obj, method, args) {
+        return v;
+    }
+    tracing::warn!(target: "runidbg::jni", 
+        "[JNI] 未处理的 CallLongMethod: {}.{}{}",
+        method.class_name, method.name, method.sig
+    );
+    0
+}
+
+/// 尝试匹配内置 `CallStaticLongMethod`（命中返回 `Some`）
+pub fn try_default_call_static_long_method(
+    _ctx: &mut JniContext<'_>,
+    class_name: &str,
+    method: &MethodDesc,
+    _args: &[JValue],
+) -> Option<i64> {
+    match (class_name, method.name.as_str()) {
+        ("java/lang/System", "currentTimeMillis") => Some(1_700_000_000_000),
+        ("java/lang/System", "nanoTime") => Some(1_700_000_000_000_000_000),
+        ("android/os/Process", "getStartElapsedRealtime") => Some(120_000),
+        ("android/os/Process", "getStartUptimeMillis") => Some(120_000),
+        ("android/os/Process", "getElapsedCpuTime") => Some(500),
+        ("android/os/SystemClock", "uptimeMillis") => Some(125_000),
+        ("android/os/SystemClock", "elapsedRealtime") => Some(125_000),
+        ("android/os/SystemClock", "elapsedRealtimeNanos") => Some(125_000_000_000),
+        ("android/os/SystemClock", "currentThreadTimeMillis") => Some(100),
+        _ => None,
     }
 }
 
 /// 内置高频 `CallStaticLongMethod` 默认分发
 pub fn default_call_static_long_method(
-    _ctx: &mut JniContext<'_>,
+    ctx: &mut JniContext<'_>,
     class_name: &str,
     method: &MethodDesc,
-    _args: &[JValue],
+    args: &[JValue],
 ) -> i64 {
-    match (class_name, method.name.as_str()) {
-        ("java/lang/System", "currentTimeMillis") => 1_700_000_000_000,
-        ("java/lang/System", "nanoTime") => 1_700_000_000_000_000_000,
-        _ => {
-            tracing::warn!(target: "runidbg::jni", 
-                "[JNI] 未处理的 CallStaticLongMethod: {}.{}{}",
-                class_name, method.name, method.sig
-            );
-            0
-        }
+    if let Some(v) = try_default_call_static_long_method(ctx, class_name, method, args) {
+        return v;
     }
+    tracing::warn!(target: "runidbg::jni", 
+        "[JNI] 未处理的 CallStaticLongMethod: {}.{}{}",
+        class_name, method.name, method.sig
+    );
+    0
 }
 
-/// 内置高频 `CallVoidMethod` 默认分发
-pub fn default_call_void_method(
+/// 尝试匹配内置 `CallVoidMethod`（命中返回 `true`）
+pub fn try_default_call_void_method(
     ctx: &mut JniContext<'_>,
     obj: JObjectRef,
     method: &MethodDesc,
     args: &[JValue],
-) {
+) -> bool {
     let target = ctx.objects.get(obj).cloned();
     match (target, method.name.as_str()) {
         (Some(JObject::StringBuilder(_)), "setLength") => {
@@ -1087,11 +1141,13 @@ pub fn default_call_void_method(
                 let units: Vec<u16> = s.encode_utf16().take(new_len).collect();
                 *s = String::from_utf16_lossy(&units);
             }
+            true
         }
         (Some(JObject::List { .. }), "clear") => {
             if let Some(JObject::List { items, .. }) = ctx.objects.get_mut(obj) {
                 items.clear();
             }
+            true
         }
         (Some(JObject::List { .. }), "add") if args.len() >= 2 => {
             let idx = args[0].as_int().unwrap_or(0).max(0) as usize;
@@ -1100,11 +1156,13 @@ pub fn default_call_void_method(
                 let pos = idx.min(items.len());
                 items.insert(pos, elem);
             }
+            true
         }
         (Some(JObject::Map { .. }), "clear") => {
             if let Some(JObject::Map { entries, .. }) = ctx.objects.get_mut(obj) {
                 entries.clear();
             }
+            true
         }
         (Some(JObject::Custom { class_name, .. }), "setSeed")
             if class_name == "java/util/Random" =>
@@ -1115,6 +1173,7 @@ pub fn default_call_void_method(
                     fields.insert("seed".to_string(), JValue::Long(scrambled as i64));
                 }
             }
+            true
         }
         (Some(JObject::Custom { class_name, .. }), "nextBytes")
             if class_name == "java/util/Random" =>
@@ -1133,23 +1192,34 @@ pub fn default_call_void_method(
                     *b = filled;
                 }
             }
+            true
         }
-        _ => {
-            tracing::warn!(target: "runidbg::jni", 
-                "[JNI] 未处理的 CallVoidMethod: {}.{}{}",
-                method.class_name, method.name, method.sig
-            );
-        }
+        _ => false,
     }
 }
 
-/// 内置高频 `CallBooleanMethod` 默认分发
-pub fn default_call_boolean_method(
+/// 内置高频 `CallVoidMethod` 默认分发
+pub fn default_call_void_method(
     ctx: &mut JniContext<'_>,
     obj: JObjectRef,
     method: &MethodDesc,
     args: &[JValue],
-) -> bool {
+) {
+    if !try_default_call_void_method(ctx, obj, method, args) {
+        tracing::warn!(target: "runidbg::jni", 
+            "[JNI] 未处理的 CallVoidMethod: {}.{}{}",
+            method.class_name, method.name, method.sig
+        );
+    }
+}
+
+/// 尝试匹配内置 `CallBooleanMethod`（命中返回 `Some`）
+pub fn try_default_call_boolean_method(
+    ctx: &mut JniContext<'_>,
+    obj: JObjectRef,
+    method: &MethodDesc,
+    args: &[JValue],
+) -> Option<bool> {
     let target = ctx.objects.get(obj).cloned();
     match (target, method.name.as_str()) {
         (Some(JObject::String(lhs)), "equals") => {
@@ -1157,24 +1227,27 @@ pub fn default_call_boolean_method(
                 .first()
                 .and_then(|v| v.as_object())
                 .and_then(|r| ctx.objects.get_string(r));
-            rhs == Some(lhs.as_str())
+            Some(rhs == Some(lhs.as_str()))
         }
-        (Some(JObject::String(s)), "isEmpty") => s.is_empty(),
-        (Some(JObject::String(s)), "startsWith") => args
-            .first()
-            .and_then(|v| v.as_object())
-            .and_then(|r| ctx.objects.get_string(r))
-            .is_some_and(|p| s.starts_with(p)),
-        (Some(JObject::String(s)), "endsWith") => args
-            .first()
-            .and_then(|v| v.as_object())
-            .and_then(|r| ctx.objects.get_string(r))
-            .is_some_and(|p| s.ends_with(p)),
-        (Some(JObject::String(s)), "contains") => args
-            .first()
-            .and_then(|v| v.as_object())
-            .and_then(|r| ctx.objects.get_string(r))
-            .is_some_and(|p| s.contains(p)),
+        (Some(JObject::String(s)), "isEmpty") => Some(s.is_empty()),
+        (Some(JObject::String(s)), "startsWith") => Some(
+            args.first()
+                .and_then(|v| v.as_object())
+                .and_then(|r| ctx.objects.get_string(r))
+                .is_some_and(|p| s.starts_with(p)),
+        ),
+        (Some(JObject::String(s)), "endsWith") => Some(
+            args.first()
+                .and_then(|v| v.as_object())
+                .and_then(|r| ctx.objects.get_string(r))
+                .is_some_and(|p| s.ends_with(p)),
+        ),
+        (Some(JObject::String(s)), "contains") => Some(
+            args.first()
+                .and_then(|v| v.as_object())
+                .and_then(|r| ctx.objects.get_string(r))
+                .is_some_and(|p| s.contains(p)),
+        ),
         (Some(JObject::List { class_name, items }), "add") => {
             let elem = args
                 .first()
@@ -1182,20 +1255,20 @@ pub fn default_call_boolean_method(
                 .unwrap_or(JObjectRef::NULL);
             let is_set = class_name.ends_with("Set");
             if is_set && items.iter().any(|&it| jobject_keys_equal(ctx.objects, it, elem)) {
-                return false;
+                return Some(false);
             }
             if let Some(JObject::List { items: vec, .. }) = ctx.objects.get_mut(obj) {
                 vec.push(elem);
             }
-            true
+            Some(true)
         }
-        (Some(JObject::List { items, .. }), "isEmpty") => items.is_empty(),
+        (Some(JObject::List { items, .. }), "isEmpty") => Some(items.is_empty()),
         (Some(JObject::List { items, .. }), "contains") => {
             let elem = args
                 .first()
                 .and_then(|v| v.as_object())
                 .unwrap_or(JObjectRef::NULL);
-            items.iter().any(|&it| jobject_keys_equal(ctx.objects, it, elem))
+            Some(items.iter().any(|&it| jobject_keys_equal(ctx.objects, it, elem)))
         }
         (Some(JObject::List { items, .. }), "remove") => {
             let elem = args
@@ -1209,41 +1282,54 @@ pub fn default_call_boolean_method(
                 if let Some(JObject::List { items: vec, .. }) = ctx.objects.get_mut(obj) {
                     vec.remove(idx);
                 }
-                true
+                Some(true)
             } else {
-                false
+                Some(false)
             }
         }
-        (Some(JObject::Map { entries, .. }), "isEmpty") => entries.is_empty(),
+        (Some(JObject::Map { entries, .. }), "isEmpty") => Some(entries.is_empty()),
         (Some(JObject::Map { entries, .. }), "containsKey") => {
             let key = args
                 .first()
                 .and_then(|v| v.as_object())
                 .unwrap_or(JObjectRef::NULL);
-            entries
-                .iter()
-                .any(|(k, _)| jobject_keys_equal(ctx.objects, *k, key))
+            Some(
+                entries
+                    .iter()
+                    .any(|(k, _)| jobject_keys_equal(ctx.objects, *k, key)),
+            )
         }
-        (Some(JObject::Iterator { items, pos }), "hasNext") => pos < items.len(),
+        (Some(JObject::Iterator { items, pos }), "hasNext") => Some(pos < items.len()),
         (Some(JObject::Custom { class_name, fields }), "isInitialized")
             if class_name == "kotlin/Lazy"
                 || class_name.ends_with("LazyImpl")
                 || method.class_name == "kotlin/Lazy" =>
         {
-            fields.contains_key("value")
+            Some(fields.contains_key("value"))
         }
-        (Some(JObject::Custom { fields, .. }), "booleanValue") => match fields.get("value") {
+        (Some(JObject::Custom { fields, .. }), "booleanValue") => Some(match fields.get("value") {
             Some(JValue::Boolean(v)) => *v,
             _ => false,
-        },
-        _ => {
-            tracing::warn!(target: "runidbg::jni", 
-                "[JNI] 未处理的 CallBooleanMethod: {}.{}{}",
-                method.class_name, method.name, method.sig
-            );
-            false
-        }
+        }),
+        _ => None,
     }
+}
+
+/// 内置高频 `CallBooleanMethod` 默认分发
+pub fn default_call_boolean_method(
+    ctx: &mut JniContext<'_>,
+    obj: JObjectRef,
+    method: &MethodDesc,
+    args: &[JValue],
+) -> bool {
+    if let Some(v) = try_default_call_boolean_method(ctx, obj, method, args) {
+        return v;
+    }
+    tracing::warn!(target: "runidbg::jni", 
+        "[JNI] 未处理的 CallBooleanMethod: {}.{}{}",
+        method.class_name, method.name, method.sig
+    );
+    false
 }
 
 /// 内置高频 `GetObjectField` 默认分发

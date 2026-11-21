@@ -72,6 +72,14 @@ pub const SYS_MADVISE: u64 = 233;
 pub const SYS_ACCEPT4: u64 = 242;
 pub const SYS_PRLIMIT64: u64 = 261;
 pub const SYS_GETRANDOM: u64 = 278;
+pub const SYS_MKDIRAT: u64 = 34;
+pub const SYS_UNLINKAT: u64 = 35;
+pub const SYS_STATFS: u64 = 43;
+pub const SYS_FSTATFS: u64 = 44;
+pub const SYS_FTRUNCATE: u64 = 46;
+pub const SYS_GETDENTS64: u64 = 61;
+pub const SYS_PREAD64: u64 = 67;
+pub const SYS_PWRITE64: u64 = 68;
 
 /// 将 Linux `PROT_READ/WRITE/EXEC` 转换为 Unicorn `Prot`
 #[inline]
@@ -230,6 +238,82 @@ where
             st[16..20].copy_from_slice(&mode.to_le_bytes());
             st[48..56].copy_from_slice(&size.to_le_bytes());
             if uc.mem_write(stat_buf, &st).is_err() {
+                return EBADF;
+            }
+            0
+        }
+        SYS_GETDENTS64 => {
+            let fd = args[0] as i32;
+            let dirp = args[1];
+            let count = (args[2] as usize).min(1024 * 1024);
+            let bytes = {
+                let (_, vfs) = get_state(uc.get_data_mut());
+                match vfs.read_getdents64(fd, count) {
+                    Ok(b) => b,
+                    Err(e) => return e,
+                }
+            };
+            if !bytes.is_empty() && uc.mem_write(dirp, &bytes).is_err() {
+                return EBADF;
+            }
+            bytes.len() as i64
+        }
+        SYS_PREAD64 => {
+            let fd = args[0] as i32;
+            let buf = args[1];
+            let count = (args[2] as usize).min(16 * 1024 * 1024);
+            let offset = args[3] as usize;
+            let data = {
+                let (_, vfs) = get_state(uc.get_data_mut());
+                match vfs.pread(fd, offset, count) {
+                    Ok(d) => d,
+                    Err(e) => return e,
+                }
+            };
+            if !data.is_empty() && uc.mem_write(buf, &data).is_err() {
+                return EBADF;
+            }
+            data.len() as i64
+        }
+        SYS_PWRITE64 => {
+            let fd = args[0] as i32;
+            let buf = args[1];
+            let count = (args[2] as usize).min(16 * 1024 * 1024);
+            let offset = args[3] as usize;
+            let mut data = vec![0u8; count];
+            if count > 0 && uc.mem_read(buf, &mut data).is_err() {
+                return EBADF;
+            }
+            let (_, vfs) = get_state(uc.get_data_mut());
+            vfs.write_at(fd, offset, &data)
+        }
+        SYS_FTRUNCATE => {
+            let fd = args[0] as i32;
+            let len = args[1];
+            let (_, vfs) = get_state(uc.get_data_mut());
+            vfs.ftruncate(fd, len)
+        }
+        SYS_MKDIRAT => {
+            let path = read_guest_c_string(uc, args[1], 512);
+            let (_, vfs) = get_state(uc.get_data_mut());
+            vfs.mkdir(&path)
+        }
+        SYS_UNLINKAT => {
+            let path = read_guest_c_string(uc, args[1], 512);
+            let (_, vfs) = get_state(uc.get_data_mut());
+            vfs.unlink(&path)
+        }
+        SYS_STATFS | SYS_FSTATFS => {
+            let buf = args[1];
+            // AArch64 `struct statfs` = 120 字节：f_type=EXT4_SUPER_MAGIC(0xEF53), f_bsize=4096, f_blocks/bfree/bavail
+            let mut st = [0u8; 120];
+            st[0..8].copy_from_slice(&0xEF53u64.to_le_bytes());
+            st[8..16].copy_from_slice(&4096u64.to_le_bytes());
+            st[16..24].copy_from_slice(&16_777_216u64.to_le_bytes()); // 64 GB total
+            st[24..32].copy_from_slice(&8_388_608u64.to_le_bytes()); // 32 GB free
+            st[32..40].copy_from_slice(&8_388_608u64.to_le_bytes()); // 32 GB avail
+            st[64..72].copy_from_slice(&255u64.to_le_bytes()); // f_namelen
+            if buf != 0 && uc.mem_write(buf, &st).is_err() {
                 return EBADF;
             }
             0
