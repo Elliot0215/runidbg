@@ -205,6 +205,28 @@ interface ModuleHandle {
   runInit(): void;
 }
 
+interface JniFieldInfo {
+  readonly id: number;
+  readonly className: string;
+  readonly name: string;
+  readonly sig: string;
+  readonly isStatic: boolean;
+}
+
+interface JniMethodInfo {
+  readonly id: number;
+  readonly className: string;
+  readonly name: string;
+  readonly sig: string;
+  readonly isStatic: boolean;
+}
+
+interface JniObjectInfo {
+  readonly ref: number;
+  readonly className: string;
+  readonly kind: string;
+}
+
 interface JniNamespace {
   readonly envPtr: number;
   hook(className: string, methods: Record<string, (...args: any[]) => any>): void;
@@ -260,6 +282,16 @@ interface JniNamespace {
   getStaticField(className: string, fieldName: string): unknown;
   /** 开启/关闭 FindClass 严格存在性校验（开启且已加载 DEX 时，非系统类不存在返回 NULL 并抛出 ClassNotFoundException） */
   setStrictFindClass(enabled: boolean): void;
+  /** 按 FieldID 反查所属类名、字段名、签名与是否静态（ID 仅在当前进程内有效；未知返回 `null`；支持在 Hook 回调内调用） */
+  describeField(fieldId: number | bigint): JniFieldInfo | null;
+  /** 列出本次运行内已 intern 的全部字段（含实例与静态字段） */
+  listFields(): JniFieldInfo[];
+  /** 按 MethodID 反查所属类名、方法名、签名与是否静态（ID 仅在当前进程内有效；未知返回 `null`；支持在 Hook 回调内调用） */
+  describeMethod(methodId: number | bigint): JniMethodInfo | null;
+  /** 列出本次运行内已 intern 的全部方法 */
+  listMethods(): JniMethodInfo[];
+  /** 按 `jobject` / `jclass` 句柄反查真实类名与对象类型（支持在 Hook 回调内调用；未知返回 `null`） */
+  describeObject(ref: number | bigint): JniObjectInfo | null;
   pushLocalFrame(): void;
   popLocalFrame(keepRef?: number | bigint): number;
   withLocalFrame<T>(fn: () => T): T;

@@ -151,6 +151,52 @@ impl JniVm {
         }
     }
 
+    /// 按 FieldID 反查字段描述（含所属类名、字段名、签名与是否静态；ID 仅在当前进程有效）
+    pub fn describe_field(&self, id: u64) -> Option<&FieldDesc> {
+        self.fields.get(&id)
+    }
+
+    /// 列出本次运行内已 intern 的全部字段（按 FieldID 升序）
+    pub fn list_fields(&self) -> Vec<(u64, &FieldDesc)> {
+        let mut items: Vec<(u64, &FieldDesc)> = self.fields.iter().map(|(&k, v)| (k, v)).collect();
+        items.sort_by_key(|(id, _)| *id);
+        items
+    }
+
+    /// 按 MethodID 反查方法描述（含所属类名、方法名、签名与是否静态；ID 仅在当前进程有效）
+    pub fn describe_method(&self, id: u64) -> Option<&MethodDesc> {
+        self.methods.get(&id)
+    }
+
+    /// 列出本次运行内已 intern 的全部方法（按 MethodID 升序）
+    pub fn list_methods(&self) -> Vec<(u64, &MethodDesc)> {
+        let mut items: Vec<(u64, &MethodDesc)> = self.methods.iter().map(|(&k, v)| (k, v)).collect();
+        items.sort_by_key(|(id, _)| *id);
+        items
+    }
+
+    /// 按 `jobject` / `jclass` 句柄反查 `(class_name, kind)`
+    pub fn describe_object(&self, r: JObjectRef) -> Option<(String, &'static str)> {
+        let obj = self.objects.get(r)?;
+        let kind = match obj {
+            JObject::Class { .. } => "class",
+            JObject::String(_) => "string",
+            JObject::BooleanArray(_) => "boolean[]",
+            JObject::ByteArray(_) => "byte[]",
+            JObject::CharArray(_) => "char[]",
+            JObject::ShortArray(_) => "short[]",
+            JObject::IntArray(_) => "int[]",
+            JObject::LongArray(_) => "long[]",
+            JObject::FloatArray(_) => "float[]",
+            JObject::DoubleArray(_) => "double[]",
+            JObject::ObjectArray(_) => "object[]",
+            JObject::DirectBuffer { .. } => "directBuffer",
+            JObject::Custom { .. } => "custom",
+            _ => "builtin",
+        };
+        Some((obj.class_name().to_string(), kind))
+    }
+
     /// 捕获 JNI 对象引用表与临时缓冲区映射快照
     pub fn snapshot_state(&self) -> JniSnapshot {
         JniSnapshot {

@@ -621,6 +621,21 @@
           setStrictFindClass(enabled) {
             __native.jniSetStrictFindClass(emuId, Boolean(enabled));
           },
+          describeField(fieldId) {
+            return __native.jniDescribeField(emuId, toAddr(fieldId));
+          },
+          listFields() {
+            return __native.jniListFields(emuId);
+          },
+          describeMethod(methodId) {
+            return __native.jniDescribeMethod(emuId, toAddr(methodId));
+          },
+          listMethods() {
+            return __native.jniListMethods(emuId);
+          },
+          describeObject(ref) {
+            return __native.jniDescribeObject(emuId, toAddr(ref));
+          },
           pushLocalFrame() {
             __native.jniPushLocalFrame(emuId);
           },

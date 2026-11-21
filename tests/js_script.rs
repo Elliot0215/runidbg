@@ -741,3 +741,103 @@ fn js_v015_feedback_fixes() {
     JsRunner::run_source_with_args(script, &[]).expect("v0.1.5 feedback fixes test failed");
 }
 
+#[test]
+fn js_jni_describe_field_method_and_object() {
+    let script = r#"
+        const emu = Emu.create({ packageName: "com.test.introspect", hleAccel: true });
+        const envPtr = emu.jni.envPtr;
+        const vtable = Number(emu.mem.readU64(envPtr));
+        const fnFindClass = Number(emu.mem.readU64(vtable + 6 * 8));
+        const fnGetMethodID = Number(emu.mem.readU64(vtable + 33 * 8));
+        const fnGetFieldID = Number(emu.mem.readU64(vtable + 94 * 8));
+        const fnGetObjectField = Number(emu.mem.readU64(vtable + 95 * 8));
+        const fnGetStaticFieldID = Number(emu.mem.readU64(vtable + 144 * 8));
+
+        const buf = emu.mem.alloc(256);
+        const ws = (off, s) => { emu.mem.writeCString(buf + off, s); return buf + off; };
+
+        const clsG0 = emu.call(fnFindClass, envPtr, ws(0, "cas/g0"));
+        const clsJ0 = emu.call(fnFindClass, envPtr, ws(16, "cas/j0"));
+
+        // 同名不同类字段：cas/g0.j[I 与 cas/j0.jLjava/lang/String;
+        const fidG0J = emu.call(fnGetFieldID, envPtr, clsG0, ws(32, "j"), ws(40, "[I"));
+        const fidJ0J = emu.call(fnGetFieldID, envPtr, clsJ0, ws(32, "j"), ws(48, "Ljava/lang/String;"));
+        const fidStaticA = emu.call(fnGetStaticFieldID, envPtr, clsG0, ws(80, "a"), ws(88, "[C"));
+        const midH = emu.call(fnGetMethodID, envPtr, clsG0, ws(96, "h"), ws(104, "()Ljava/lang/String;"));
+
+        // 1. describeField 精确区分所属类
+        const f1 = emu.jni.describeField(fidG0J);
+        const f2 = emu.jni.describeField(fidJ0J);
+        const f3 = emu.jni.describeField(fidStaticA);
+        if (!f1 || f1.className !== "cas/g0" || f1.name !== "j" || f1.sig !== "[I" || f1.isStatic !== false) {
+            throw new Error("describeField fidG0J mismatch: " + JSON.stringify(f1));
+        }
+        if (!f2 || f2.className !== "cas/j0" || f2.name !== "j" || f2.sig !== "Ljava/lang/String;" || f2.isStatic !== false) {
+            throw new Error("describeField fidJ0J mismatch: " + JSON.stringify(f2));
+        }
+        if (!f3 || f3.className !== "cas/g0" || f3.name !== "a" || f3.isStatic !== true) {
+            throw new Error("describeField fidStaticA mismatch: " + JSON.stringify(f3));
+        }
+        if (emu.jni.describeField(0x999999) !== null) {
+            throw new Error("unknown fieldId should return null");
+        }
+        if (emu.jni.listFields().length < 3) {
+            throw new Error("listFields expected >= 3");
+        }
+
+        // 2. describeMethod & listMethods
+        const m1 = emu.jni.describeMethod(midH);
+        if (!m1 || m1.className !== "cas/g0" || m1.name !== "h" || m1.sig !== "()Ljava/lang/String;" || m1.isStatic !== false) {
+            throw new Error("describeMethod mismatch: " + JSON.stringify(m1));
+        }
+        if (emu.jni.describeMethod(0x999999) !== null) {
+            throw new Error("unknown methodId should return null");
+        }
+        if (emu.jni.listMethods().length < 1) {
+            throw new Error("listMethods expected >= 1");
+        }
+
+        // 3. describeObject 支持 jclass / custom / string / array
+        const objJ0 = emu.jni.newObject("cas/j0");
+        const strRef = emu.jni.newString("hello");
+        emu.jni.setField(objJ0, "j", strRef);
+        const dCls = emu.jni.describeObject(clsG0);
+        const dObj = emu.jni.describeObject(objJ0);
+        const dStr = emu.jni.describeObject(strRef);
+        if (!dCls || dCls.className !== "cas/g0" || dCls.kind !== "class") {
+            throw new Error("describeObject class mismatch: " + JSON.stringify(dCls));
+        }
+        if (!dObj || dObj.className !== "cas/j0" || dObj.kind !== "custom") {
+            throw new Error("describeObject custom mismatch: " + JSON.stringify(dObj));
+        }
+        if (!dStr || dStr.kind !== "string") {
+            throw new Error("describeObject string mismatch: " + JSON.stringify(dStr));
+        }
+        if (emu.jni.describeObject(0) !== null) {
+            throw new Error("describeObject(0) should return null");
+        }
+
+        // 4. 在 GetObjectField (slot 95) Hook 回调内重入调用 describeField + describeObject
+        let seenField = null;
+        let seenObj = null;
+        const h = emu.hook.attach(fnGetObjectField, {
+            onEnter(ctx) {
+                seenObj = emu.jni.describeObject(ctx.x1);
+                seenField = emu.jni.describeField(ctx.x2);
+            },
+        });
+        const gotRef = emu.call(fnGetObjectField, envPtr, objJ0, fidJ0J);
+        h.detach();
+        if (gotRef !== strRef) throw new Error("GetObjectField returned wrong ref");
+        if (!seenField || seenField.className !== "cas/j0" || seenField.name !== "j") {
+            throw new Error("reentrant describeField failed: " + JSON.stringify(seenField));
+        }
+        if (!seenObj || seenObj.className !== "cas/j0") {
+            throw new Error("reentrant describeObject failed: " + JSON.stringify(seenObj));
+        }
+    "#;
+
+    JsRunner::run_source_with_args(script, &[])
+        .expect("JNI describeField/Method/Object test failed");
+}
+

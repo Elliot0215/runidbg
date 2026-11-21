@@ -1290,6 +1290,151 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
+    // jniDescribeField(emuId, fieldId) -> { id, className, name, sig, isStatic } | null
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniDescribeField",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize, fid: f64| -> rquickjs::Result<Value<'js>> {
+                    let fid_u64 = fid as u64;
+                    let info = with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc.get_data().jni.describe_field(fid_u64).cloned())
+                    })?;
+                    let Some(f) = info else {
+                        return Ok(Value::new_null(ctx.clone()));
+                    };
+                    let obj = Object::new(ctx.clone())?;
+                    obj.set("id", fid_u64 as f64)?;
+                    obj.set("className", f.class_name)?;
+                    obj.set("name", f.name)?;
+                    obj.set("sig", f.sig)?;
+                    obj.set("isStatic", f.is_static)?;
+                    Ok(obj.into_value())
+                },
+            )?,
+        )?;
+    }
+
+    // jniListFields(emuId) -> Array<{ id, className, name, sig, isStatic }>
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniListFields",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize| -> rquickjs::Result<Array<'js>> {
+                    let items = with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc
+                            .get_data()
+                            .jni
+                            .list_fields()
+                            .into_iter()
+                            .map(|(id, f)| (id, f.clone()))
+                            .collect::<Vec<_>>())
+                    })?;
+                    let arr = Array::new(ctx.clone())?;
+                    for (i, (id, f)) in items.into_iter().enumerate() {
+                        let obj = Object::new(ctx.clone())?;
+                        obj.set("id", id as f64)?;
+                        obj.set("className", f.class_name)?;
+                        obj.set("name", f.name)?;
+                        obj.set("sig", f.sig)?;
+                        obj.set("isStatic", f.is_static)?;
+                        arr.set(i, obj)?;
+                    }
+                    Ok(arr)
+                },
+            )?,
+        )?;
+    }
+
+    // jniDescribeMethod(emuId, methodId) -> { id, className, name, sig, isStatic } | null
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniDescribeMethod",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize, mid: f64| -> rquickjs::Result<Value<'js>> {
+                    let mid_u64 = mid as u64;
+                    let info = with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc.get_data().jni.describe_method(mid_u64).cloned())
+                    })?;
+                    let Some(m) = info else {
+                        return Ok(Value::new_null(ctx.clone()));
+                    };
+                    let obj = Object::new(ctx.clone())?;
+                    obj.set("id", mid_u64 as f64)?;
+                    obj.set("className", m.class_name)?;
+                    obj.set("name", m.name)?;
+                    obj.set("sig", m.sig)?;
+                    obj.set("isStatic", m.is_static)?;
+                    Ok(obj.into_value())
+                },
+            )?,
+        )?;
+    }
+
+    // jniListMethods(emuId) -> Array<{ id, className, name, sig, isStatic }>
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniListMethods",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize| -> rquickjs::Result<Array<'js>> {
+                    let items = with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc
+                            .get_data()
+                            .jni
+                            .list_methods()
+                            .into_iter()
+                            .map(|(id, m)| (id, m.clone()))
+                            .collect::<Vec<_>>())
+                    })?;
+                    let arr = Array::new(ctx.clone())?;
+                    for (i, (id, m)) in items.into_iter().enumerate() {
+                        let obj = Object::new(ctx.clone())?;
+                        obj.set("id", id as f64)?;
+                        obj.set("className", m.class_name)?;
+                        obj.set("name", m.name)?;
+                        obj.set("sig", m.sig)?;
+                        obj.set("isStatic", m.is_static)?;
+                        arr.set(i, obj)?;
+                    }
+                    Ok(arr)
+                },
+            )?,
+        )?;
+    }
+
+    // jniDescribeObject(emuId, objRef) -> { ref, className, kind } | null
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "jniDescribeObject",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize, obj_ref: f64| -> rquickjs::Result<Value<'js>> {
+                    let r = JObjectRef(obj_ref as u64);
+                    let info = with_uc(&ctx, &host, emu_id, |uc| {
+                        Ok(uc.get_data().jni.describe_object(r))
+                    })?;
+                    let Some((class_name, kind)) = info else {
+                        return Ok(Value::new_null(ctx.clone()));
+                    };
+                    let obj = Object::new(ctx.clone())?;
+                    obj.set("ref", r.0 as f64)?;
+                    obj.set("className", class_name)?;
+                    obj.set("kind", kind)?;
+                    Ok(obj.into_value())
+                },
+            )?,
+        )?;
+    }
+
     // emuLoadDex(emuId, pathOrPaths) -> { classes, addedClasses, totalClasses, dexCount }
     {
         let host = Rc::clone(host);
