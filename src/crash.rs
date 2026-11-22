@@ -2,7 +2,9 @@ use std::collections::VecDeque;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use unicorn_engine::{RegisterARM64, Unicorn};
+use unicorn_engine::RegisterARM64;
+
+use crate::backend::CpuBackend;
 
 use crate::loader::DynamicLinker;
 use crate::memory::MemoryManager;
@@ -116,8 +118,8 @@ const X_REGS: [RegisterARM64; 31] = [
 
 impl CrashReport {
     /// 从当前 Unicorn 现场采集完整崩溃报告
-    pub fn capture<D>(
-        uc: &Unicorn<'_, D>,
+    pub fn capture<B: CpuBackend + ?Sized>(
+        uc: &B,
         linker: &DynamicLinker,
         mem: &MemoryManager,
         breadcrumbs: &BreadcrumbRing,

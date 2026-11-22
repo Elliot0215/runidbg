@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM64, UcHookId, Unicorn};
 
+use crate::backend::{BackendWithData, CpuBackend, ARM64_SVC_JNI_INSN};
+
 use crate::crash::BreadcrumbRing;
 use crate::diag::EnvDiag;
 use crate::error::EmuResult;
@@ -489,8 +491,12 @@ impl JniVm {
         self.handler = handler;
     }
 
-    /// 在 Unicorn 内存中初始化 `JavaVM*`、`JNIEnv*` 虚函数表与 `RET` 跳板区
-    pub fn init<D>(&mut self, uc: &mut Unicorn<'_, D>, mem: &mut MemoryManager) -> EmuResult<()> {
+    /// 初始化 `JavaVM*`、`JNIEnv*` 虚函数表与跳板区（Unicorn 填 `RET`，非 Unicorn 填 `SVC #0x1002`）
+    pub fn init<B: CpuBackend + ?Sized>(
+        &mut self,
+        uc: &mut B,
+        mem: &mut MemoryManager,
+    ) -> EmuResult<()> {
         if self.initialized {
             return Ok(());
         }
@@ -515,12 +521,18 @@ impl JniVm {
             0,
         )?;
 
+        let tramp_insn = if uc.uses_svc_trampolines() {
+            ARM64_SVC_JNI_INSN
+        } else {
+            ARM64_RET_INSN
+        };
+
         // 3. 写入 JavaVM 实例及 JNIInvokeInterface 虚表
         let vm_vtable_addr = JNI_VM_BASE + 0x10;
         mem.write_u64(uc, JNI_VM_BASE, vm_vtable_addr)?;
         for slot in 0..VM_SLOT_COUNT {
             let tramp = JNI_TRAMPOLINE_BASE + (slot as u64) * 4;
-            mem.write_u32(uc, tramp, ARM64_RET_INSN)?;
+            mem.write_u32(uc, tramp, tramp_insn)?;
             mem.write_u64(uc, vm_vtable_addr + (slot as u64) * 8, tramp)?;
         }
 
@@ -529,7 +541,7 @@ impl JniVm {
         mem.write_u64(uc, JNI_ENV_BASE, env_vtable_addr)?;
         for slot in 0..ENV_SLOT_COUNT {
             let tramp = JNI_TRAMPOLINE_BASE + ((ENV_TRAMPOLINE_SLOT_OFFSET + slot) as u64) * 4;
-            mem.write_u32(uc, tramp, ARM64_RET_INSN)?;
+            mem.write_u32(uc, tramp, tramp_insn)?;
             mem.write_u64(uc, env_vtable_addr + (slot as u64) * 8, tramp)?;
         }
 
@@ -618,8 +630,8 @@ impl JniVm {
 
 /// 统一读取 JNI 三联槽位（`Call*Method` / `V` / `A` 及 `CallNonvirtual*Method`）的变参列表
 #[inline]
-fn read_jni_call_args<D>(
-    uc: &Unicorn<'_, D>,
+fn read_jni_call_args<B: CpuBackend + ?Sized>(
+    uc: &B,
     slot: usize,
     base_slot: usize,
     ptr_reg: u64,
@@ -629,8 +641,8 @@ fn read_jni_call_args<D>(
 }
 
 #[inline]
-fn read_jni_call_args_at<D>(
-    uc: &Unicorn<'_, D>,
+fn read_jni_call_args_at<B: CpuBackend + ?Sized>(
+    uc: &B,
     slot: usize,
     base_slot: usize,
     first_reg: usize,
@@ -641,6 +653,28 @@ fn read_jni_call_args_at<D>(
         0 => read_varargs_direct(uc, first_reg, sig),
         1 => read_varargs_va_list(uc, ptr_reg, sig),
         _ => read_varargs_jvalue_array(uc, ptr_reg, sig),
+    }
+}
+
+/// 按跳板地址分发 JNI 槽位（供 Unicorn Code Hook 与非 Unicorn `SVC #0x1002` 外部陷阱循环共用）
+pub fn dispatch_jni_slot<B, D, F>(uc: &mut B, slot_addr: u64, get_state: &mut F) -> bool
+where
+    B: BackendWithData<D> + ?Sized,
+    F: FnMut(&mut D) -> (&mut JniVm, &mut MemoryManager),
+{
+    if slot_addr < JNI_TRAMPOLINE_BASE || !(slot_addr - JNI_TRAMPOLINE_BASE).is_multiple_of(4) {
+        return false;
+    }
+    let raw_slot = ((slot_addr - JNI_TRAMPOLINE_BASE) / 4) as usize;
+    let env_range = ENV_TRAMPOLINE_SLOT_OFFSET..ENV_TRAMPOLINE_SLOT_OFFSET + ENV_SLOT_COUNT;
+    if raw_slot < VM_SLOT_COUNT {
+        dispatch_java_vm(uc, raw_slot, get_state);
+        true
+    } else if env_range.contains(&raw_slot) {
+        dispatch_jni_env(uc, raw_slot - ENV_TRAMPOLINE_SLOT_OFFSET, get_state);
+        true
+    } else {
+        false
     }
 }
 
@@ -656,16 +690,7 @@ where
         JNI_TRAMPOLINE_BASE,
         JNI_TRAMPOLINE_BASE + JNI_TRAMPOLINE_SIZE,
         move |uc, addr, _size| {
-            if addr < JNI_TRAMPOLINE_BASE || !(addr - JNI_TRAMPOLINE_BASE).is_multiple_of(4) {
-                return;
-            }
-            let raw_slot = ((addr - JNI_TRAMPOLINE_BASE) / 4) as usize;
-            let env_range = ENV_TRAMPOLINE_SLOT_OFFSET..ENV_TRAMPOLINE_SLOT_OFFSET + ENV_SLOT_COUNT;
-            if raw_slot < VM_SLOT_COUNT {
-                dispatch_java_vm(uc, raw_slot, &mut get_state);
-            } else if env_range.contains(&raw_slot) {
-                dispatch_jni_env(uc, raw_slot - ENV_TRAMPOLINE_SLOT_OFFSET, &mut get_state);
-            }
+            dispatch_jni_slot(uc, addr, &mut get_state);
         },
     )?;
 
@@ -673,8 +698,9 @@ where
 }
 
 /// 分派 `JavaVM` (`JNIInvokeInterface`) 方法
-fn dispatch_java_vm<D, F>(uc: &mut Unicorn<'_, D>, slot: usize, get_state: &mut F)
+fn dispatch_java_vm<B, D, F>(uc: &mut B, slot: usize, get_state: &mut F)
 where
+    B: BackendWithData<D> + ?Sized,
     F: FnMut(&mut D) -> (&mut JniVm, &mut MemoryManager),
 {
     let x1 = uc.reg_read(RegisterARM64::X1).unwrap_or(0);
@@ -704,8 +730,9 @@ where
 }
 
 /// 分派 `JNIEnv` (`JNINativeInterface`) 方法
-fn dispatch_jni_env<D, F>(uc: &mut Unicorn<'_, D>, slot: usize, get_state: &mut F)
+fn dispatch_jni_env<B, D, F>(uc: &mut B, slot: usize, get_state: &mut F)
 where
+    B: BackendWithData<D> + ?Sized,
     F: FnMut(&mut D) -> (&mut JniVm, &mut MemoryManager),
 {
     let x1 = uc.reg_read(RegisterARM64::X1).unwrap_or(0);
@@ -870,7 +897,7 @@ where
         18 => {
             let msg = read_guest_cstr(uc, x1, 512);
             tracing::error!(target: "runidbg::jni", "FatalError: {msg}");
-            let _ = uc.emu_stop();
+            let _ = CpuBackend::stop(uc);
             0
         }
 
@@ -2110,8 +2137,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_nonvirtual_call<D, F, H>(
-    uc: &mut Unicorn<'_, D>,
+fn dispatch_nonvirtual_call<B, D, F, H>(
+    uc: &mut B,
     slot: usize,
     base_slot: usize,
     obj_raw: u64,
@@ -2121,6 +2148,7 @@ fn dispatch_nonvirtual_call<D, F, H>(
     invoke: H,
 ) -> u64
 where
+    B: BackendWithData<D> + ?Sized,
     F: FnMut(&mut D) -> (&mut JniVm, &mut MemoryManager),
     H: FnOnce(&mut dyn JniHandler, &mut JniContext<'_>, JObjectRef, &MethodDesc, &[JValue]) -> u64,
 {
@@ -2137,8 +2165,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_instance_call<D, F, H>(
-    uc: &mut Unicorn<'_, D>,
+fn dispatch_instance_call<B, D, F, H>(
+    uc: &mut B,
     slot: usize,
     base_slot: usize,
     obj_raw: u64,
@@ -2148,6 +2176,7 @@ fn dispatch_instance_call<D, F, H>(
     invoke: H,
 ) -> u64
 where
+    B: BackendWithData<D> + ?Sized,
     F: FnMut(&mut D) -> (&mut JniVm, &mut MemoryManager),
     H: FnOnce(&mut dyn JniHandler, &mut JniContext<'_>, JObjectRef, &MethodDesc, &[JValue]) -> u64,
 {
@@ -2190,8 +2219,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn dispatch_static_call<D, F, H>(
-    uc: &mut Unicorn<'_, D>,
+fn dispatch_static_call<B, D, F, H>(
+    uc: &mut B,
     slot: usize,
     base_slot: usize,
     cls_raw: u64,
@@ -2201,6 +2230,7 @@ fn dispatch_static_call<D, F, H>(
     invoke: H,
 ) -> u64
 where
+    B: BackendWithData<D> + ?Sized,
     F: FnMut(&mut D) -> (&mut JniVm, &mut MemoryManager),
     H: FnOnce(&mut dyn JniHandler, &mut JniContext<'_>, &str, &MethodDesc, &[JValue]) -> u64,
 {
@@ -2244,14 +2274,15 @@ where
     ret
 }
 
-fn dispatch_instance_field<D, F, H>(
-    uc: &mut Unicorn<'_, D>,
+fn dispatch_instance_field<B, D, F, H>(
+    uc: &mut B,
     obj_raw: u64,
     fid_raw: u64,
     get_state: &mut F,
     invoke: H,
 ) -> u64
 where
+    B: BackendWithData<D> + ?Sized,
     F: FnMut(&mut D) -> (&mut JniVm, &mut MemoryManager),
     H: FnOnce(&mut dyn JniHandler, &mut JniContext<'_>, JObjectRef, &FieldDesc) -> u64,
 {

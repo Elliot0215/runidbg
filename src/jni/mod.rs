@@ -4,8 +4,8 @@ pub mod types;
 pub mod va_list;
 
 pub use env::{
-    attach_jni_hook, JniTraceEvent, JniTracer, JniVm, JNI_ENV_BASE, JNI_TRAMPOLINE_BASE,
-    JNI_VM_BASE,
+    attach_jni_hook, dispatch_jni_slot, JniTraceEvent, JniTracer, JniVm, JNI_ENV_BASE,
+    JNI_TRAMPOLINE_BASE, JNI_VM_BASE,
 };
 pub use handler::{DefaultJniHandler, JniContext, JniHandler};
 pub use types::{

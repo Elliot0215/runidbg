@@ -9,6 +9,7 @@ use rquickjs::{Ctx, Function, Object, Persistent, Value};
 use unicorn_engine::unicorn_const::{HookType, MemType};
 use unicorn_engine::{RegisterARM64, UcHookId, Unicorn};
 
+use crate::backend::{BackendWithData, CpuBackend};
 use crate::emulator::EmuState;
 use crate::script::jni_bridge::current_js_ctx;
 
@@ -124,7 +125,7 @@ pub(crate) fn parse_reg_name(name: &str) -> Option<RegisterARM64> {
 }
 
 /// 导出常用通用寄存器快照
-pub(crate) fn dump_regs(uc: &Unicorn<'_, EmuState>) -> Vec<(&'static str, u64)> {
+pub(crate) fn dump_regs<B: CpuBackend + ?Sized>(uc: &B) -> Vec<(&'static str, u64)> {
     const REGS: &[(&str, RegisterARM64)] = &[
         ("x0", RegisterARM64::X0),
         ("x1", RegisterARM64::X1),
@@ -781,8 +782,8 @@ pub(crate) fn parse_hex_pattern(pattern: &str) -> Result<Vec<Option<u8>>> {
 }
 
 /// 在指定 Guest 内存区间内搜索通配符特征码，返回所有命中地址
-pub(crate) fn scan_memory(
-    uc: &Unicorn<'_, EmuState>,
+pub(crate) fn scan_memory<B: BackendWithData<EmuState> + ?Sized>(
+    uc: &B,
     start: u64,
     len: u64,
     pattern: &[Option<u8>],
@@ -793,11 +794,16 @@ pub(crate) fn scan_memory(
     let end = start.saturating_add(len);
     let mut hits = Vec::new();
 
-    // 优先尝试按已映射区域分段扫描，避免跨未映射洞导致整块 mem_read 失败
-    let regions = uc.mem_regions().unwrap_or_default();
-    for r in regions {
-        let r_begin = r.begin.max(start);
-        let r_end = r.end.saturating_add(1).min(end);
+    // 优先按 MemoryManager 记录的已映射 VMA 分段扫描，避免跨未映射洞导致整块 mem_read 失败（全后端兼容）
+    let regions: Vec<(u64, u64)> = uc
+        .get_data()
+        .mem
+        .regions()
+        .map(|r| (r.start, r.end))
+        .collect();
+    for (r_start, r_limit) in regions {
+        let r_begin = r_start.max(start);
+        let r_end = r_limit.min(end);
         if r_end <= r_begin || (r_end - r_begin) < pattern.len() as u64 {
             continue;
         }

@@ -240,7 +240,8 @@
       const searchPaths = Array.isArray(opts.searchPaths) ? opts.searchPaths.map(String) : [];
       const hleAccel = opts.hleAccel !== undefined ? Boolean(opts.hleAccel) : true;
       const heapSize = opts.heapSize !== undefined ? Number(opts.heapSize) : 32 * 1024 * 1024;
-      const emuId = __native.emuCreate(packageName, searchPaths, hleAccel, heapSize);
+      const backend = opts.backend !== undefined ? String(opts.backend) : "unicorn";
+      const emuId = __native.emuCreate(packageName, searchPaths, hleAccel, heapSize, backend);
 
       const memNs = {
         alloc(size) {
@@ -309,6 +310,7 @@
       }
 
       return {
+        backend,
         load(path, loadOpts = {}) {
           const runInit = loadOpts && loadOpts.runInit === false ? false : true;
           const info = __native.emuLoad(emuId, String(path), runInit);

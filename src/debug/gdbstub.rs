@@ -124,6 +124,13 @@ impl GdbServer {
         start_pc: u64,
         args: &[u64],
     ) -> Result<()> {
+        if !emu.backend_kind().supports_gdb() {
+            return Err(crate::error::EmuError::Backend(format!(
+                "当前后端 `{}` 不支持 GDB Stub 远程调试（请切换到 `unicorn` 后端）",
+                emu.backend_kind()
+            ))
+            .into());
+        }
         // 准备调用寄存器（X0..X7, LR=RET_MAGIC_ADDR, PC=start_pc）
         for (idx, &val) in args.iter().take(8).enumerate() {
             emu.uc_mut().reg_write(CORE_REGS[idx], val)?;

@@ -1,6 +1,7 @@
 use unicorn_engine::unicorn_const::Prot;
-use unicorn_engine::{Context, RegisterARM64, Unicorn};
+use unicorn_engine::RegisterARM64;
 
+use crate::backend::{CpuBackend, CpuContextBlob, ARM64_SVC_RET_INSN};
 use crate::error::EmuResult;
 use crate::memory::{MemoryManager, PAGE_SIZE};
 
@@ -30,19 +31,19 @@ const CPU_INIT_STUB_ADDR: u64 = 0xDEAD_1000;
 
 /// CPU 寄存器上下文快照包装器（用于 Snapshot/Restore 与协作调度切换）
 pub struct CpuSnapshot {
-    inner: Context,
+    inner: CpuContextBlob,
 }
 
 impl CpuSnapshot {
     /// 捕获当前完整 CPU 寄存器上下文快照
-    pub fn capture<D>(uc: &Unicorn<'_, D>) -> EmuResult<Self> {
-        let inner = uc.context_init()?;
+    pub fn capture<B: CpuBackend + ?Sized>(uc: &B) -> EmuResult<Self> {
+        let inner = uc.capture_context()?;
         Ok(Self { inner })
     }
 
     /// 恢复先前保存的 CPU 寄存器上下文快照
-    pub fn restore<D>(&self, uc: &mut Unicorn<'_, D>) -> EmuResult<()> {
-        uc.context_restore(&self.inner)?;
+    pub fn restore<B: CpuBackend + ?Sized>(&self, uc: &mut B) -> EmuResult<()> {
+        uc.restore_context(&self.inner)?;
         Ok(())
     }
 }
@@ -63,7 +64,7 @@ impl CpuContext {
     /// 2. 映射返回停止魔数页 (0xDEAD0000) 并设置 LR
     /// 3. 写入并执行开启 NEON/FP 浮点运算的机器码（配置 CPACR_EL1）
     /// 4. 映射并初始化 Android Bionic TLS 块并写入 `TPIDR_EL0`
-    pub fn init<D>(uc: &mut Unicorn<'_, D>, mem: &mut MemoryManager) -> EmuResult<Self> {
+    pub fn init<B: CpuBackend + ?Sized>(uc: &mut B, mem: &mut MemoryManager) -> EmuResult<Self> {
         // 1. 映射栈空间 (RW)，预留 0x100 字节保护缓冲区，严格保持 16 字节对齐 (AAPCS64 规范)
         mem.map_labeled(
             uc,
@@ -75,7 +76,7 @@ impl CpuContext {
         )?;
         let stack_top = (STACK_BASE + STACK_SIZE - 0x100) & !0xF;
 
-        // 2. 映射 RET_MAGIC_ADDR 所在页 (RX)，防止执行到 RET 返回 0xDEAD0000 时触发未映射取指异常
+        // 2. 映射 RET_MAGIC_ADDR 所在页 (RX)，非 Unicorn 后端写入 SVC #0x1003 返回哨兵
         mem.map_labeled(
             uc,
             RET_MAGIC_ADDR,
@@ -84,9 +85,14 @@ impl CpuContext {
             "[emu:ret_magic]",
             0,
         )?;
+        if uc.uses_svc_trampolines() {
+            mem.write_u32(uc, RET_MAGIC_ADDR, ARM64_SVC_RET_INSN)?;
+        }
 
-        // 3. 开启 ARM64 NEON / FP 浮点与 SIMD 单元
-        Self::enable_neon_fp(uc, mem)?;
+        // 3. 开启 ARM64 NEON / FP 浮点与 SIMD 单元（非 Unicorn 后端原生开启）
+        if !uc.uses_svc_trampolines() {
+            Self::enable_neon_fp(uc, mem)?;
+        }
 
         // 4. 初始化 Bionic TLS 空间并设置 TPIDR_EL0
         let errno_addr = Self::init_tls(uc, mem, TLS_BASE, 1000)?;
@@ -106,12 +112,10 @@ impl CpuContext {
     }
 
     /// 写入并执行 ARM64 开启 NEON/FP 浮点运算的初始化指令序列
-    ///
-    /// 原理说明：
-    /// Unicorn 模拟 ARM64 时默认处于 EL1，系统寄存器 CPACR_EL1 的 FPEN 位（bits [21:20]）初始为 0b00，
-    /// 任何浮点或 NEON/SIMD 指令（如 AES/SHA/memcpy 向量化优化）都会触发未定义/陷阱异常。
-    /// 将 CPACR_EL1.FPEN 置为 0b11（即或上 0x3 << 20 = 0x300000）即可允许 EL0/EL1 正常执行 FP/SIMD 指令。
-    fn enable_neon_fp<D>(uc: &mut Unicorn<'_, D>, mem: &mut MemoryManager) -> EmuResult<()> {
+    fn enable_neon_fp<B: CpuBackend + ?Sized>(
+        uc: &mut B,
+        mem: &mut MemoryManager,
+    ) -> EmuResult<()> {
         // 4 条 ARM64 机器码（32-bit 定长，小端序）：
         //   0xD538_1040: mrs x0, cpacr_el1       ; 读取 CPACR_EL1 (op0=3, op1=0, CRn=1, CRm=0, op2=2) 到 X0
         //   0xB26C_0400: orr x0, x0, #0x300000   ; 置位 FPEN[21:20] = 0b11 (sf=1, N=1, immr=44, imms=1)
@@ -135,7 +139,7 @@ impl CpuContext {
         mem.write(uc, CPU_INIT_STUB_ADDR, &code)?;
 
         // 执行上述 4 条指令（不挂载任何 Trace Hook，零污染）
-        uc.emu_start(
+        uc.run_simple(
             CPU_INIT_STUB_ADDR,
             CPU_INIT_STUB_ADDR + code.len() as u64,
             0,
@@ -145,9 +149,9 @@ impl CpuContext {
         Ok(())
     }
 
-    /// 映射并填充 Android 10–12 Bionic TLS 块，并通过 `msr tpidr_el0, x0; isb` 写入系统寄存器
-    pub fn init_tls<D>(
-        uc: &mut Unicorn<'_, D>,
+    /// 映射并填充 Android 10–12 Bionic TLS 块，并写入 `TPIDR_EL0` 系统寄存器
+    pub fn init_tls<B: CpuBackend + ?Sized>(
+        uc: &mut B,
         mem: &mut MemoryManager,
         tls_base: u64,
         tid: u32,
@@ -174,30 +178,33 @@ impl CpuContext {
         mem.write_u32(uc, pthread_struct_addr + 0x10, tid)?;
         mem.write_u32(uc, errno_addr, 0)?;
 
-        // 执行 `msr tpidr_el0, x0; isb` 将 tls_base 写入 TPIDR_EL0
-        //   0xD51B_D040: msr tpidr_el0, x0 (op0=3, op1=3, CRn=13, CRm=0, op2=2, Rt=0)
-        //   0xD503_3FDF: isb
-        const SET_TPIDR_INSNS: [u32; 2] = [0xD51B_D040, 0xD503_3FDF];
-        let mut code = [0u8; 8];
-        for (i, insn) in SET_TPIDR_INSNS.iter().enumerate() {
-            code[i * 4..(i + 1) * 4].copy_from_slice(&insn.to_le_bytes());
-        }
+        if uc.uses_svc_trampolines() {
+            // 非 Unicorn 后端直接写 TPIDR_EL0 寄存器，无需跑初始化小代码
+            uc.reg_write(RegisterARM64::TPIDR_EL0, tls_base)?;
+        } else {
+            // 执行 `msr tpidr_el0, x0; isb` 将 tls_base 写入 TPIDR_EL0
+            const SET_TPIDR_INSNS: [u32; 2] = [0xD51B_D040, 0xD503_3FDF];
+            let mut code = [0u8; 8];
+            for (i, insn) in SET_TPIDR_INSNS.iter().enumerate() {
+                code[i * 4..(i + 1) * 4].copy_from_slice(&insn.to_le_bytes());
+            }
 
-        let stub_addr = CPU_INIT_STUB_ADDR + 0x40;
-        mem.write(uc, stub_addr, &code)?;
-        uc.reg_write(RegisterARM64::X0, tls_base)?;
-        uc.emu_start(
-            stub_addr,
-            stub_addr + code.len() as u64,
-            0,
-            SET_TPIDR_INSNS.len(),
-        )?;
+            let stub_addr = CPU_INIT_STUB_ADDR + 0x40;
+            mem.write(uc, stub_addr, &code)?;
+            uc.reg_write(RegisterARM64::X0, tls_base)?;
+            uc.run_simple(
+                stub_addr,
+                stub_addr + code.len() as u64,
+                0,
+                SET_TPIDR_INSNS.len(),
+            )?;
+        }
 
         Ok(errno_addr)
     }
 
     /// 重置函数调用帧并按 AAPCS64 调用约定写入前 8 个整型/指针参数 (X0..X7)
-    pub fn prepare_call<D>(&self, uc: &mut Unicorn<'_, D>, args: &[u64]) -> EmuResult<()> {
+    pub fn prepare_call<B: CpuBackend + ?Sized>(&self, uc: &mut B, args: &[u64]) -> EmuResult<()> {
         const ARG_REGS: [RegisterARM64; 8] = [
             RegisterARM64::X0,
             RegisterARM64::X1,
@@ -220,18 +227,16 @@ impl CpuContext {
     }
 
     /// 保存当前完整 CPU 寄存器上下文快照
-    pub fn save_snapshot<D>(&self, uc: &Unicorn<'_, D>) -> EmuResult<CpuSnapshot> {
-        let inner = uc.context_init()?;
-        Ok(CpuSnapshot { inner })
+    pub fn save_snapshot<B: CpuBackend + ?Sized>(&self, uc: &B) -> EmuResult<CpuSnapshot> {
+        CpuSnapshot::capture(uc)
     }
 
     /// 恢复先前保存的 CPU 寄存器上下文快照
-    pub fn restore_snapshot<D>(
+    pub fn restore_snapshot<B: CpuBackend + ?Sized>(
         &self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         snapshot: &CpuSnapshot,
     ) -> EmuResult<()> {
-        uc.context_restore(&snapshot.inner)?;
-        Ok(())
+        snapshot.restore(uc)
     }
 }

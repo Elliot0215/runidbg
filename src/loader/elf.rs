@@ -9,7 +9,7 @@ use goblin::elf::reloc::{
 };
 use goblin::elf::Elf;
 use unicorn_engine::unicorn_const::Prot;
-use unicorn_engine::Unicorn;
+use crate::backend::CpuBackend;
 
 use crate::error::{EmuError, EmuResult};
 use crate::memory::{align_up, MemoryManager, PAGE_SIZE};
@@ -43,8 +43,8 @@ pub struct ElfLoader;
 
 impl ElfLoader {
     /// 从文件路径加载 Android ARM64 `.so`
-    pub fn load_so<D>(
-        uc: &mut Unicorn<'_, D>,
+    pub fn load_so<B: CpuBackend + ?Sized>(
+        uc: &mut B,
         mem: &mut MemoryManager,
         path: impl AsRef<Path>,
         base_addr: u64,
@@ -60,8 +60,8 @@ impl ElfLoader {
     }
 
     /// 从内存字节切片加载 Android ARM64 ELF 并完成基础重定位
-    pub fn load_bytes<D>(
-        uc: &mut Unicorn<'_, D>,
+    pub fn load_bytes<B: CpuBackend + ?Sized>(
+        uc: &mut B,
         mem: &mut MemoryManager,
         bytes: &[u8],
         name: String,
@@ -123,8 +123,8 @@ impl ElfLoader {
 }
 
 /// 映射 ELF 中所有 `PT_LOAD` 段并返回最高虚拟地址偏移
-pub(crate) fn map_pt_load_segments<D>(
-    uc: &mut Unicorn<'_, D>,
+pub(crate) fn map_pt_load_segments<B: CpuBackend + ?Sized>(
+    uc: &mut B,
     mem: &mut MemoryManager,
     elf: &Elf<'_>,
     bytes: &[u8],
@@ -177,8 +177,8 @@ pub(crate) fn extract_dynsyms(elf: &Elf<'_>, base_addr: u64) -> HashMap<String, 
 
 /// 从 `PT_DYNAMIC` 中提取 `DT_INIT` 与 `DT_INIT_ARRAY` 构造器函数地址列表
 /// 注意：必须在完成重定位之后调用，因为 `.init_array` 内的指针通常依赖 `R_AARCH64_RELATIVE` 回填
-pub(crate) fn extract_init_array<D>(
-    uc: &Unicorn<'_, D>,
+pub(crate) fn extract_init_array<B: CpuBackend + ?Sized>(
+    uc: &B,
     mem: &MemoryManager,
     elf: &Elf<'_>,
     base_addr: u64,

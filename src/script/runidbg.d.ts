@@ -60,7 +60,11 @@ interface DeviceProfileConfig {
   androidId?: string;
 }
 
+type EmuBackendKind = "unicorn" | "dynarmic" | "kvm" | "hypervisor";
+
 interface EmuOptions {
+  /** 底层 CPU 执行后端（默认 `"unicorn"`；`"dynarmic"` 提速 1.4x–6x；`"kvm"`/`"hypervisor"` 硬件虚拟化） */
+  backend?: EmuBackendKind;
   packageName?: string;
   searchPaths?: string[];
   hleAccel?: boolean;
@@ -491,6 +495,8 @@ interface DexNamespace {
 }
 
 interface EmuHandle {
+  /** 当前实例使用的底层 CPU 执行后端 */
+  readonly backend: EmuBackendKind;
   load(path: string, opts?: LoadOptions): ModuleHandle;
   /** 加载单个 `.dex`、路径数组或包含 `classes*.dex` 的目录到轻量元数据索引并挂载到 VFS */
   loadDex(pathOrPaths: string | string[]): {

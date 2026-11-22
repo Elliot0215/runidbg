@@ -1,6 +1,8 @@
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM64, UcHookId, Unicorn};
 
+use crate::backend::{BackendWithData, CpuBackend};
+
 use crate::error::EmuResult;
 use crate::memory::{read_guest_cstr as read_guest_c_string, MemoryManager};
 use crate::os::net::{
@@ -152,14 +154,15 @@ where
     Ok(hook_id)
 }
 
-/// 核心 Syscall 分发逻辑
-fn dispatch_syscall<D, F>(
-    uc: &mut Unicorn<'_, D>,
+/// 核心 Syscall 分发逻辑（供 Unicorn `SVC #0` Hook 与非 Unicorn 外部陷阱循环共用）
+pub fn dispatch_syscall<B, D, F>(
+    uc: &mut B,
     nr: u64,
     args: [u64; 6],
     get_state: &mut F,
 ) -> i64
 where
+    B: BackendWithData<D> + ?Sized,
     F: FnMut(&mut D) -> (&mut MemoryManager, &mut VirtualFs),
 {
     match nr {
@@ -931,7 +934,7 @@ where
             0
         }
         SYS_EXIT | SYS_EXIT_GROUP => {
-            let _ = uc.emu_stop();
+            let _ = CpuBackend::stop(uc);
             0
         }
         _ => {

@@ -10,6 +10,7 @@ use rquickjs::{
 };
 use unicorn_engine::Unicorn;
 
+use crate::backend::{BackendKind, BackendWithData, CpuBackend};
 use crate::emulator::{EmuState, DEFAULT_HEAP_BASE};
 use crate::jni::{JObject, JObjectRef, JValue};
 use crate::loader::LoadedModule;
@@ -26,13 +27,13 @@ use super::jni_bridge::{
 };
 use super::{EmuEntry, SharedHost, SharedLogSink};
 
-/// 统一可重入 `Unicorn` 访问器：
+/// 统一可重入 CPU 后端访问器（兼容 Unicorn / Dynarmic / KVM / Hypervisor）：
 /// 在原生 Hook 回调期间直接复用线程局部 `ACTIVE_UC`，非回调期间借用 `ScriptHost`。
 fn with_uc<R>(
     ctx: &Ctx<'_>,
     host: &SharedHost,
     emu_id: usize,
-    f: impl FnOnce(&mut Unicorn<'static, EmuState>) -> rquickjs::Result<R>,
+    f: impl FnOnce(&mut dyn BackendWithData<EmuState>) -> rquickjs::Result<R>,
 ) -> rquickjs::Result<R> {
     let mut f = Some(f);
     if let Some(res) = with_active_uc(|uc| (f.take().unwrap())(uc)) {
@@ -48,7 +49,39 @@ fn with_uc<R>(
         .emus
         .get_mut(emu_id)
         .ok_or_else(|| throw_err(ctx, "无效的 emuId"))?;
-    (f.take().unwrap())(entry.emu.uc_mut())
+    (f.take().unwrap())(entry.emu.cpu_mut())
+}
+
+/// 仅 Unicorn 后端可用的访问器（供逐指令/内存/Syscall 原生 Hook 使用，其他后端返回明确错误）
+fn with_unicorn_only<R>(
+    ctx: &Ctx<'_>,
+    host: &SharedHost,
+    emu_id: usize,
+    op_name: &str,
+    f: impl FnOnce(&mut Unicorn<'static, EmuState>) -> rquickjs::Result<R>,
+) -> rquickjs::Result<R> {
+    let mut f = Some(f);
+    if let Some(res) = with_active_uc(|uc| (f.take().unwrap())(uc)) {
+        return res;
+    }
+    let mut h = host.try_borrow_mut().map_err(|_| {
+        throw_err(
+            ctx,
+            "当前处于原生/JNI 回调重入上下文，此 API 不可重入调用",
+        )
+    })?;
+    let entry = h
+        .emus
+        .get_mut(emu_id)
+        .ok_or_else(|| throw_err(ctx, "无效的 emuId"))?;
+    let kind = entry.emu.backend_kind();
+    let uc = entry.emu.try_uc_mut().ok_or_else(|| {
+        throw_err(
+            ctx,
+            format!("当前后端 `{kind}` 不支持 `{op_name}`（仅 `unicorn` 后端支持原生指令/内存/Syscall Hook）"),
+        )
+    })?;
+    (f.take().unwrap())(uc)
 }
 
 fn throw_err(ctx: &Ctx<'_>, msg: impl std::fmt::Display) -> JsError {
@@ -315,7 +348,7 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
-    // emuCreate(packageName, searchPaths, hleAccel, heapSize) -> emuId
+    // emuCreate(packageName, searchPaths, hleAccel, heapSize, backendName?) -> emuId
     {
         let host = Rc::clone(host);
         let handles_table = Rc::clone(&handles_table);
@@ -327,12 +360,20 @@ pub(super) fn register_native_bridge<'js>(
                       pkg: String,
                       search_paths: Vec<String>,
                       hle_accel: bool,
-                      heap_size: f64|
+                      heap_size: f64,
+                      backend_name: Option<String>|
                       -> rquickjs::Result<usize> {
+                    let backend_kind: BackendKind = match backend_name.as_deref() {
+                        Some(s) if !s.trim().is_empty() => {
+                            s.parse().map_err(|e| throw_err(&ctx, e))?
+                        }
+                        _ => BackendKind::Unicorn,
+                    };
                     let hooks = Rc::new(RefCell::new(JsHookTable::default()));
                     let native_hooks = Rc::new(RefCell::new(JsNativeHookTable::default()));
                     let modules = Rc::new(RefCell::new(Vec::new()));
                     let mut builder = AndroidEmulator::builder()
+                        .backend(backend_kind)
                         .package_name(pkg)
                         .hle_accel(hle_accel)
                         .heap(DEFAULT_HEAP_BASE, (heap_size as u64).max(4 * 1024 * 1024))
@@ -441,8 +482,10 @@ pub(super) fn register_native_bridge<'js>(
                         .emu
                         .run_module_init_array(&module)
                         .map_err(|e| throw_err(&ctx, e))?;
-                    let nh = Rc::clone(&entry.native_hooks);
-                    JsNativeHookTable::flush_ret_magic_leaves(&nh, emu_id, entry.emu.uc_mut());
+                    if let Some(uc) = entry.emu.try_uc_mut() {
+                        let nh = Rc::clone(&entry.native_hooks);
+                        JsNativeHookTable::flush_ret_magic_leaves(&nh, emu_id, uc);
+                    }
                     Ok(())
                 },
             )?,
@@ -563,11 +606,13 @@ pub(super) fn register_native_bridge<'js>(
                         .emu
                         .call_symbol(&module, &sym, &args_u64)
                         .map_err(|e| throw_err(&ctx, e))?;
-                    let nh = Rc::clone(&entry.native_hooks);
-                    JsNativeHookTable::flush_ret_magic_leaves(&nh, emu_id, entry.emu.uc_mut());
+                    if let Some(uc) = entry.emu.try_uc_mut() {
+                        let nh = Rc::clone(&entry.native_hooks);
+                        JsNativeHookTable::flush_ret_magic_leaves(&nh, emu_id, uc);
+                    }
                     let final_ret = entry
                         .emu
-                        .uc()
+                        .cpu()
                         .reg_read(unicorn_engine::RegisterARM64::X0)
                         .unwrap_or(_ret);
                     Ok(final_ret as f64)
@@ -604,11 +649,13 @@ pub(super) fn register_native_bridge<'js>(
                         .emu
                         .call_address(addr as u64, &args_u64)
                         .map_err(|e| throw_err(&ctx, e))?;
-                    let nh = Rc::clone(&entry.native_hooks);
-                    JsNativeHookTable::flush_ret_magic_leaves(&nh, emu_id, entry.emu.uc_mut());
+                    if let Some(uc) = entry.emu.try_uc_mut() {
+                        let nh = Rc::clone(&entry.native_hooks);
+                        JsNativeHookTable::flush_ret_magic_leaves(&nh, emu_id, uc);
+                    }
                     let final_ret = entry
                         .emu
-                        .uc()
+                        .cpu()
                         .reg_read(unicorn_engine::RegisterARM64::X0)
                         .unwrap_or(_ret);
                     Ok(final_ret as f64)
@@ -799,11 +846,13 @@ pub(super) fn register_native_bridge<'js>(
                         .emu
                         .call_registered_native_with_this(&cls, &method, this_ref, &args_u64)
                         .map_err(|e| throw_err(&ctx, e))?;
-                    let nh = Rc::clone(&entry.native_hooks);
-                    JsNativeHookTable::flush_ret_magic_leaves(&nh, emu_id, entry.emu.uc_mut());
+                    if let Some(uc) = entry.emu.try_uc_mut() {
+                        let nh = Rc::clone(&entry.native_hooks);
+                        JsNativeHookTable::flush_ret_magic_leaves(&nh, emu_id, uc);
+                    }
                     let final_ret = entry
                         .emu
-                        .uc()
+                        .cpu()
                         .reg_read(unicorn_engine::RegisterARM64::X0)
                         .unwrap_or(_ret);
                     Ok(final_ret as f64)
@@ -2283,7 +2332,7 @@ pub(super) fn register_native_bridge<'js>(
                             let a = addr as u64;
                             uc.mem_write(a, slice)
                                 .map_err(|e| throw_err(&ctx, format!("memPatch 失败: {e:?}")))?;
-                            let _ = uc.ctl_remove_cache(a, a.saturating_add(slice.len() as u64));
+                            let _ = uc.flush_cache(a, a.saturating_add(slice.len() as u64));
                         }
                         Ok(slice.len())
                     })
@@ -2305,7 +2354,7 @@ pub(super) fn register_native_bridge<'js>(
                         let a = addr as u64;
                         uc.mem_write(a, &bytes)
                             .map_err(|e| throw_err(&ctx, format!("memNop 失败: {e:?}")))?;
-                        let _ = uc.ctl_remove_cache(a, a.saturating_add(bytes.len() as u64));
+                        let _ = uc.flush_cache(a, a.saturating_add(bytes.len() as u64));
                         Ok(bytes.len())
                     })
                 },
@@ -2336,7 +2385,7 @@ pub(super) fn register_native_bridge<'js>(
                         let a = addr as u64;
                         uc.mem_write(a, &bytes)
                             .map_err(|e| throw_err(&ctx, format!("memRet 失败: {e:?}")))?;
-                        let _ = uc.ctl_remove_cache(a, a.saturating_add(bytes.len() as u64));
+                        let _ = uc.flush_cache(a, a.saturating_add(bytes.len() as u64));
                         Ok(bytes.len())
                     })
                 },
@@ -2443,7 +2492,7 @@ pub(super) fn register_native_bridge<'js>(
                         .emus
                         .get(emu_id)
                         .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                    match entry.emu.uc().get_data().vfs.get_overlay_file(&path) {
+                    match entry.emu.cpu().get_data().vfs.get_overlay_file(&path) {
                         Some(data) => Ok(Some(TypedArray::new(ctx.clone(), data.to_vec())?)),
                         None => Ok(None),
                     }
@@ -2586,7 +2635,7 @@ pub(super) fn register_native_bridge<'js>(
                         .emus
                         .get(emu_id)
                         .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                    let nic = &entry.emu.uc().get_data().vfs.net.config.nic;
+                    let nic = &entry.emu.cpu().get_data().vfs.net.config.nic;
                     let out = Object::new(ctx.clone())?;
                     out.set("name", nic.name.as_str())?;
                     out.set("ipv4", nic.ipv4_string())?;
@@ -2611,7 +2660,7 @@ pub(super) fn register_native_bridge<'js>(
                         .emus
                         .get(emu_id)
                         .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
-                    let pkts = entry.emu.uc().get_data().vfs.net.packets();
+                    let pkts = entry.emu.cpu().get_data().vfs.net.packets();
                     let arr = Array::new(ctx.clone())?;
                     for (i, p) in pkts.iter().enumerate() {
                         let o = Object::new(ctx.clone())?;
@@ -3122,7 +3171,7 @@ pub(super) fn register_native_bridge<'js>(
                 move |ctx: Ctx<'_>, emu_id: usize| -> rquickjs::Result<()> {
                     with_uc(&ctx, &host, emu_id, |uc| {
                         uc.get_data_mut().manual_stop = true;
-                        uc.emu_stop()
+                        uc.stop()
                             .map_err(|e| throw_err(&ctx, format!("emu_stop 失败: {e:?}")))?;
                         Ok(())
                     })
@@ -3485,7 +3534,7 @@ pub(super) fn register_native_bridge<'js>(
                         Some(max_hits as u64)
                     };
                     let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
-                    with_uc(&ctx, &host, emu_id, |uc| {
+                    with_unicorn_only(&ctx, &host, emu_id, "hook.code", |uc| {
                         handles
                             .native_hooks
                             .borrow_mut()
@@ -3514,7 +3563,7 @@ pub(super) fn register_native_bridge<'js>(
                       -> rquickjs::Result<usize> {
                     let persistent = Persistent::save(&ctx, func);
                     let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
-                    with_uc(&ctx, &host, emu_id, |uc| {
+                    with_unicorn_only(&ctx, &host, emu_id, "hook.mem", |uc| {
                         handles
                             .native_hooks
                             .borrow_mut()
@@ -3548,7 +3597,7 @@ pub(super) fn register_native_bridge<'js>(
                       -> rquickjs::Result<usize> {
                     let persistent = Persistent::save(&ctx, func);
                     let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
-                    with_uc(&ctx, &host, emu_id, |uc| {
+                    with_unicorn_only(&ctx, &host, emu_id, "hook.replace", |uc| {
                         handles
                             .native_hooks
                             .borrow_mut()
@@ -3594,7 +3643,7 @@ pub(super) fn register_native_bridge<'js>(
                         None
                     };
                     let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
-                    with_uc(&ctx, &host, emu_id, |uc| {
+                    with_unicorn_only(&ctx, &host, emu_id, "hook.attach", |uc| {
                         handles
                             .native_hooks
                             .borrow_mut()
@@ -3621,7 +3670,7 @@ pub(super) fn register_native_bridge<'js>(
                     let persistent = Persistent::save(&ctx, func);
                     let key = if nr < 0.0 { SYSCALL_WILDCARD } else { nr as u64 };
                     let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
-                    with_uc(&ctx, &host, emu_id, |uc| {
+                    with_unicorn_only(&ctx, &host, emu_id, "hook.syscall", |uc| {
                         Ok(handles
                             .native_hooks
                             .borrow_mut()
@@ -3641,7 +3690,7 @@ pub(super) fn register_native_bridge<'js>(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, emu_id: usize, hook_id: usize| -> rquickjs::Result<bool> {
                     let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
-                    with_uc(&ctx, &host, emu_id, |uc| {
+                    with_unicorn_only(&ctx, &host, emu_id, "hook.detach", |uc| {
                         Ok(handles.native_hooks.borrow_mut().detach(hook_id, uc))
                     })
                 },

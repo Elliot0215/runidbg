@@ -1,18 +1,37 @@
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use unicorn_engine::unicorn_const::{Arch, Mode};
 use unicorn_engine::{RegisterARM64, UcHookId, Unicorn};
 
+#[cfg(feature = "dynarmic")]
+use crate::backend::dynarmic_backend::DynarmicCpu;
+#[cfg(feature = "hypervisor")]
+use crate::backend::hypervisor_backend::HypervisorCpu;
+#[cfg(feature = "kvm")]
+use crate::backend::kvm_backend::KvmCpu;
+#[cfg(any(feature = "dynarmic", feature = "kvm", feature = "hypervisor"))]
+use crate::backend::ExternalBackend;
+use crate::backend::{
+    BackendKind, BackendWithData, CpuBackend, CpuEngine, RunStopReason, SVC_IMM_HLE_TRAMPOLINE,
+    SVC_IMM_JNI_TRAMPOLINE, SVC_IMM_RET_MAGIC, SVC_IMM_SYSCALL,
+};
 use crate::cpu::{CpuContext, RET_MAGIC_ADDR};
 use crate::crash::{BreadcrumbRing, CrashReport};
 use crate::diag::EnvDiag;
 use crate::error::{EmuError, EmuResult};
-use crate::jni::{attach_jni_hook, DefaultJniHandler, JObjectRef, JniHandler, JniVm};
+use crate::jni::{
+    attach_jni_hook, dispatch_jni_slot, DefaultJniHandler, JObjectRef, JniHandler, JniVm,
+};
 #[cfg(feature = "apk")]
 use crate::loader::ApkPackage;
-use crate::loader::{attach_trampoline_hook, DynamicLinker, LoadedModule, TrampolineTable};
+use crate::loader::{
+    attach_trampoline_hook, dispatch_trampoline_slot, DynamicLinker, LoadedModule, TrampolineTable,
+};
 use crate::memory::MemoryManager;
-use crate::os::{attach_syscall_hook_with_interceptor, DeviceProfile, VirtualFs};
+use crate::os::{
+    attach_syscall_hook_with_interceptor, dispatch_syscall, DeviceProfile, VirtualFs,
+};
 use crate::snapshot::EmuSnapshot;
 use crate::tracer::{attach_code_hook, attach_mem_trace_hook, BinaryTracer, TraceLevel};
 
@@ -37,6 +56,7 @@ pub struct EmuState {
 
 /// 开箱即用的 Android ARM64 模拟器构建器
 pub struct AndroidEmulatorBuilder {
+    backend: BackendKind,
     package_name: String,
     heap_base: u64,
     heap_size: u64,
@@ -58,6 +78,7 @@ impl Default for AndroidEmulatorBuilder {
 impl AndroidEmulatorBuilder {
     pub fn new() -> Self {
         Self {
+            backend: BackendKind::Unicorn,
             package_name: "com.example.app".to_string(),
             heap_base: DEFAULT_HEAP_BASE,
             heap_size: DEFAULT_HEAP_SIZE,
@@ -69,6 +90,12 @@ impl AndroidEmulatorBuilder {
             trace_level: TraceLevel::RegDelta,
             auto_attach_trace: false,
         }
+    }
+
+    /// 指定底层 CPU 执行后端（默认 `BackendKind::Unicorn`，可选 `Dynarmic` / `Kvm` / `Hypervisor`）
+    pub fn backend(mut self, kind: BackendKind) -> Self {
+        self.backend = kind;
+        self
     }
 
     /// 设置模拟进程包名（同步生效于 `/proc/self/cmdline` 与 `JniVm`）
@@ -143,17 +170,63 @@ impl AndroidEmulatorBuilder {
             syscall_interceptor: None,
             manual_stop: false,
         };
-        let mut uc = Unicorn::new_with_data(Arch::ARM64, Mode::LITTLE_ENDIAN, placeholder)?;
+        let mut engine: CpuEngine<EmuState> = match self.backend {
+            BackendKind::Unicorn => CpuEngine::Unicorn(Unicorn::new_with_data(
+                Arch::ARM64,
+                Mode::LITTLE_ENDIAN,
+                placeholder,
+            )?),
+            BackendKind::Dynarmic => {
+                #[cfg(feature = "dynarmic")]
+                {
+                    CpuEngine::Dynarmic(Box::new(ExternalBackend::new(
+                        DynarmicCpu::new()?,
+                        placeholder,
+                    )))
+                }
+                #[cfg(not(feature = "dynarmic"))]
+                {
+                    return Err(EmuError::Backend(
+                        "当前构建未启用 `dynarmic` feature".to_string(),
+                    ));
+                }
+            }
+            BackendKind::Kvm => {
+                #[cfg(feature = "kvm")]
+                {
+                    CpuEngine::Kvm(Box::new(ExternalBackend::new(KvmCpu::new()?, placeholder)))
+                }
+                #[cfg(not(feature = "kvm"))]
+                {
+                    return Err(EmuError::Backend("当前构建未启用 `kvm` feature".to_string()));
+                }
+            }
+            BackendKind::Hypervisor => {
+                #[cfg(feature = "hypervisor")]
+                {
+                    CpuEngine::Hypervisor(Box::new(ExternalBackend::new(
+                        HypervisorCpu::new()?,
+                        placeholder,
+                    )))
+                }
+                #[cfg(not(feature = "hypervisor"))]
+                {
+                    return Err(EmuError::Backend(
+                        "当前构建未启用 `hypervisor` feature".to_string(),
+                    ));
+                }
+            }
+        };
 
         // 1. 初始化堆、CPU(NEON + TLS)、HLE 跳板区与 JNI 虚函数表
-        mem.init_heap(&mut uc)?;
-        let cpu = CpuContext::init(&mut uc, &mut mem)?;
+        mem.init_heap(&mut engine)?;
+        let cpu = CpuContext::init(&mut engine, &mut mem)?;
         trampolines.errno_addr = cpu.errno_addr;
-        trampolines.init(&mut uc, &mut mem)?;
-        jni.init(&mut uc, &mut mem)?;
+        trampolines.init(&mut engine, &mut mem)?;
+        jni.init(&mut engine, &mut mem)?;
 
-        // 2. 注入完整状态到 Unicorn UserData
-        let state = uc.get_data_mut();
+        // 2. 注入完整状态到后端 UserData
+        let state = engine.get_data_mut();
         state.mem = mem;
         state.vfs = vfs;
         state.trampolines = trampolines;
@@ -162,21 +235,23 @@ impl AndroidEmulatorBuilder {
         state.syscall_interceptor = None;
         state.manual_stop = false;
 
-        // 3. 自动挂载 Syscall / HLE Trampoline / JNI 三个核心 Hook
-        attach_syscall_hook_with_interceptor(
-            &mut uc,
-            |s| (&mut s.mem, &mut s.vfs),
-            |uc, nr, args| {
-                let mut cb = uc.get_data_mut().syscall_interceptor.take()?;
-                let res = cb(uc, nr, args);
-                if uc.get_data().syscall_interceptor.is_none() {
-                    uc.get_data_mut().syscall_interceptor = Some(cb);
-                }
-                res
-            },
-        )?;
-        attach_trampoline_hook(&mut uc, |s| (&mut s.trampolines, &mut s.mem, &mut s.vfs))?;
-        attach_jni_hook(&mut uc, |s| (&mut s.jni, &mut s.mem))?;
+        // 3. Unicorn 后端挂载 Syscall / HLE / JNI Hook；非 Unicorn 后端通过 SVC #imm16 统一外部循环分派
+        if let Some(uc) = engine.as_unicorn_mut() {
+            attach_syscall_hook_with_interceptor(
+                uc,
+                |s| (&mut s.mem, &mut s.vfs),
+                |uc, nr, args| {
+                    let mut cb = uc.get_data_mut().syscall_interceptor.take()?;
+                    let res = cb(uc, nr, args);
+                    if uc.get_data().syscall_interceptor.is_none() {
+                        uc.get_data_mut().syscall_interceptor = Some(cb);
+                    }
+                    res
+                },
+            )?;
+            attach_trampoline_hook(uc, |s| (&mut s.trampolines, &mut s.mem, &mut s.vfs))?;
+            attach_jni_hook(uc, |s| (&mut s.jni, &mut s.mem))?;
+        }
 
         let mut linker = DynamicLinker::new(self.enable_hle_accel);
         for dir in &self.sysroot_dirs {
@@ -184,7 +259,7 @@ impl AndroidEmulatorBuilder {
         }
 
         let mut emu = AndroidEmulator {
-            uc,
+            engine,
             cpu,
             linker,
             trace_code_hook: None,
@@ -204,10 +279,10 @@ impl AndroidEmulatorBuilder {
 
 /// 统一高层 Android ARM64 模拟器门面
 ///
-/// 封装了 Unicorn 引擎、MMU、Overlay VFS、动态链接器、HLE 跳板、JNI 桥接与 Trace 引擎，
-/// 提供开箱即用的 `.so` 加载、`JNI_OnLoad` 引导、函数调用与快照回放接口。
+/// 封装了多执行后端（Unicorn / Dynarmic / KVM / Hypervisor）、MMU、Overlay VFS、动态链接器、
+/// HLE 跳板、JNI 桥接与 Trace 引擎，提供开箱即用的 `.so` 加载、`JNI_OnLoad` 引导、函数调用与快照回放接口。
 pub struct AndroidEmulator {
-    uc: Unicorn<'static, EmuState>,
+    engine: CpuEngine<EmuState>,
     cpu: CpuContext,
     linker: DynamicLinker,
     trace_code_hook: Option<UcHookId>,
@@ -261,15 +336,15 @@ impl AndroidEmulator {
     ) -> EmuResult<LoadedModule> {
         let prev_loaded = self.linker.load_order().len();
 
-        // 暂移 mem 与 trampolines 进行静态映射与重定位（避免同时借用 &mut uc 与 UserData）
+        // 暂移 mem 与 trampolines 进行静态映射与重定位（避免同时借用 &mut engine 与 UserData）
         let mut mem = std::mem::replace(
-            &mut self.uc.get_data_mut().mem,
+            &mut self.engine.get_data_mut().mem,
             MemoryManager::new(0, 0),
         );
-        let mut trampolines = std::mem::take(&mut self.uc.get_data_mut().trampolines);
+        let mut trampolines = std::mem::take(&mut self.engine.get_data_mut().trampolines);
 
         let load_res = self.linker.load_bytes(
-            &mut self.uc,
+            &mut self.engine,
             &mut mem,
             &self.cpu,
             &mut trampolines,
@@ -280,8 +355,8 @@ impl AndroidEmulator {
         );
 
         // 归还 mem 与 trampolines，确保后续执行 .init_array 时 Syscall/HLE Hook 可正常访问
-        self.uc.get_data_mut().mem = mem;
-        self.uc.get_data_mut().trampolines = trampolines;
+        self.engine.get_data_mut().mem = mem;
+        self.engine.get_data_mut().trampolines = trampolines;
 
         let module = load_res?;
 
@@ -298,7 +373,7 @@ impl AndroidEmulator {
                     symbols: m.symbols.clone(),
                 })
                 .collect();
-            let tramp = &mut self.uc.get_data_mut().trampolines;
+            let tramp = &mut self.engine.get_data_mut().trampolines;
             for entry in new_mods {
                 tramp.register_loaded_module(entry);
             }
@@ -325,7 +400,7 @@ impl AndroidEmulator {
         let Ok(addr) = module.find_symbol("JNI_OnLoad") else {
             return Ok(None);
         };
-        let vm_ptr = self.uc.get_data().jni.java_vm_ptr();
+        let vm_ptr = self.engine.get_data().jni.java_vm_ptr();
         let ret = self.call_address(addr, &[vm_ptr, 0])?;
         Ok(Some(ret as i32))
     }
@@ -365,7 +440,7 @@ impl AndroidEmulator {
         extra_args: &[u64],
     ) -> EmuResult<u64> {
         let fn_ptr = self
-            .uc
+            .engine
             .get_data()
             .jni
             .find_registered_native(class_name, method_name)
@@ -374,11 +449,11 @@ impl AndroidEmulator {
                 EmuError::SymbolNotFound(format!("{class_name}.{method_name} (RegisterNatives)"))
             })?;
 
-        let env_ptr = self.uc.get_data().jni.jni_env_ptr();
+        let env_ptr = self.engine.get_data().jni.jni_env_ptr();
         let second_arg = match this_obj {
             Some(obj) if !obj.is_null() => obj.0,
             _ => self
-                .uc
+                .engine
                 .get_data_mut()
                 .jni
                 .objects
@@ -394,7 +469,7 @@ impl AndroidEmulator {
         self.call_address(fn_ptr, &all_args)
     }
 
-    /// 设置单次执行的 Unicorn 硬超时（微秒，0 表示不限）与最大指令数（0 表示不限）
+    /// 设置单次执行的硬超时（微秒，0 表示不限）与最大指令数（0 表示不限）
     pub fn set_execution_limits(&mut self, timeout_us: u64, max_instructions: usize) {
         self.exec_timeout_us = timeout_us;
         self.max_instructions = max_instructions;
@@ -405,10 +480,10 @@ impl AndroidEmulator {
         (self.exec_timeout_us, self.max_instructions)
     }
 
-    /// 主动请求中止当前 Unicorn 执行（与超时强杀区分）
+    /// 主动请求中止当前执行（与超时强杀区分）
     pub fn request_stop(&mut self) -> EmuResult<()> {
-        self.uc.get_data_mut().manual_stop = true;
-        self.uc.emu_stop()?;
+        self.engine.get_data_mut().manual_stop = true;
+        self.engine.stop()?;
         Ok(())
     }
 
@@ -419,26 +494,34 @@ impl AndroidEmulator {
 
     /// 获取最近外部事件环形缓冲（供 HLE/JNI/Syscall 写入前因轨迹）
     pub fn breadcrumbs(&self) -> &BreadcrumbRing {
-        self.uc.get_data().vfs.breadcrumbs()
+        self.engine.get_data().vfs.breadcrumbs()
     }
 
     /// 调用任意指定地址的函数（重置 `LR = RET_MAGIC_ADDR`），返回 `X0`
     pub fn call_address(&mut self, pc: u64, args: &[u64]) -> EmuResult<u64> {
-        self.cpu.prepare_call(&mut self.uc, args)?;
-        self.uc.get_data_mut().manual_stop = false;
+        self.cpu.prepare_call(&mut self.engine, args)?;
+        self.engine.get_data_mut().manual_stop = false;
         self.last_crash = None;
 
-        if let Err(uc_err) = self.uc.emu_start(
-            pc,
-            RET_MAGIC_ADDR,
-            self.exec_timeout_us,
-            self.max_instructions,
-        ) {
+        if self.engine.uses_svc_trampolines() {
+            return self.run_external_trap_loop(pc);
+        }
+
+        let exec_res = {
+            let uc = self.engine.as_unicorn_mut().expect("Unicorn backend");
+            uc.emu_start(
+                pc,
+                RET_MAGIC_ADDR,
+                self.exec_timeout_us,
+                self.max_instructions,
+            )
+        };
+        if let Err(uc_err) = exec_res {
             let report = CrashReport::capture(
-                &self.uc,
+                &self.engine,
                 &self.linker,
-                &self.uc.get_data().mem,
-                self.uc.get_data().vfs.breadcrumbs(),
+                &self.engine.get_data().mem,
+                self.engine.get_data().vfs.breadcrumbs(),
                 format!("Unicorn({uc_err:?})"),
             );
             tracing::error!(
@@ -452,17 +535,17 @@ impl AndroidEmulator {
             return Err(EmuError::GuestCrash(Box::new(report)));
         }
 
-        let end_pc = self.uc.reg_read(RegisterARM64::PC)?;
-        let manual_stop = self.uc.get_data().manual_stop;
+        let end_pc = self.engine.reg_read(RegisterARM64::PC)?;
+        let manual_stop = self.engine.get_data().manual_stop;
         if (self.exec_timeout_us > 0 || self.max_instructions > 0)
             && !manual_stop
             && end_pc != RET_MAGIC_ADDR
         {
             let report = CrashReport::capture(
-                &self.uc,
+                &self.engine,
                 &self.linker,
-                &self.uc.get_data().mem,
-                self.uc.get_data().vfs.breadcrumbs(),
+                &self.engine.get_data().mem,
+                self.engine.get_data().vfs.breadcrumbs(),
                 format!(
                     "ExecutionTimeout(timeout_us={}, max_instructions={})",
                     self.exec_timeout_us, self.max_instructions
@@ -482,99 +565,264 @@ impl AndroidEmulator {
                 max_instructions: self.max_instructions,
             });
         }
-        Ok(self.uc.reg_read(RegisterARM64::X0)?)
+        self.engine.reg_read(RegisterARM64::X0)
     }
 
-    /// 挂载指令级（及 `Full` 模式下的内存级）Trace Hook
+    /// 非 Unicorn 后端（Dynarmic / KVM / Hypervisor）统一的 `SVC #imm16` 外部调度循环
+    fn run_external_trap_loop(&mut self, start_pc: u64) -> EmuResult<u64> {
+        let mut cur_pc = start_pc;
+        let deadline = if self.exec_timeout_us > 0 {
+            Some(Instant::now() + Duration::from_micros(self.exec_timeout_us))
+        } else {
+            None
+        };
+
+        loop {
+            let remaining_us = match deadline {
+                Some(dl) => {
+                    let now = Instant::now();
+                    if now >= dl {
+                        let pc = self.engine.reg_read(RegisterARM64::PC).unwrap_or(cur_pc);
+                        let report = CrashReport::capture(
+                            &self.engine,
+                            &self.linker,
+                            &self.engine.get_data().mem,
+                            self.engine.get_data().vfs.breadcrumbs(),
+                            format!(
+                                "ExecutionTimeout(timeout_us={}, max_instructions={})",
+                                self.exec_timeout_us, self.max_instructions
+                            ),
+                        );
+                        self.last_crash = Some(report);
+                        return Err(EmuError::ExecutionTimeout {
+                            pc,
+                            timeout_us: self.exec_timeout_us,
+                            max_instructions: self.max_instructions,
+                        });
+                    }
+                    dl.duration_since(now).as_micros().max(1) as u64
+                }
+                None => 0,
+            };
+
+            match self
+                .engine
+                .run_external_step(cur_pc, remaining_us, self.max_instructions)?
+            {
+                RunStopReason::Svc { imm, next_pc } => match imm {
+                    SVC_IMM_RET_MAGIC => {
+                        return self.engine.reg_read(RegisterARM64::X0);
+                    }
+                    SVC_IMM_SYSCALL => {
+                        let nr = self.engine.reg_read(RegisterARM64::X8)?;
+                        let args = [
+                            self.engine.reg_read(RegisterARM64::X0)?,
+                            self.engine.reg_read(RegisterARM64::X1)?,
+                            self.engine.reg_read(RegisterARM64::X2)?,
+                            self.engine.reg_read(RegisterARM64::X3)?,
+                            self.engine.reg_read(RegisterARM64::X4)?,
+                            self.engine.reg_read(RegisterARM64::X5)?,
+                        ];
+                        let ret = dispatch_syscall(&mut self.engine, nr, args, &mut |s| {
+                            (&mut s.mem, &mut s.vfs)
+                        });
+                        self.engine.reg_write(RegisterARM64::X0, ret as u64)?;
+                        if self.engine.get_data().manual_stop || self.engine.is_stop_requested() {
+                            return self.engine.reg_read(RegisterARM64::X0);
+                        }
+                        cur_pc = next_pc;
+                    }
+                    SVC_IMM_HLE_TRAMPOLINE => {
+                        let slot_addr = next_pc.wrapping_sub(4);
+                        // 将 PC 置于槽位地址，以便检测 HLE 是否显式重定向了 PC
+                        // （如 pthread_once / pthread_join / longjmp / dl_iterate_phdr / __system_property_read_callback）
+                        self.engine.reg_write(RegisterARM64::PC, slot_addr)?;
+                        dispatch_trampoline_slot(&mut self.engine, slot_addr, &mut |s| {
+                            (&mut s.trampolines, &mut s.mem, &mut s.vfs)
+                        });
+                        if self.engine.get_data().manual_stop || self.engine.is_stop_requested() {
+                            return self.engine.reg_read(RegisterARM64::X0);
+                        }
+                        let pc_after = self.engine.reg_read(RegisterARM64::PC)?;
+                        cur_pc = if pc_after != slot_addr && pc_after != next_pc {
+                            pc_after
+                        } else {
+                            self.engine.reg_read(RegisterARM64::LR)?
+                        };
+                    }
+                    SVC_IMM_JNI_TRAMPOLINE => {
+                        let slot_addr = next_pc.wrapping_sub(4);
+                        dispatch_jni_slot(&mut self.engine, slot_addr, &mut |s| {
+                            (&mut s.jni, &mut s.mem)
+                        });
+                        if self.engine.get_data().manual_stop || self.engine.is_stop_requested() {
+                            return self.engine.reg_read(RegisterARM64::X0);
+                        }
+                        cur_pc = self.engine.reg_read(RegisterARM64::LR)?;
+                    }
+                    other => {
+                        let fault_pc = next_pc.wrapping_sub(4);
+                        let _ = self.engine.reg_write(RegisterARM64::PC, fault_pc);
+                        let report = CrashReport::capture(
+                            &self.engine,
+                            &self.linker,
+                            &self.engine.get_data().mem,
+                            self.engine.get_data().vfs.breadcrumbs(),
+                            format!("UnknownSvc(imm=0x{other:04x})"),
+                        );
+                        self.last_crash = Some(report.clone());
+                        return Err(EmuError::GuestCrash(Box::new(report)));
+                    }
+                },
+                RunStopReason::MemoryFault { pc, detail, .. }
+                | RunStopReason::IllegalInstruction { pc, detail } => {
+                    let _ = self.engine.reg_write(RegisterARM64::PC, pc);
+                    let report = CrashReport::capture(
+                        &self.engine,
+                        &self.linker,
+                        &self.engine.get_data().mem,
+                        self.engine.get_data().vfs.breadcrumbs(),
+                        detail,
+                    );
+                    tracing::error!(
+                        target: "runidbg::crash",
+                        pc = format_args!("0x{:016x}", report.pc),
+                        location = %report.pc_location,
+                        reason = %report.reason,
+                        "\n{report}"
+                    );
+                    self.last_crash = Some(report.clone());
+                    return Err(EmuError::GuestCrash(Box::new(report)));
+                }
+                RunStopReason::Timeout { pc } => {
+                    let _ = self.engine.reg_write(RegisterARM64::PC, pc);
+                    let report = CrashReport::capture(
+                        &self.engine,
+                        &self.linker,
+                        &self.engine.get_data().mem,
+                        self.engine.get_data().vfs.breadcrumbs(),
+                        format!(
+                            "ExecutionTimeout(timeout_us={}, max_instructions={})",
+                            self.exec_timeout_us, self.max_instructions
+                        ),
+                    );
+                    self.last_crash = Some(report);
+                    return Err(EmuError::ExecutionTimeout {
+                        pc,
+                        timeout_us: self.exec_timeout_us,
+                        max_instructions: self.max_instructions,
+                    });
+                }
+                RunStopReason::Stopped => {
+                    return self.engine.reg_read(RegisterARM64::X0);
+                }
+            }
+        }
+    }
+
+    /// 挂载指令级（及 `Full` 模式下的内存级）Trace Hook（仅 Unicorn 后端支持）
     pub fn attach_tracer(&mut self, begin: u64, end: u64) -> EmuResult<()> {
+        if !self.backend_kind().supports_trace() {
+            return Err(EmuError::Backend(format!(
+                "当前后端 `{}` 不支持指令级 Trace（请切换到 `unicorn` 后端）",
+                self.backend_kind()
+            )));
+        }
+        let uc = self.engine.as_unicorn_mut().expect("Unicorn backend");
         if self.trace_code_hook.is_none() {
-            let h = attach_code_hook(&mut self.uc, begin, end, |s| &mut s.tracer)?;
+            let h = attach_code_hook(uc, begin, end, |s| &mut s.tracer)?;
             self.trace_code_hook = Some(h);
-            // 清除已加载模块的 Unicorn JIT TB 缓存，确保之前已执行过的函数也能命中新挂载的 Trace Hook
             for name in self.linker.load_order() {
                 if let Some(m) = self.linker.get_module(name) {
-                    let _ = self
-                        .uc
+                    let _ = uc
                         .ctl_remove_cache(m.base_addr, m.base_addr.saturating_add(m.image_size));
                 }
             }
         }
-        if self.uc.get_data().tracer.level() == TraceLevel::Full && self.trace_mem_hook.is_none() {
-            let mh = attach_mem_trace_hook(&mut self.uc, 0, u64::MAX, |s| &mut s.tracer)?;
+        if uc.get_data().tracer.level() == TraceLevel::Full && self.trace_mem_hook.is_none() {
+            let mh = attach_mem_trace_hook(uc, 0, u64::MAX, |s| &mut s.tracer)?;
             self.trace_mem_hook = Some(mh);
         }
         Ok(())
     }
 
-    /// 替换底层 Tracer（例如切换为双流 `memmap2` 落盘）并自动挂载 Hook
+    /// 替换底层 Tracer（例如切换为双流 `memmap2` 落盘）并自动挂载 Hook（仅 Unicorn 后端支持）
     pub fn set_tracer(&mut self, tracer: BinaryTracer) -> EmuResult<()> {
-        self.uc.get_data_mut().tracer = tracer;
+        if !self.backend_kind().supports_trace() {
+            return Err(EmuError::Backend(format!(
+                "当前后端 `{}` 不支持指令级 Trace（请切换到 `unicorn` 后端）",
+                self.backend_kind()
+            )));
+        }
+        self.engine.get_data_mut().tracer = tracer;
         self.attach_tracer(0, u64::MAX)
     }
 
     /// 卸载 Trace Hook 并刷盘
     pub fn detach_tracer(&mut self) -> EmuResult<()> {
-        if let Some(h) = self.trace_code_hook.take() {
-            let _ = self.uc.remove_hook(h);
+        if let Some(uc) = self.engine.as_unicorn_mut() {
+            if let Some(h) = self.trace_code_hook.take() {
+                let _ = uc.remove_hook(h);
+            }
+            if let Some(mh) = self.trace_mem_hook.take() {
+                let _ = uc.remove_hook(mh);
+            }
         }
-        if let Some(mh) = self.trace_mem_hook.take() {
-            let _ = self.uc.remove_hook(mh);
-        }
-        self.uc.get_data_mut().tracer.finalize()
+        self.engine.get_data_mut().tracer.finalize()
     }
 
     /// 捕获完整 CPU + 可写内存 + 模拟堆分配器 + JNI 引用表快照（供批量回放或常驻重置）
     pub fn capture_snapshot(&self) -> EmuResult<EmuSnapshot> {
-        let data = self.uc.get_data();
-        EmuSnapshot::capture_full(&self.uc, &data.mem, &data.jni)
+        let data = self.engine.get_data();
+        EmuSnapshot::capture_full(&self.engine, &data.mem, &data.jni)
     }
 
     /// 完整回滚至指定快照状态（同步恢复 CPU、可写内存、堆指针/空闲链表与 JNI 引用表）
     pub fn restore_snapshot(&mut self, snapshot: &EmuSnapshot) -> EmuResult<()> {
-        snapshot.restore_full(&mut self.uc, |d| (&mut d.mem, &mut d.jni))
+        snapshot.restore_full(&mut self.engine, |d| (&mut d.mem, &mut d.jni))
     }
 
     /// 便捷创建 `jstring`
     pub fn new_jstring(&mut self, s: impl Into<String>) -> JObjectRef {
-        self.uc.get_data_mut().jni.objects.add_string(s)
+        self.engine.get_data_mut().jni.objects.add_string(s)
     }
 
     /// 便捷读取 `jstring` 内容
     pub fn read_jstring(&self, r: JObjectRef) -> Option<&str> {
-        self.uc.get_data().jni.objects.get_string(r)
+        self.engine.get_data().jni.objects.get_string(r)
     }
 
     /// 便捷创建 `jbyteArray`
     pub fn new_jbyte_array(&mut self, bytes: impl Into<Vec<u8>>) -> JObjectRef {
-        self.uc.get_data_mut().jni.objects.add_byte_array(bytes)
+        self.engine.get_data_mut().jni.objects.add_byte_array(bytes)
     }
 
     pub fn jni(&self) -> &JniVm {
-        &self.uc.get_data().jni
+        &self.engine.get_data().jni
     }
 
     pub fn jni_mut(&mut self) -> &mut JniVm {
-        &mut self.uc.get_data_mut().jni
+        &mut self.engine.get_data_mut().jni
     }
 
     pub fn vfs(&self) -> &VirtualFs {
-        &self.uc.get_data().vfs
+        &self.engine.get_data().vfs
     }
 
     pub fn vfs_mut(&mut self) -> &mut VirtualFs {
-        &mut self.uc.get_data_mut().vfs
+        &mut self.engine.get_data_mut().vfs
     }
 
     /// 统一应用设备画像，同步更新 VFS（系统属性、`/proc/*`、`uname`）与 JNI（`android/os/Build`）
     pub fn apply_device_profile(&mut self, profile: DeviceProfile) {
-        let data = self.uc.get_data_mut();
+        let data = self.engine.get_data_mut();
         data.vfs.apply_device_profile(profile.clone());
         data.jni.set_device_profile(profile);
     }
 
     /// 获取缺环境自动诊断器（共享引用，可动态开启/关闭/导出补环境脚本）
     pub fn diag(&self) -> &EnvDiag {
-        self.uc.get_data().vfs.diag()
+        self.engine.get_data().vfs.diag()
     }
 
     /// 从磁盘加载单个 `.dex` 文件到轻量元数据索引并挂载到 VFS，返回解析出的类数量
@@ -590,17 +838,14 @@ impl AndroidEmulator {
 
     /// 从字节流加载 `.dex` 到轻量元数据索引并挂载到 VFS，返回解析出的类数量
     pub fn load_dex_bytes(&mut self, name: &str, bytes: &[u8]) -> EmuResult<usize> {
-        let data = self.uc.get_data_mut();
+        let data = self.engine.get_data_mut();
         let pkg = data.vfs.package_name.clone();
         data.vfs
             .add_overlay_file(format!("/data/app/{pkg}/{name}"), bytes.to_vec());
         data.jni.dex_index.add_dex_bytes(bytes)
     }
 
-    /// 一键加载 Android APK：
-    /// - 解析包名与签名证书（`AndroidManifest.xml` + `META-INF/*.RSA`）
-    /// - 将 `lib/arm64-v8a/*.so` 注册到内存动态链接器（自动解析 `DT_NEEDED`）
-    /// - 将 `assets/**`、`classes*.dex` 与 `base.apk` 挂载到内存 VFS，并自动建立 DEX 元数据索引
+    /// 一键加载 Android APK
     #[cfg(feature = "apk")]
     pub fn load_apk(&mut self, path: impl AsRef<Path>) -> EmuResult<ApkPackage> {
         let apk = ApkPackage::from_path(path)?;
@@ -614,9 +859,9 @@ impl AndroidEmulator {
         let pkg_name = apk
             .package_name
             .clone()
-            .unwrap_or_else(|| self.uc.get_data().vfs.package_name.clone());
+            .unwrap_or_else(|| self.engine.get_data().vfs.package_name.clone());
         {
-            let data = self.uc.get_data_mut();
+            let data = self.engine.get_data_mut();
             data.vfs.package_name = pkg_name.clone();
             data.vfs
                 .add_overlay_file(format!("/data/app/{pkg_name}/base.apk"), apk.raw_apk.clone());
@@ -667,19 +912,54 @@ impl AndroidEmulator {
     }
 
     pub fn tracer(&self) -> &BinaryTracer {
-        &self.uc.get_data().tracer
+        &self.engine.get_data().tracer
     }
 
     pub fn tracer_mut(&mut self) -> &mut BinaryTracer {
-        &mut self.uc.get_data_mut().tracer
+        &mut self.engine.get_data_mut().tracer
     }
 
+    /// 返回当前使用的底层 CPU 执行后端类型
+    pub fn backend_kind(&self) -> BackendKind {
+        self.engine.kind()
+    }
+
+    /// 获取跨后端统一的 `CpuEngine` 只读引用（实现 `CpuBackend + BackendWithData<EmuState>`）
+    pub fn cpu(&self) -> &CpuEngine<EmuState> {
+        &self.engine
+    }
+
+    /// 获取跨后端统一的 `CpuEngine` 可变引用（实现 `CpuBackend + BackendWithData<EmuState>`）
+    pub fn cpu_mut(&mut self) -> &mut CpuEngine<EmuState> {
+        &mut self.engine
+    }
+
+    /// 若当前为 Unicorn 后端，返回底层 `Unicorn` 引用；否则返回 `None`
+    pub fn try_uc(&self) -> Option<&Unicorn<'static, EmuState>> {
+        self.engine.as_unicorn()
+    }
+
+    /// 若当前为 Unicorn 后端，返回底层 `Unicorn` 可变引用；否则返回 `None`
+    pub fn try_uc_mut(&mut self) -> Option<&mut Unicorn<'static, EmuState>> {
+        self.engine.as_unicorn_mut()
+    }
+
+    /// 获取底层 `Unicorn` 只读引用（仅 Unicorn 后端可用；非 Unicorn 后端请改用 `cpu()` / `try_uc()`）
     pub fn uc(&self) -> &Unicorn<'static, EmuState> {
-        &self.uc
+        self.engine.as_unicorn().unwrap_or_else(|| {
+            panic!(
+                "当前后端 `{}` 不是 Unicorn，请改用 `emu.cpu()` 或 `emu.try_uc()`",
+                self.engine.kind()
+            )
+        })
     }
 
+    /// 获取底层 `Unicorn` 可变引用（仅 Unicorn 后端可用；非 Unicorn 后端请改用 `cpu_mut()` / `try_uc_mut()`）
     pub fn uc_mut(&mut self) -> &mut Unicorn<'static, EmuState> {
-        &mut self.uc
+        let kind = self.engine.kind();
+        self.engine.as_unicorn_mut().unwrap_or_else(|| {
+            panic!("当前后端 `{kind}` 不是 Unicorn，请改用 `emu.cpu_mut()` 或 `emu.try_uc_mut()`")
+        })
     }
 
     pub fn linker(&self) -> &DynamicLinker {

@@ -1,3 +1,4 @@
+pub mod backend;
 pub mod cpu;
 pub mod crash;
 pub mod debug;
@@ -16,4 +17,5 @@ pub mod tracer;
 #[cfg(feature = "ui")]
 pub mod ui;
 
+pub use backend::{BackendKind, BackendWithData, CpuBackend};
 pub use emulator::{AndroidEmulator, AndroidEmulatorBuilder};

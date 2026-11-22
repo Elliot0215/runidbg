@@ -8,7 +8,9 @@ use goblin::elf::reloc::{
     R_AARCH64_RELATIVE, R_AARCH64_TLS_TPREL,
 };
 use goblin::elf::Elf;
-use unicorn_engine::{RegisterARM64, Unicorn};
+use unicorn_engine::RegisterARM64;
+
+use crate::backend::CpuBackend;
 
 use crate::cpu::{CpuContext, RET_MAGIC_ADDR};
 use crate::error::{EmuError, EmuResult};
@@ -118,9 +120,9 @@ impl DynamicLinker {
     }
 
     /// 从文件路径加载目标 `.so`（递归加载 `DT_NEEDED` 依赖，并可选执行 `.init_array`）
-    pub fn load_file<D>(
+    pub fn load_file<B: CpuBackend + ?Sized>(
         &mut self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         mem: &mut MemoryManager,
         cpu: &CpuContext,
         trampolines: &mut TrampolineTable,
@@ -144,9 +146,9 @@ impl DynamicLinker {
 
     /// 从字节切片加载 `.so`（供主流程与测试使用）
     #[allow(clippy::too_many_arguments)]
-    pub fn load_bytes<D>(
+    pub fn load_bytes<B: CpuBackend + ?Sized>(
         &mut self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         mem: &mut MemoryManager,
         cpu: &CpuContext,
         trampolines: &mut TrampolineTable,
@@ -271,7 +273,7 @@ impl DynamicLinker {
         // 5. 执行 R_AARCH64_IRELATIVE 解析器并回填返回值 X0
         for (patch_addr, resolver_addr) in irelatives {
             cpu.prepare_call(uc, &[])?;
-            uc.emu_start(resolver_addr, RET_MAGIC_ADDR, 0, 0)?;
+            uc.run_simple(resolver_addr, RET_MAGIC_ADDR, 0, 0)?;
             let resolved_fn = uc.reg_read(RegisterARM64::X0)?;
             mem.write_u64(uc, patch_addr, resolved_fn)?;
         }
@@ -305,9 +307,9 @@ impl DynamicLinker {
     /// 3) 已加载依赖模块的全局导出符号
     /// 4) 若有内置 HLE 实现 -> 路由到内置 HLE 跳板
     /// 5) 兜底分配 `UnimplementedStub` 跳板桩
-    fn resolve_symbol<D>(
+    fn resolve_symbol<B: CpuBackend + ?Sized>(
         &self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         mem: &mut MemoryManager,
         trampolines: &mut TrampolineTable,
         sym_name: &str,
@@ -349,14 +351,14 @@ impl DynamicLinker {
     }
 
     /// 依次执行模块的 `DT_INIT` 与 `.init_array` 构造器
-    pub fn run_init_array<D>(
-        uc: &mut Unicorn<'_, D>,
+    pub fn run_init_array<B: CpuBackend + ?Sized>(
+        uc: &mut B,
         cpu: &CpuContext,
         module: &LoadedModule,
     ) -> EmuResult<()> {
         for &init_fn in &module.init_array {
             cpu.prepare_call(uc, &[0, 0, 0])?;
-            uc.emu_start(init_fn, RET_MAGIC_ADDR, 0, 0)?;
+            uc.run_simple(init_fn, RET_MAGIC_ADDR, 0, 0)?;
         }
         Ok(())
     }

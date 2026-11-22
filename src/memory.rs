@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use unicorn_engine::unicorn_const::Prot;
-use unicorn_engine::Unicorn;
+use crate::backend::CpuBackend;
 
 use crate::error::{EmuError, EmuResult};
 
@@ -230,7 +230,7 @@ impl MemoryManager {
     }
 
     /// 初始化并向 Unicorn 映射模拟堆区域（RW 权限）
-    pub fn init_heap<D>(&mut self, uc: &mut Unicorn<'_, D>) -> EmuResult<()> {
+    pub fn init_heap<B: CpuBackend + ?Sized>(&mut self, uc: &mut B) -> EmuResult<()> {
         self.map_labeled(
             uc,
             self.heap.base(),
@@ -244,9 +244,9 @@ impl MemoryManager {
     }
 
     /// 4KB 页对齐映射内存（默认匿名标签 `[anon]`）
-    pub fn map_aligned<D>(
+    pub fn map_aligned<B: CpuBackend + ?Sized>(
         &mut self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         addr: u64,
         size: u64,
         perms: Prot,
@@ -255,9 +255,9 @@ impl MemoryManager {
     }
 
     /// 4KB 页对齐映射内存并记录 VMA 元数据（用于 `/proc/self/maps` 合成）
-    pub fn map_labeled<D>(
+    pub fn map_labeled<B: CpuBackend + ?Sized>(
         &mut self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         addr: u64,
         size: u64,
         perms: Prot,
@@ -303,9 +303,9 @@ impl MemoryManager {
     }
 
     /// 模拟 Linux `mmap`：当 `hint_addr == 0` 时从匿名映射池自动分配空闲区间
-    pub fn mmap<D>(
+    pub fn mmap<B: CpuBackend + ?Sized>(
         &mut self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         hint_addr: u64,
         size: u64,
         perms: Prot,
@@ -333,7 +333,7 @@ impl MemoryManager {
     }
 
     /// 模拟 Linux `munmap`：解除指定页范围映射并清理 VMA 元数据
-    pub fn munmap<D>(&mut self, uc: &mut Unicorn<'_, D>, addr: u64, size: u64) -> EmuResult<()> {
+    pub fn munmap<B: CpuBackend + ?Sized>(&mut self, uc: &mut B, addr: u64, size: u64) -> EmuResult<()> {
         if size == 0 {
             return Ok(());
         }
@@ -359,9 +359,9 @@ impl MemoryManager {
     }
 
     /// 模拟 Linux `mprotect`：修改已映射页的读写执行权限并同步更新 VMA 区间
-    pub fn mprotect<D>(
+    pub fn mprotect<B: CpuBackend + ?Sized>(
         &mut self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         addr: u64,
         size: u64,
         perms: Prot,
@@ -507,7 +507,7 @@ impl MemoryManager {
     }
 
     /// 带块头元数据的 HLE `malloc`（支持 `realloc` 读取原块大小，并可被 `hle_free` 回收复用）
-    pub fn hle_malloc<D>(&mut self, uc: &mut Unicorn<'_, D>, size: u64) -> EmuResult<u64> {
+    pub fn hle_malloc<B: CpuBackend + ?Sized>(&mut self, uc: &mut B, size: u64) -> EmuResult<u64> {
         let alloc_sz = size.max(1);
         let raw_addr = self.heap.alloc(HEAP_HEADER_SIZE + alloc_sz, 16)?;
         self.write_u64(uc, raw_addr, HEAP_BLOCK_MAGIC)?;
@@ -529,9 +529,9 @@ impl MemoryManager {
     }
 
     /// 带零初始化的 HLE `calloc`
-    pub fn hle_calloc<D>(
+    pub fn hle_calloc<B: CpuBackend + ?Sized>(
         &mut self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         nmemb: u64,
         size: u64,
     ) -> EmuResult<u64> {
@@ -543,9 +543,9 @@ impl MemoryManager {
     }
 
     /// HLE `realloc`（读取 16 字节块头原大小并拷贝数据到新块，同时回收旧块）
-    pub fn hle_realloc<D>(
+    pub fn hle_realloc<B: CpuBackend + ?Sized>(
         &mut self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         old_ptr: u64,
         new_size: u64,
     ) -> EmuResult<u64> {
@@ -587,14 +587,14 @@ impl MemoryManager {
     }
 
     /// 读取指定地址内存到新 Vec
-    pub fn read<D>(&self, uc: &Unicorn<'_, D>, addr: u64, size: usize) -> EmuResult<Vec<u8>> {
+    pub fn read<B: CpuBackend + ?Sized>(&self, uc: &B, addr: u64, size: usize) -> EmuResult<Vec<u8>> {
         let mut buf = vec![0u8; size];
         self.read_into(uc, addr, &mut buf)?;
         Ok(buf)
     }
 
     /// 零分配读取指定地址内存到已有切片
-    pub fn read_into<D>(&self, uc: &Unicorn<'_, D>, addr: u64, buf: &mut [u8]) -> EmuResult<()> {
+    pub fn read_into<B: CpuBackend + ?Sized>(&self, uc: &B, addr: u64, buf: &mut [u8]) -> EmuResult<()> {
         uc.mem_read(addr, buf)
             .map_err(|_| EmuError::UnmappedMemory {
                 addr,
@@ -603,7 +603,7 @@ impl MemoryManager {
     }
 
     /// 向模拟内存写入字节切片
-    pub fn write<D>(&self, uc: &mut Unicorn<'_, D>, addr: u64, data: &[u8]) -> EmuResult<()> {
+    pub fn write<B: CpuBackend + ?Sized>(&self, uc: &mut B, addr: u64, data: &[u8]) -> EmuResult<()> {
         uc.mem_write(addr, data)
             .map_err(|_| EmuError::UnmappedMemory {
                 addr,
@@ -612,26 +612,26 @@ impl MemoryManager {
     }
 
     /// 读取小端 64 位整数
-    pub fn read_u64<D>(&self, uc: &Unicorn<'_, D>, addr: u64) -> EmuResult<u64> {
+    pub fn read_u64<B: CpuBackend + ?Sized>(&self, uc: &B, addr: u64) -> EmuResult<u64> {
         let mut buf = [0u8; 8];
         self.read_into(uc, addr, &mut buf)?;
         Ok(u64::from_le_bytes(buf))
     }
 
     /// 写入小端 64 位整数
-    pub fn write_u64<D>(&self, uc: &mut Unicorn<'_, D>, addr: u64, val: u64) -> EmuResult<()> {
+    pub fn write_u64<B: CpuBackend + ?Sized>(&self, uc: &mut B, addr: u64, val: u64) -> EmuResult<()> {
         self.write(uc, addr, &val.to_le_bytes())
     }
 
     /// 写入小端 32 位整数
-    pub fn write_u32<D>(&self, uc: &mut Unicorn<'_, D>, addr: u64, val: u32) -> EmuResult<()> {
+    pub fn write_u32<B: CpuBackend + ?Sized>(&self, uc: &mut B, addr: u64, val: u32) -> EmuResult<()> {
         self.write(uc, addr, &val.to_le_bytes())
     }
 
     /// 从模拟内存读取以 `\0` 结尾的 C 字符串（最大读取 `max_len` 字节防止无限扫描）
-    pub fn read_c_string<D>(
+    pub fn read_c_string<B: CpuBackend + ?Sized>(
         &self,
-        uc: &Unicorn<'_, D>,
+        uc: &B,
         addr: u64,
         max_len: usize,
     ) -> EmuResult<String> {
@@ -667,7 +667,7 @@ impl MemoryManager {
     }
 
     /// 向模拟内存写入以 `\0` 结尾的 C 字符串
-    pub fn write_c_string<D>(&self, uc: &mut Unicorn<'_, D>, addr: u64, s: &str) -> EmuResult<()> {
+    pub fn write_c_string<B: CpuBackend + ?Sized>(&self, uc: &mut B, addr: u64, s: &str) -> EmuResult<()> {
         let mut buf = Vec::with_capacity(s.len() + 1);
         buf.extend_from_slice(s.as_bytes());
         buf.push(0);
@@ -680,7 +680,7 @@ impl MemoryManager {
 }
 
 /// 仅借用 `&Unicorn` 读取 Guest C 字符串原始字节（不含 `\0`），供 Hook 回调内安全调用，避免借用冲突
-pub fn read_guest_cstr_bytes<D>(uc: &Unicorn<'_, D>, addr: u64, max_len: usize) -> Vec<u8> {
+pub fn read_guest_cstr_bytes<B: CpuBackend + ?Sized>(uc: &B, addr: u64, max_len: usize) -> Vec<u8> {
     if addr == 0 || max_len == 0 {
         return Vec::new();
     }
@@ -712,14 +712,14 @@ pub fn read_guest_cstr_bytes<D>(uc: &Unicorn<'_, D>, addr: u64, max_len: usize) 
 }
 
 /// 仅借用 `&Unicorn` 读取 Guest C 字符串并按 UTF-8 容错解码
-pub fn read_guest_cstr<D>(uc: &Unicorn<'_, D>, addr: u64, max_len: usize) -> String {
+pub fn read_guest_cstr<B: CpuBackend + ?Sized>(uc: &B, addr: u64, max_len: usize) -> String {
     let bytes = read_guest_cstr_bytes(uc, addr, max_len);
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
 /// 仅借用 `&Unicorn` 读取小端 `u64`（越界返回 0）
 #[inline]
-pub fn read_guest_u64<D>(uc: &Unicorn<'_, D>, addr: u64) -> u64 {
+pub fn read_guest_u64<B: CpuBackend + ?Sized>(uc: &B, addr: u64) -> u64 {
     let mut buf = [0u8; 8];
     if addr != 0 && uc.mem_read(addr, &mut buf).is_ok() {
         u64::from_le_bytes(buf)
@@ -730,7 +730,7 @@ pub fn read_guest_u64<D>(uc: &Unicorn<'_, D>, addr: u64) -> u64 {
 
 /// 仅借用 `&Unicorn` 读取小端 `i32`（越界返回 0）
 #[inline]
-pub fn read_guest_i32<D>(uc: &Unicorn<'_, D>, addr: u64) -> i32 {
+pub fn read_guest_i32<B: CpuBackend + ?Sized>(uc: &B, addr: u64) -> i32 {
     let mut buf = [0u8; 4];
     if addr != 0 && uc.mem_read(addr, &mut buf).is_ok() {
         i32::from_le_bytes(buf)

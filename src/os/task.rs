@@ -1,7 +1,9 @@
 use std::collections::VecDeque;
 
 use unicorn_engine::unicorn_const::Prot;
-use unicorn_engine::{RegisterARM64, Unicorn};
+use unicorn_engine::RegisterARM64;
+
+use crate::backend::CpuBackend;
 
 use crate::cpu::{CpuSnapshot, RET_MAGIC_ADDR};
 use crate::error::EmuResult;
@@ -68,9 +70,9 @@ impl TaskScheduler {
     }
 
     /// 创建一个新的模拟工作线程，分配独立栈与 TLS 空间并加入就绪队列
-    pub fn spawn_thread<D>(
+    pub fn spawn_thread<B: CpuBackend + ?Sized>(
         &mut self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         mem: &mut MemoryManager,
         entry_pc: u64,
         arg_x0: u64,
@@ -163,9 +165,9 @@ impl TaskScheduler {
     /// 按固定指令时间片轮转执行所有就绪线程，直至全部完成或阻塞
     ///
     /// 返回本次调度循环累计执行的线程时间片总数。
-    pub fn run_until_idle<D>(
+    pub fn run_until_idle<B: CpuBackend + ?Sized>(
         &mut self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         time_slice_insns: usize,
     ) -> EmuResult<u64> {
         let slice = time_slice_insns.max(1);
@@ -191,7 +193,7 @@ impl TaskScheduler {
             }
 
             let start_pc = self.tasks[idx].pc;
-            uc.emu_start(start_pc, RET_MAGIC_ADDR, 0, slice)?;
+            uc.run_simple(start_pc, RET_MAGIC_ADDR, 0, slice)?;
             total_slices += 1;
             self.tasks[idx].executed_slices += 1;
 

@@ -1,4 +1,6 @@
-use unicorn_engine::{RegisterARM64, Unicorn};
+use unicorn_engine::RegisterARM64;
+
+use crate::backend::CpuBackend;
 
 use crate::jni::types::{JObjectRef, JValue};
 use crate::memory::{read_guest_i32 as read_i32_guest, read_guest_u64 as read_u64_guest};
@@ -116,8 +118,8 @@ fn decode_slot(ty: JniParamType, raw: u64) -> JValue {
 ///
 /// `first_gpr_idx` 为变参起始通用寄存器编号（例如 `CallObjectMethod(env, obj, mid, ...)`
 /// 占用了 `X0, X1, X2`，故 `first_gpr_idx = 3`，从 `X3..X7` 开始读取，超出部分从 `[SP + offset]` 读取）。
-pub fn read_varargs_direct<D>(
-    uc: &Unicorn<'_, D>,
+pub fn read_varargs_direct<B: CpuBackend + ?Sized>(
+    uc: &B,
     first_gpr_idx: usize,
     sig: &str,
 ) -> Vec<JValue> {
@@ -194,7 +196,11 @@ pub fn read_varargs_direct<D>(
 /// - `+0x10`: `void *__vr_top`
 /// - `+0x18`: `int __gr_offs`（负偏移，每次 +8）
 /// - `+0x1c`: `int __vr_offs`（负偏移，每次 +16）
-pub fn read_varargs_va_list<D>(uc: &Unicorn<'_, D>, va_list_ptr: u64, sig: &str) -> Vec<JValue> {
+pub fn read_varargs_va_list<B: CpuBackend + ?Sized>(
+    uc: &B,
+    va_list_ptr: u64,
+    sig: &str,
+) -> Vec<JValue> {
     if va_list_ptr == 0 {
         return Vec::new();
     }
@@ -245,8 +251,8 @@ pub fn read_varargs_va_list<D>(uc: &Unicorn<'_, D>, va_list_ptr: u64, sig: &str)
 
 /// 读取 `const jvalue*` 数组 (`Call*MethodA`)
 /// 每个 `jvalue` union 固定占 8 字节
-pub fn read_varargs_jvalue_array<D>(
-    uc: &Unicorn<'_, D>,
+pub fn read_varargs_jvalue_array<B: CpuBackend + ?Sized>(
+    uc: &B,
     jvalue_ptr: u64,
     sig: &str,
 ) -> Vec<JValue> {

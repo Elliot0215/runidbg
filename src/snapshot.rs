@@ -1,6 +1,6 @@
 use unicorn_engine::unicorn_const::Prot;
-use unicorn_engine::Unicorn;
 
+use crate::backend::{BackendWithData, CpuBackend};
 use crate::cpu::CpuSnapshot;
 use crate::error::EmuResult;
 use crate::jni::env::{JniSnapshot, JniVm};
@@ -21,21 +21,21 @@ pub struct EmuSnapshot {
 
 impl EmuSnapshot {
     /// 捕获当前 CPU 寄存器状态、所有可写 VMA 内存镜像及堆分配器状态
-    pub fn capture<D>(uc: &Unicorn<'_, D>, mem: &MemoryManager) -> EmuResult<Self> {
+    pub fn capture<B: CpuBackend + ?Sized>(uc: &B, mem: &MemoryManager) -> EmuResult<Self> {
         Self::capture_inner(uc, mem, None)
     }
 
     /// 捕获完整状态（包含 JNI 对象引用表与临时缓冲区映射）
-    pub fn capture_full<D>(
-        uc: &Unicorn<'_, D>,
+    pub fn capture_full<B: CpuBackend + ?Sized>(
+        uc: &B,
         mem: &MemoryManager,
         jni: &JniVm,
     ) -> EmuResult<Self> {
         Self::capture_inner(uc, mem, Some(jni.snapshot_state()))
     }
 
-    fn capture_inner<D>(
-        uc: &Unicorn<'_, D>,
+    fn capture_inner<B: CpuBackend + ?Sized>(
+        uc: &B,
         mem: &MemoryManager,
         jni: Option<JniSnapshot>,
     ) -> EmuResult<Self> {
@@ -61,7 +61,7 @@ impl EmuSnapshot {
     }
 
     /// 极速回滚 CPU 寄存器与全部可写内存页到快照时刻（底层兼容接口）
-    pub fn restore<D>(&self, uc: &mut Unicorn<'_, D>) -> EmuResult<()> {
+    pub fn restore<B: CpuBackend + ?Sized>(&self, uc: &mut B) -> EmuResult<()> {
         for (start, bytes) in &self.writable_regions {
             uc.mem_write(*start, bytes)?;
         }
@@ -70,11 +70,14 @@ impl EmuSnapshot {
     }
 
     /// 完整回滚 CPU 寄存器、可写内存页、堆分配器元数据与 JNI 对象引用表
-    pub fn restore_full<D>(
+    pub fn restore_full<B, D>(
         &self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         get_state: impl Fn(&mut D) -> (&mut MemoryManager, &mut JniVm),
-    ) -> EmuResult<()> {
+    ) -> EmuResult<()>
+    where
+        B: BackendWithData<D> + ?Sized,
+    {
         self.restore(uc)?;
         let (mem, jni) = get_state(uc.get_data_mut());
         mem.restore_heap_snapshot(&self.heap);

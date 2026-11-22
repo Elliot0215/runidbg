@@ -10,4 +10,4 @@ pub use apk::ApkPackage;
 pub use dex::{DexClassInfo, DexFieldInfo, DexIndex, DexMethodInfo, DexValue};
 pub use elf::{ElfLoader, LoadedModule};
 pub use linker::DynamicLinker;
-pub use trampoline::{attach_trampoline_hook, HleBuiltin, TrampolineTable};
+pub use trampoline::{attach_trampoline_hook, dispatch_trampoline_slot, HleBuiltin, TrampolineTable};

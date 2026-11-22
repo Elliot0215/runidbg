@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use unicorn_engine::unicorn_const::Prot;
 use unicorn_engine::{RegisterARM64, UcHookId, Unicorn};
 
+use crate::backend::{BackendWithData, CpuBackend, ARM64_SVC_HLE_INSN};
+
 use crate::error::EmuResult;
 use crate::memory::{
     align_down, align_up, read_guest_cstr, read_guest_cstr_bytes, read_guest_u64, MemoryManager,
@@ -696,9 +698,9 @@ impl TrampolineTable {
     }
 
     /// 按符号名获取或预注册导入跳板地址（支持在 `emu.load` 之前或之后挂符号级 Hook）
-    pub fn resolve_or_register_import<D>(
+    pub fn resolve_or_register_import<B: CpuBackend + ?Sized>(
         &mut self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         mem: &mut MemoryManager,
         name: &str,
     ) -> EmuResult<u64> {
@@ -711,7 +713,11 @@ impl TrampolineTable {
     }
 
     /// 映射跳板区内存（初始映射 64KB，按需使用）
-    pub fn init<D>(&mut self, uc: &mut Unicorn<'_, D>, mem: &mut MemoryManager) -> EmuResult<()> {
+    pub fn init<B: CpuBackend + ?Sized>(
+        &mut self,
+        uc: &mut B,
+        mem: &mut MemoryManager,
+    ) -> EmuResult<()> {
         if self.initialized {
             return Ok(());
         }
@@ -788,10 +794,10 @@ impl TrampolineTable {
         Ok(())
     }
 
-    /// 注册一个符号到跳板槽位，并向对应地址写入 ARM64 `RET` 指令
-    pub fn register<D>(
+    /// 注册一个符号到跳板槽位，并写入 `RET`（Unicorn）或 `SVC #0x1001`（非 Unicorn）
+    pub fn register<B: CpuBackend + ?Sized>(
         &mut self,
-        uc: &mut Unicorn<'_, D>,
+        uc: &mut B,
         mem: &mut MemoryManager,
         name: &str,
         action: HleBuiltin,
@@ -805,7 +811,12 @@ impl TrampolineTable {
 
         let slot_idx = self.slots.len() as u64;
         let addr = TRAMPOLINE_BASE + slot_idx * 4;
-        mem.write_u32(uc, addr, ARM64_RET_INSN)?;
+        let slot_insn = if uc.uses_svc_trampolines() {
+            ARM64_SVC_HLE_INSN
+        } else {
+            ARM64_RET_INSN
+        };
+        mem.write_u32(uc, addr, slot_insn)?;
         self.slots.push(action);
         self.name_to_addr.insert(name.to_string(), addr);
         Ok(addr)
@@ -854,11 +865,15 @@ fn parse_c_i64(s: &str) -> i64 {
 }
 
 /// 精简版 AAPCS64 `sscanf(input, fmt, ...)`（支持 `%d/%i/%u/%ld/%lu/%lld/%llu/%x/%X/%s/%c`）
-fn run_guest_sscanf<D>(uc: &mut Unicorn<'_, D>, input: &str, fmt: &str) -> i32 {
+fn run_guest_sscanf<B: CpuBackend + ?Sized>(uc: &mut B, input: &str, fmt: &str) -> i32 {
     run_guest_scanf_core(uc, input, fmt).0
 }
 
-fn run_guest_scanf_core<D>(uc: &mut Unicorn<'_, D>, input: &str, fmt: &str) -> (i32, usize) {
+fn run_guest_scanf_core<B: CpuBackend + ?Sized>(
+    uc: &mut B,
+    input: &str,
+    fmt: &str,
+) -> (i32, usize) {
     let mut in_pos = 0usize;
     let in_bytes = input.as_bytes();
     let fmt_bytes = fmt.as_bytes();
@@ -866,7 +881,7 @@ fn run_guest_scanf_core<D>(uc: &mut Unicorn<'_, D>, input: &str, fmt: &str) -> (
     let mut arg_idx = 2usize; // x2..x7, 然后栈参
     let mut matched = 0i32;
 
-    let read_arg_ptr = |uc: &Unicorn<'_, D>, idx: usize| -> u64 {
+    let read_arg_ptr = |uc: &B, idx: usize| -> u64 {
         const REGS: [RegisterARM64; 8] = [
             RegisterARM64::X0,
             RegisterARM64::X1,
@@ -1131,7 +1146,11 @@ fn run_guest_scanf_core<D>(uc: &mut Unicorn<'_, D>, input: &str, fmt: &str) -> (
 
 /// 按 AAPCS64 规则解析 `snprintf`/`sprintf` 变参格式化字符串
 /// 支持 `%s`、`%d`/`%i`/`%u`、`%x`/`%X`、`%p`、`%c`、`%%` 以及宽度/零填充（如 `%02x`、`%08X`）
-fn format_guest_printf<D>(uc: &Unicorn<'_, D>, fmt: &str, first_gpr_idx: usize) -> String {
+fn format_guest_printf<B: CpuBackend + ?Sized>(
+    uc: &B,
+    fmt: &str,
+    first_gpr_idx: usize,
+) -> String {
     const GPRS: [RegisterARM64; 8] = [
         RegisterARM64::X0,
         RegisterARM64::X1,
@@ -1166,7 +1185,7 @@ fn format_guest_printf<D>(uc: &Unicorn<'_, D>, fmt: &str, first_gpr_idx: usize) 
 
 /// 按 AAPCS64 `va_list` 结构解析 `vsnprintf`/`__vsnprintf_chk`/`vasprintf`
 /// AAPCS64 `va_list` (32B): `{ __stack: u64, __gr_top: u64, __vr_top: u64, __gr_offs: i32, __vr_offs: i32 }`
-fn format_guest_vprintf<D>(uc: &Unicorn<'_, D>, fmt: &str, va_list_ptr: u64) -> String {
+fn format_guest_vprintf<B: CpuBackend + ?Sized>(uc: &B, fmt: &str, va_list_ptr: u64) -> String {
     if va_list_ptr == 0 {
         return fmt.to_string();
     }
@@ -1197,8 +1216,8 @@ fn format_guest_vprintf<D>(uc: &Unicorn<'_, D>, fmt: &str, va_list_ptr: u64) -> 
     })
 }
 
-fn format_guest_printf_with_reader<D, F>(
-    uc: &Unicorn<'_, D>,
+fn format_guest_printf_with_reader<B: CpuBackend + ?Sized, F>(
+    uc: &B,
     fmt: &str,
     mut next_arg: F,
 ) -> String
@@ -1310,6 +1329,23 @@ where
     out
 }
 
+/// 按槽位地址分发 HLE 跳板（供 Unicorn Code Hook 与非 Unicorn `SVC #0x1001` 外部陷阱循环共用）
+pub fn dispatch_trampoline_slot<B, D, F>(uc: &mut B, slot_addr: u64, get_state: &mut F) -> bool
+where
+    B: BackendWithData<D> + ?Sized,
+    F: FnMut(&mut D) -> (&mut TrampolineTable, &mut MemoryManager, &mut VirtualFs),
+{
+    let action = {
+        let (table, _, _) = get_state(uc.get_data_mut());
+        table.lookup(slot_addr)
+    };
+    let Some(builtin) = action else {
+        return false;
+    };
+    execute_hle_builtin(uc, builtin, get_state);
+    true
+}
+
 /// 挂载 HLE 跳板区 Code Hook
 ///
 /// 当 Guest 执行 `BLR` / `BR` 跳转到 `TRAMPOLINE_BASE..TRAMPOLINE_BASE + TRAMPOLINE_SIZE` 时，
@@ -1325,14 +1361,7 @@ where
         TRAMPOLINE_BASE,
         TRAMPOLINE_BASE + TRAMPOLINE_SIZE,
         move |uc, addr, _size| {
-            let action = {
-                let (table, _, _) = get_state(uc.get_data_mut());
-                table.lookup(addr)
-            };
-            let Some(builtin) = action else {
-                return;
-            };
-            execute_hle_builtin(uc, builtin, &mut get_state);
+            dispatch_trampoline_slot(uc, addr, &mut get_state);
         },
     )?;
 
@@ -1341,7 +1370,7 @@ where
 
 /// 将标准 Linux 负错误码转换为 C 库约定（设置 `*__errno() = -res` 并返回 `-1`）
 #[inline]
-fn c_errno_ret<D>(uc: &mut Unicorn<'_, D>, errno_addr: u64, res: i64) -> u64 {
+fn c_errno_ret<B: CpuBackend + ?Sized>(uc: &mut B, errno_addr: u64, res: i64) -> u64 {
     if res < 0 {
         let err = (-res) as i32;
         let _ = uc.mem_write(errno_addr, &err.to_le_bytes());
@@ -1353,7 +1382,12 @@ fn c_errno_ret<D>(uc: &mut Unicorn<'_, D>, errno_addr: u64, res: i64) -> u64 {
 
 /// 按 Linux AArch64 ABI 填充 128 字节 `struct stat`
 #[inline]
-fn write_aarch64_stat<D>(uc: &mut Unicorn<'_, D>, stat_buf: u64, mode: u32, size: u64) -> bool {
+fn write_aarch64_stat<B: CpuBackend + ?Sized>(
+    uc: &mut B,
+    stat_buf: u64,
+    mode: u32,
+    size: u64,
+) -> bool {
     let mut st = [0u8; 128];
     st[16..20].copy_from_slice(&mode.to_le_bytes());
     st[48..56].copy_from_slice(&size.to_le_bytes());
@@ -1396,8 +1430,9 @@ fn linux_prot_to_uc(prot: u64) -> Prot {
 }
 
 /// 执行具体的原生 Rust HLE 逻辑，并按 AAPCS64 将返回值写入 X0
-fn execute_hle_builtin<D, F>(uc: &mut Unicorn<'_, D>, builtin: HleBuiltin, get_state: &mut F)
+fn execute_hle_builtin<B, D, F>(uc: &mut B, builtin: HleBuiltin, get_state: &mut F)
 where
+    B: BackendWithData<D> + ?Sized,
     F: FnMut(&mut D) -> (&mut TrampolineTable, &mut MemoryManager, &mut VirtualFs),
 {
     let x0 = uc.reg_read(RegisterARM64::X0).unwrap_or(0);
@@ -2346,11 +2381,11 @@ where
             let (_, _, vfs) = get_state(uc.get_data_mut());
             vfs.breadcrumbs().push("[HLE FATAL] abort()");
             tracing::error!(target: "runidbg::hle", "Guest 调用 abort()，终止仿真");
-            let _ = uc.emu_stop();
+            let _ = CpuBackend::stop(uc);
             0
         }
         HleBuiltin::Exit => {
-            let _ = uc.emu_stop();
+            let _ = CpuBackend::stop(uc);
             x0
         }
         HleBuiltin::Memalign => {
@@ -3792,7 +3827,7 @@ where
                 let _ = uc.reg_write(RegisterARM64::PC, PTHREAD_CREATE_STUB_ADDR + 16);
                 return;
             }
-            let _ = uc.emu_stop();
+            let _ = CpuBackend::stop(uc);
             return;
         }
         HleBuiltin::Setjmp => {

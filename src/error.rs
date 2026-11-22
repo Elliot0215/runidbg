@@ -8,6 +8,10 @@ pub enum EmuError {
     #[error("Unicorn 引擎错误: {0:?}")]
     Unicorn(uc_error),
 
+    /// 执行后端错误（Dynarmic / KVM / Hypervisor 或当前后端不支持的能力）
+    #[error("执行后端错误: {0}")]
+    Backend(String),
+
     /// 访问未映射内存
     #[error("访问未映射内存: addr=0x{addr:016x}, size=0x{size:x}")]
     UnmappedMemory { addr: u64, size: usize },
