@@ -14,7 +14,11 @@ use runidbg_arm64_emu_tracer::backend::BackendWithData;
     all(feature = "hypervisor", target_os = "macos", target_arch = "aarch64")
 ))]
 use runidbg_arm64_emu_tracer::backend::CpuBackend;
-#[cfg(feature = "dynarmic")]
+#[cfg(any(
+    feature = "dynarmic",
+    all(feature = "kvm", target_os = "linux", target_arch = "aarch64"),
+    all(feature = "hypervisor", target_os = "macos", target_arch = "aarch64")
+))]
 use runidbg_arm64_emu_tracer::cpu::RET_MAGIC_ADDR;
 #[cfg(any(
     feature = "dynarmic",
@@ -39,6 +43,11 @@ use runidbg_arm64_emu_tracer::AndroidEmulator;
     all(feature = "hypervisor", target_os = "macos", target_arch = "aarch64")
 ))]
 use unicorn_engine::unicorn_const::Prot;
+#[cfg(any(
+    all(feature = "kvm", target_os = "linux", target_arch = "aarch64"),
+    all(feature = "hypervisor", target_os = "macos", target_arch = "aarch64")
+))]
+use unicorn_engine::RegisterARM64;
 
 #[cfg(feature = "dynarmic")]
 fn register_hle(emu: &mut AndroidEmulator, sym: &str) -> u64 {
@@ -664,7 +673,8 @@ fn kvm_and_hypervisor_platform_guards_and_capabilities() {
         assert!(matches!(res, Err(EmuError::Backend(_))));
     }
 
-    // Linux aarch64 宿主机请求 KVM：若 /dev/kvm 可用则直接实跑 ARM64 指令与 Unicorn-only 守卫，否则应返回清晰的 /dev/kvm 错误
+    // Linux aarch64 宿主机请求 KVM：若 /dev/kvm 可用则直接实跑 ARM64 指令、IRELATIVE run_simple、
+    // Guest EL0 BRK、FPCR/FPSR、局部 mem_unmap、flush_cache 与 Unicorn-only 守卫
     #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "aarch64"))]
     {
         match AndroidEmulator::builder().backend(BackendKind::Kvm).build() {
@@ -673,12 +683,102 @@ fn kvm_and_hypervisor_platform_guards_and_capabilities() {
                 emu.cpu_mut()
                     .mem_map(code_base, 0x4000, Prot::READ | Prot::WRITE | Prot::EXEC)
                     .unwrap();
-                // add x0, x0, x1; ret
+                // 1. 基本 ARM64 执行 + flush_cache: add x0, x0, x1; ret
                 let mut code = Vec::new();
                 code.extend_from_slice(&0x8B01_0000u32.to_le_bytes());
                 code.extend_from_slice(&0xD65F_03C0u32.to_le_bytes());
                 emu.cpu_mut().mem_write(code_base, &code).unwrap();
+                emu.cpu_mut().flush_cache(code_base, code_base + 8).unwrap();
                 assert_eq!(emu.call_address(code_base, &[19, 23]).unwrap(), 42);
+
+                // 2. run_simple（模拟 R_AARCH64_IRELATIVE resolver）: movz x0, #0x1234; ret
+                let ifunc_addr = code_base + 0x100;
+                let mut ifunc_code = Vec::new();
+                ifunc_code.extend_from_slice(&0xD282_4680u32.to_le_bytes());
+                ifunc_code.extend_from_slice(&0xD65F_03C0u32.to_le_bytes());
+                emu.cpu_mut().mem_write(ifunc_addr, &ifunc_code).unwrap();
+                emu.cpu_mut()
+                    .flush_cache(ifunc_addr, ifunc_addr + 8)
+                    .unwrap();
+                emu.cpu_mut().reg_write(RegisterARM64::X0, 0).unwrap();
+                emu.cpu_mut()
+                    .reg_write(RegisterARM64::LR, RET_MAGIC_ADDR)
+                    .unwrap();
+                emu.cpu_mut()
+                    .run_simple(ifunc_addr, RET_MAGIC_ADDR, 0, 0)
+                    .unwrap();
+                assert_eq!(emu.cpu().reg_read(RegisterARM64::X0).unwrap(), 0x1234);
+
+                // 3. Guest EL0 自身执行 BRK #0x42：不能误读上一次 SVC 残留 ESR_EL1
+                let brk_addr = code_base + 0x200;
+                emu.cpu_mut()
+                    .mem_write(brk_addr, &0xD420_0840u32.to_le_bytes())
+                    .unwrap();
+                emu.cpu_mut().flush_cache(brk_addr, brk_addr + 4).unwrap();
+                let brk_err = emu
+                    .call_address(brk_addr, &[])
+                    .expect_err("EL0 BRK must raise GuestCrash, not stale SVC");
+                match brk_err {
+                    EmuError::GuestCrash(report) => {
+                        assert_eq!(report.pc, brk_addr);
+                        assert!(
+                            report.reason.contains("BRK"),
+                            "expected EL0 BRK crash reason, got: {}",
+                            report.reason
+                        );
+                    }
+                    other => panic!("expected GuestCrash on EL0 BRK, got {other:?}"),
+                }
+
+                // 4. FPCR / FPSR (KVM_REG_SIZE_U32) 读写
+                let orig_fpcr = emu.cpu().reg_read(RegisterARM64::FPCR).unwrap();
+                let test_fpcr = orig_fpcr | (1 << 24);
+                emu.cpu_mut()
+                    .reg_write(RegisterARM64::FPCR, test_fpcr)
+                    .unwrap();
+                assert_eq!(
+                    emu.cpu().reg_read(RegisterARM64::FPCR).unwrap() & (1 << 24),
+                    1 << 24
+                );
+                emu.cpu_mut()
+                    .reg_write(RegisterARM64::FPCR, orig_fpcr)
+                    .unwrap();
+                let _ = emu.cpu().reg_read(RegisterARM64::FPSR).unwrap();
+
+                // 5. 局部 mem_unmap：映射 3 页，仅卸载中间页，验证首尾页数据保留且中间页已卸载并可重新映射
+                let split_base = 0x4900_0000u64;
+                emu.cpu_mut()
+                    .mem_map(split_base, 0x3000, Prot::READ | Prot::WRITE)
+                    .unwrap();
+                emu.cpu_mut().mem_write(split_base, b"PAGE0").unwrap();
+                emu.cpu_mut()
+                    .mem_write(split_base + 0x1000, b"PAGE1")
+                    .unwrap();
+                emu.cpu_mut()
+                    .mem_write(split_base + 0x2000, b"PAGE2")
+                    .unwrap();
+                emu.cpu_mut().mem_unmap(split_base + 0x1000, 0x1000).unwrap();
+                assert_eq!(
+                    emu.cpu().mem_read_as_vec(split_base, 5).unwrap(),
+                    b"PAGE0"
+                );
+                assert_eq!(
+                    emu.cpu().mem_read_as_vec(split_base + 0x2000, 5).unwrap(),
+                    b"PAGE2"
+                );
+                assert!(matches!(
+                    emu.cpu().mem_read_as_vec(split_base + 0x1000, 5),
+                    Err(EmuError::UnmappedMemory { .. })
+                ));
+                emu.cpu_mut()
+                    .mem_map(split_base + 0x1000, 0x1000, Prot::READ | Prot::WRITE)
+                    .unwrap();
+                assert_eq!(
+                    emu.cpu().mem_read_as_vec(split_base + 0x1000, 5).unwrap(),
+                    [0u8; 5]
+                );
+
+                // 6. Unicorn-only 守卫
                 assert!(matches!(
                     emu.attach_tracer(0, u64::MAX),
                     Err(EmuError::Backend(_))
@@ -704,7 +804,7 @@ fn kvm_and_hypervisor_platform_guards_and_capabilities() {
         assert!(matches!(res, Err(EmuError::Backend(_))));
     }
 
-    // macOS Apple Silicon 请求 Hypervisor：若有 entitlement 则直接实跑 ARM64 指令，否则应返回清晰的 HV_DENIED 签名指引
+    // macOS Apple Silicon 请求 Hypervisor：若有 entitlement 则直接实跑 ARM64 指令与 run_simple，否则应返回清晰的 HV_DENIED 签名指引
     #[cfg(all(feature = "hypervisor", target_os = "macos", target_arch = "aarch64"))]
     {
         match AndroidEmulator::builder()
@@ -721,7 +821,26 @@ fn kvm_and_hypervisor_platform_guards_and_capabilities() {
                 code.extend_from_slice(&0x8B01_0000u32.to_le_bytes());
                 code.extend_from_slice(&0xD65F_03C0u32.to_le_bytes());
                 emu.cpu_mut().mem_write(code_base, &code).unwrap();
+                emu.cpu_mut().flush_cache(code_base, code_base + 8).unwrap();
                 assert_eq!(emu.call_address(code_base, &[19, 23]).unwrap(), 42);
+
+                // run_simple (IRELATIVE resolver): movz x0, #0x1234; ret
+                let ifunc_addr = code_base + 0x100;
+                let mut ifunc_code = Vec::new();
+                ifunc_code.extend_from_slice(&0xD282_4680u32.to_le_bytes());
+                ifunc_code.extend_from_slice(&0xD65F_03C0u32.to_le_bytes());
+                emu.cpu_mut().mem_write(ifunc_addr, &ifunc_code).unwrap();
+                emu.cpu_mut()
+                    .flush_cache(ifunc_addr, ifunc_addr + 8)
+                    .unwrap();
+                emu.cpu_mut().reg_write(RegisterARM64::X0, 0).unwrap();
+                emu.cpu_mut()
+                    .reg_write(RegisterARM64::LR, RET_MAGIC_ADDR)
+                    .unwrap();
+                emu.cpu_mut()
+                    .run_simple(ifunc_addr, RET_MAGIC_ADDR, 0, 0)
+                    .unwrap();
+                assert_eq!(emu.cpu().reg_read(RegisterARM64::X0).unwrap(), 0x1234);
             }
             Err(EmuError::Backend(msg)) => {
                 assert!(

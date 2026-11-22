@@ -32,6 +32,7 @@ mod imp {
     };
     use crate::backend::{
         BackendKind, CpuBackend, CpuContextBlob, GenericCpuContext, RunStopReason,
+        SVC_IMM_RET_MAGIC,
     };
     use crate::error::{EmuError, EmuResult};
     use crate::memory::{align_down, align_up, PAGE_SIZE};
@@ -118,6 +119,7 @@ mod imp {
             offset: i64,
         ) -> *mut c_void;
         fn munmap(addr: *mut c_void, length: usize) -> c_int;
+        fn sys_icache_invalidate(start: *mut c_void, len: usize);
     }
 
     fn hv_check(rc: i32, op: &str) -> EmuResult<()> {
@@ -635,18 +637,61 @@ mod imp {
             Ok(())
         }
 
-        fn flush_cache(&mut self, _begin: u64, _end: u64) -> EmuResult<()> {
+        fn flush_cache(&mut self, begin: u64, end: u64) -> EmuResult<()> {
+            if end > begin {
+                for (&ipa_16k, &host_ptr) in &self.host_pages_16k {
+                    let p_end = ipa_16k + HV_PAGE_SIZE;
+                    if p_end <= begin || ipa_16k >= end {
+                        continue;
+                    }
+                    let f_start = begin.max(ipa_16k);
+                    let f_end = end.min(p_end);
+                    let off = (f_start - ipa_16k) as usize;
+                    let len = (f_end - f_start) as usize;
+                    unsafe {
+                        sys_icache_invalidate(host_ptr.add(off).cast(), len);
+                    }
+                }
+            } else {
+                for &host_ptr in self.host_pages_16k.values() {
+                    unsafe {
+                        sys_icache_invalidate(host_ptr.cast(), HV_PAGE_SIZE as usize);
+                    }
+                }
+            }
             Ok(())
         }
 
         fn run_simple(
             &mut self,
-            _begin: u64,
-            _until: u64,
-            _timeout_us: u64,
-            _count: usize,
+            begin: u64,
+            until: u64,
+            timeout_us: u64,
+            count: usize,
         ) -> EmuResult<()> {
-            Ok(())
+            match self.run_until_trap(begin, timeout_us, count) {
+                RunStopReason::Svc {
+                    imm: SVC_IMM_RET_MAGIC,
+                    ..
+                }
+                | RunStopReason::Stopped => Ok(()),
+                RunStopReason::Svc { imm, next_pc } => {
+                    if next_pc == until || next_pc.wrapping_sub(4) == until {
+                        Ok(())
+                    } else {
+                        Err(EmuError::Backend(format!(
+                            "Hypervisor run_simple 遇到未处理 SVC #0x{imm:x} @ 0x{next_pc:x}"
+                        )))
+                    }
+                }
+                RunStopReason::MemoryFault { pc, detail, .. }
+                | RunStopReason::IllegalInstruction { pc, detail } => Err(EmuError::Backend(
+                    format!("Hypervisor run_simple 异常 @ 0x{pc:x}: {detail}"),
+                )),
+                RunStopReason::Timeout { pc } => Err(EmuError::Backend(format!(
+                    "Hypervisor run_simple 超时 @ 0x{pc:x}"
+                ))),
+            }
         }
 
         fn stop(&mut self) -> EmuResult<()> {

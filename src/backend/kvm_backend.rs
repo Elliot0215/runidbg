@@ -23,11 +23,13 @@ mod imp {
 
     use crate::backend::vm_common::{
         build_el1_vector_table, build_identity_page_tables, decode_esr_el1, EsrException,
-        CPACR_EL1_FPEN_ALL, KVM_BRK_TRAP_INSN, MAIR_EL1_DEFAULT, PSTATE_EL0T, SCTLR_EL1_MMU_ON,
-        TCR_EL1_4KB_39BIT, TTBR0_PAGE_ADDR, TTBR0_TABLES_SIZE, VBAR_EL1_ADDR,
+        CPACR_EL1_FPEN_ALL, EL1_VECTOR_TABLE_SIZE, KVM_BRK_TRAP_INSN, MAIR_EL1_DEFAULT,
+        PSTATE_EL0T, SCTLR_EL1_MMU_ON, TCR_EL1_4KB_39BIT, TTBR0_PAGE_ADDR, TTBR0_TABLES_SIZE,
+        VBAR_EL1_ADDR,
     };
     use crate::backend::{
         BackendKind, CpuBackend, CpuContextBlob, GenericCpuContext, RunStopReason,
+        SVC_IMM_RET_MAGIC,
     };
     use crate::error::{EmuError, EmuResult};
     use crate::memory::{align_down, align_up, PAGE_SIZE};
@@ -325,6 +327,35 @@ mod imp {
             Ok(())
         }
 
+        fn get_one_reg_u32(&self, id: u64) -> EmuResult<u32> {
+            let mut val = 0u32;
+            let reg = KvmOneReg {
+                id,
+                addr: (&mut val as *mut u32) as u64,
+            };
+            if unsafe { ioctl(self.vcpu_fd, KVM_GET_ONE_REG, &reg) } < 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(EmuError::Backend(format!(
+                    "KVM_GET_ONE_REG(u32 0x{id:x}) 失败: {err}"
+                )));
+            }
+            Ok(val)
+        }
+
+        fn set_one_reg_u32(&self, id: u64, val: u32) -> EmuResult<()> {
+            let reg = KvmOneReg {
+                id,
+                addr: (&val as *const u32) as u64,
+            };
+            if unsafe { ioctl(self.vcpu_fd, KVM_SET_ONE_REG, &reg) } < 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(EmuError::Backend(format!(
+                    "KVM_SET_ONE_REG(u32 0x{id:x}) 失败: {err}"
+                )));
+            }
+            Ok(())
+        }
+
         fn get_one_reg_u128(&self, id: u64) -> EmuResult<u128> {
             let mut val = 0u128;
             let reg = KvmOneReg {
@@ -398,6 +429,21 @@ mod imp {
             let exit_reason = unsafe { ptr::read_volatile(self.run_ptr.add(8).cast::<u32>()) };
             match exit_reason {
                 KVM_EXIT_DEBUG => {
+                    // 仅当 PC 落在 EL1 异常向量表 [VBAR_EL1_ADDR, VBAR_EL1_ADDR + 2KB) 内时，
+                    // 才说明是由 EL0 异常路由到 EL1 向量表中的 BRK #0x1337；
+                    // 若 Guest EL0 自身直接执行了 BRK，EL2 KVM_GUESTDBG_USE_SW_BP 会绕过 EL1 直接退回宿主，
+                    // 此时 ESR_EL1/ELR_EL1 仍是上一次异常的残留值，不可误判。
+                    let pc = self.get_one_reg_u64(REG_PC).unwrap_or(start_pc);
+                    let in_el1_vectors = pc >= VBAR_EL1_ADDR
+                        && pc < VBAR_EL1_ADDR + EL1_VECTOR_TABLE_SIZE as u64;
+                    if !in_el1_vectors {
+                        let hsr = unsafe { ptr::read_volatile(self.run_ptr.add(32).cast::<u32>()) };
+                        return RunStopReason::IllegalInstruction {
+                            pc,
+                            detail: format!("KVM Guest EL0 BRK/Debug(hsr=0x{hsr:x})"),
+                        };
+                    }
+
                     let esr = self.get_one_reg_u64(SYS_ESR_EL1).unwrap_or(0);
                     let elr = self.get_one_reg_u64(REG_ELR_EL1).unwrap_or(start_pc);
                     let far = self.get_one_reg_u64(SYS_FAR_EL1).unwrap_or(0);
@@ -525,6 +571,11 @@ mod imp {
         }
 
         fn reg_read(&self, reg: RegisterARM64) -> EmuResult<u64> {
+            match reg {
+                RegisterARM64::FPCR => return Ok(u64::from(self.get_one_reg_u32(REG_FPCR)?)),
+                RegisterARM64::FPSR => return Ok(u64::from(self.get_one_reg_u32(REG_FPSR)?)),
+                _ => {}
+            }
             if let Some(id) = reg_to_kvm_id(reg) {
                 return self.get_one_reg_u64(id);
             }
@@ -535,6 +586,11 @@ mod imp {
         }
 
         fn reg_write(&mut self, reg: RegisterARM64, val: u64) -> EmuResult<()> {
+            match reg {
+                RegisterARM64::FPCR => return self.set_one_reg_u32(REG_FPCR, val as u32),
+                RegisterARM64::FPSR => return self.set_one_reg_u32(REG_FPSR, val as u32),
+                _ => {}
+            }
             if let Some(id) = reg_to_kvm_id(reg) {
                 return self.set_one_reg_u64(id, val);
             }
@@ -605,6 +661,14 @@ mod imp {
             if len == 0 {
                 return Ok(());
             }
+            // 若目标区间与已有 KVM memslot 重叠（如 MAP_FIXED / 二次重映射），先局部裁剪/移除旧段
+            let has_overlap = self
+                .slots
+                .values()
+                .any(|s| s.guest_addr < end && s.guest_addr + s.size > start);
+            if has_overlap {
+                self.mem_unmap(start, len)?;
+            }
             let host_ptr = unsafe {
                 mmap(
                     ptr::null_mut(),
@@ -628,9 +692,10 @@ mod imp {
                 userspace_addr: host_ptr as u64,
             };
             if unsafe { ioctl(self.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) } < 0 {
+                let err = std::io::Error::last_os_error();
                 unsafe { munmap(host_ptr, len as usize) };
                 return Err(EmuError::Backend(format!(
-                    "KVM_SET_USER_MEMORY_REGION 失败: addr=0x{start:x}, size=0x{len:x}"
+                    "KVM_SET_USER_MEMORY_REGION 失败: addr=0x{start:x}, size=0x{len:x}: {err}"
                 )));
             }
             self.slots.insert(
@@ -645,18 +710,111 @@ mod imp {
             Ok(())
         }
 
-        fn mem_unmap(&mut self, addr: u64, _size: u64) -> EmuResult<()> {
+        fn mem_unmap(&mut self, addr: u64, size: u64) -> EmuResult<()> {
             let start = align_down(addr, PAGE_SIZE);
-            if let Some(slot) = self.slots.remove(&start) {
-                let region = KvmUserspaceMemoryRegion {
+            let end = align_up(addr.saturating_add(size), PAGE_SIZE);
+            if end <= start {
+                return Ok(());
+            }
+            let overlapping_keys: Vec<u64> = self
+                .slots
+                .iter()
+                .filter(|(_, s)| s.guest_addr < end && s.guest_addr + s.size > start)
+                .map(|(&k, _)| k)
+                .collect();
+
+            for key in overlapping_keys {
+                let Some(slot) = self.slots.remove(&key) else {
+                    continue;
+                };
+                let slot_start = slot.guest_addr;
+                let slot_end = slot_start + slot.size;
+                let u_start = start.max(slot_start);
+                let u_end = end.min(slot_end);
+
+                // 1. 先从 KVM 注销旧 memslot
+                let del_region = KvmUserspaceMemoryRegion {
                     slot: slot.slot_id,
                     flags: 0,
-                    guest_phys_addr: slot.guest_addr,
+                    guest_phys_addr: slot_start,
                     memory_size: 0,
                     userspace_addr: slot.host_ptr as u64,
                 };
-                let _ = unsafe { ioctl(self.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) };
-                unsafe { munmap(slot.host_ptr.cast(), slot.size as usize) };
+                let _ = unsafe { ioctl(self.vm_fd, KVM_SET_USER_MEMORY_REGION, &del_region) };
+
+                // 2. 仅 munmap 被卸载的子区间 [u_start, u_end)（Linux 支持按页部分 munmap）
+                let unmap_off = (u_start - slot_start) as usize;
+                let unmap_len = (u_end - u_start) as usize;
+                unsafe {
+                    munmap(slot.host_ptr.add(unmap_off).cast(), unmap_len);
+                }
+
+                // 3. 若左侧有保留前缀 [slot_start, u_start)，复用原 slot_id 重新注册
+                let mut reused_slot_id = false;
+                if u_start > slot_start {
+                    let prefix_len = u_start - slot_start;
+                    let prefix_region = KvmUserspaceMemoryRegion {
+                        slot: slot.slot_id,
+                        flags: 0,
+                        guest_phys_addr: slot_start,
+                        memory_size: prefix_len,
+                        userspace_addr: slot.host_ptr as u64,
+                    };
+                    if unsafe { ioctl(self.vm_fd, KVM_SET_USER_MEMORY_REGION, &prefix_region) } < 0
+                    {
+                        let err = std::io::Error::last_os_error();
+                        return Err(EmuError::Backend(format!(
+                            "KVM 局部 mem_unmap 重注册前缀段失败(0x{slot_start:x}+0x{prefix_len:x}): {err}"
+                        )));
+                    }
+                    self.slots.insert(
+                        slot_start,
+                        KvmSlot {
+                            slot_id: slot.slot_id,
+                            guest_addr: slot_start,
+                            size: prefix_len,
+                            host_ptr: slot.host_ptr,
+                        },
+                    );
+                    reused_slot_id = true;
+                }
+
+                // 4. 若右侧有保留后缀 [u_end, slot_end)，注册新 memslot
+                if u_end < slot_end {
+                    let suffix_off = (u_end - slot_start) as usize;
+                    let suffix_len = slot_end - u_end;
+                    let suffix_ptr = unsafe { slot.host_ptr.add(suffix_off) };
+                    let suffix_slot_id = if reused_slot_id {
+                        let id = self.next_slot;
+                        self.next_slot += 1;
+                        id
+                    } else {
+                        slot.slot_id
+                    };
+                    let suffix_region = KvmUserspaceMemoryRegion {
+                        slot: suffix_slot_id,
+                        flags: 0,
+                        guest_phys_addr: u_end,
+                        memory_size: suffix_len,
+                        userspace_addr: suffix_ptr as u64,
+                    };
+                    if unsafe { ioctl(self.vm_fd, KVM_SET_USER_MEMORY_REGION, &suffix_region) } < 0
+                    {
+                        let err = std::io::Error::last_os_error();
+                        return Err(EmuError::Backend(format!(
+                            "KVM 局部 mem_unmap 重注册后缀段失败(0x{u_end:x}+0x{suffix_len:x}): {err}"
+                        )));
+                    }
+                    self.slots.insert(
+                        u_end,
+                        KvmSlot {
+                            slot_id: suffix_slot_id,
+                            guest_addr: u_end,
+                            size: suffix_len,
+                            host_ptr: suffix_ptr,
+                        },
+                    );
+                }
             }
             Ok(())
         }
@@ -665,18 +823,62 @@ mod imp {
             Ok(())
         }
 
-        fn flush_cache(&mut self, _begin: u64, _end: u64) -> EmuResult<()> {
+        fn flush_cache(&mut self, begin: u64, end: u64) -> EmuResult<()> {
+            if end > begin {
+                for slot in self.slots.values() {
+                    let s_start = slot.guest_addr;
+                    let s_end = s_start + slot.size;
+                    if s_end <= begin || s_start >= end {
+                        continue;
+                    }
+                    let f_start = begin.max(s_start);
+                    let f_end = end.min(s_end);
+                    let off = (f_start - s_start) as usize;
+                    let len = (f_end - f_start) as usize;
+                    unsafe {
+                        flush_icache_host_range(slot.host_ptr.add(off), len);
+                    }
+                }
+            } else {
+                for slot in self.slots.values() {
+                    unsafe {
+                        flush_icache_host_range(slot.host_ptr, slot.size as usize);
+                    }
+                }
+            }
             Ok(())
         }
 
         fn run_simple(
             &mut self,
-            _begin: u64,
-            _until: u64,
-            _timeout_us: u64,
-            _count: usize,
+            begin: u64,
+            until: u64,
+            timeout_us: u64,
+            count: usize,
         ) -> EmuResult<()> {
-            Ok(())
+            match self.run_until_trap(begin, timeout_us, count) {
+                RunStopReason::Svc {
+                    imm: SVC_IMM_RET_MAGIC,
+                    ..
+                }
+                | RunStopReason::Stopped => Ok(()),
+                RunStopReason::Svc { imm, next_pc } => {
+                    if next_pc == until || next_pc.wrapping_sub(4) == until {
+                        Ok(())
+                    } else {
+                        Err(EmuError::Backend(format!(
+                            "KVM run_simple 遇到未处理 SVC #0x{imm:x} @ 0x{next_pc:x}"
+                        )))
+                    }
+                }
+                RunStopReason::MemoryFault { pc, detail, .. }
+                | RunStopReason::IllegalInstruction { pc, detail } => Err(EmuError::Backend(
+                    format!("KVM run_simple 异常 @ 0x{pc:x}: {detail}"),
+                )),
+                RunStopReason::Timeout { pc } => {
+                    Err(EmuError::Backend(format!("KVM run_simple 超时 @ 0x{pc:x}")))
+                }
+            }
         }
 
         fn stop(&mut self) -> EmuResult<()> {
@@ -704,8 +906,8 @@ mod imp {
                 pstate: self.get_one_reg_u64(REG_PSTATE)?,
                 tpidr_el0: self.get_one_reg_u64(SYS_TPIDR_EL0)?,
                 q,
-                fpcr: self.get_one_reg_u64(REG_FPCR).unwrap_or(0) as u32,
-                fpsr: self.get_one_reg_u64(REG_FPSR).unwrap_or(0) as u32,
+                fpcr: self.get_one_reg_u32(REG_FPCR).unwrap_or(0),
+                fpsr: self.get_one_reg_u32(REG_FPSR).unwrap_or(0),
             })))
         }
 
@@ -722,8 +924,8 @@ mod imp {
                     self.set_one_reg_u64(REG_PC, g.pc)?;
                     self.set_one_reg_u64(REG_PSTATE, g.pstate)?;
                     self.set_one_reg_u64(SYS_TPIDR_EL0, g.tpidr_el0)?;
-                    let _ = self.set_one_reg_u64(REG_FPCR, u64::from(g.fpcr));
-                    let _ = self.set_one_reg_u64(REG_FPSR, u64::from(g.fpsr));
+                    let _ = self.set_one_reg_u32(REG_FPCR, g.fpcr);
+                    let _ = self.set_one_reg_u32(REG_FPSR, g.fpsr);
                     Ok(())
                 }
                 CpuContextBlob::Unicorn(_) => Err(EmuError::Backend(
@@ -731,6 +933,33 @@ mod imp {
                 )),
             }
         }
+    }
+
+    /// 刷清 ARM64 宿主虚拟地址区间的 D-Cache (PoU) 与 I-Cache，确保动态写入的代码页/跳板对 Guest vCPU 立即生效
+    unsafe fn flush_icache_host_range(ptr: *const u8, len: usize) {
+        if len == 0 {
+            return;
+        }
+        let ctr: u64;
+        std::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack, preserves_flags));
+        let dminline = 4usize << ((ctr >> 16) & 0xF);
+        let iminline = 4usize << (ctr & 0xF);
+        let start = ptr as usize;
+        let end = start.saturating_add(len);
+
+        let mut addr = start & !(dminline - 1);
+        while addr < end {
+            std::arch::asm!("dc cvau, {}", in(reg) addr, options(nostack, preserves_flags));
+            addr += dminline;
+        }
+        std::arch::asm!("dsb ish", options(nostack, preserves_flags));
+
+        let mut addr = start & !(iminline - 1);
+        while addr < end {
+            std::arch::asm!("ic ivau, {}", in(reg) addr, options(nostack, preserves_flags));
+            addr += iminline;
+        }
+        std::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
     }
 
     fn d_reg_index(reg: RegisterARM64) -> Option<u8> {
