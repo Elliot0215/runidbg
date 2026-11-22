@@ -211,12 +211,14 @@ impl MemoryArena {
             while cur < end {
                 if cur < ARENA_SIZE as u64 {
                     let idx = (cur / PAGE_SIZE) as usize;
-                    let page = self
+                    let ptr = self
                         .low_pages
                         .entry(cur)
-                        .or_insert_with(|| Box::new([0u8; 4096]));
+                        .or_insert_with(|| Box::new([0u8; 4096]))
+                        .as_mut_ptr()
+                        .cast();
                     self.set_low_page_mapped(idx, true);
-                    page_table[idx] = page.as_mut_ptr().cast();
+                    page_table[idx] = ptr;
                 } else {
                     self.high_pages
                         .entry(cur)
