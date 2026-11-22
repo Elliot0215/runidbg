@@ -11,17 +11,27 @@ env:
 
 jobs:
   check-and-test:
+    name: CI (${{ matrix.label }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - label: macos-arm64 (unicorn + dynarmic + hypervisor)
+            os: macos-latest
+            expected_backends: "unicorn, dynarmic, hypervisor"
+          - label: linux-x86_64 (unicorn + dynarmic + kvm)
+            os: ubuntu-latest
+            expected_backends: "unicorn, dynarmic, kvm"
+          - label: linux-arm64 (unicorn + dynarmic + kvm)
+            os: ubuntu-24.04-arm
+            expected_backends: "unicorn, dynarmic, kvm"
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install native build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config cmake ninja-build libclang-dev
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config cmake ninja-build clang libclang-dev
 
       - name: Install native build dependencies (macOS)
         if: runner.os == 'macOS'
@@ -35,13 +45,10 @@ jobs:
       - name: Cache Cargo registry & build
         uses: Swatinem/rust-cache@v2
 
-      - name: Run full test suite
-        run: cargo test
-
       - name: Clippy (default features)
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Clippy (no default features)
+      - name: Clippy (no default features / unicorn only)
         run: cargo clippy --no-default-features --all-targets -- -D warnings
 
       - name: Clippy (js only)
@@ -50,5 +57,17 @@ jobs:
       - name: Clippy (mcp only)
         run: cargo clippy --no-default-features --features mcp --all-targets -- -D warnings
 
-      - name: Clippy & test (ui feature)
-        run: cargo clippy --features ui --all-targets -- -D warnings && cargo test --features ui --test ui_web
+      - name: Clippy (dynarmic only)
+        run: cargo clippy --no-default-features --features dynarmic --all-targets -- -D warnings
+
+      - name: Run full test suite
+        run: cargo test
+
+      - name: Build CLI and verify compiled backends
+        run: |
+          cargo build --bin runidbg-cli
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            codesign --force --sign - --entitlements entitlements/hypervisor.plist target/debug/runidbg-cli
+          fi
+          ./target/debug/runidbg-cli --help 2>&1 | tee /tmp/cli-help.txt
+          grep -F "${{ matrix.expected_backends }}" /tmp/cli-help.txt

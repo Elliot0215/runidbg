@@ -19,21 +19,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            artifact_name: runidbg-linux-x86_64
-            archive: tar.gz
-            bin_ext: ""
           - os: macos-latest
             target: aarch64-apple-darwin
             artifact_name: runidbg-macos-arm64
             archive: tar.gz
             bin_ext: ""
+            sign_hypervisor: true
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: runidbg-linux-x86_64
+            archive: tar.gz
+            bin_ext: ""
+            sign_hypervisor: false
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact_name: runidbg-linux-arm64
+            archive: tar.gz
+            bin_ext: ""
+            sign_hypervisor: false
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             artifact_name: runidbg-windows-x86_64
             archive: zip
             bin_ext: ".exe"
+            sign_hypervisor: false
 
     runs-on: ${{ matrix.os }}
 
@@ -42,11 +51,16 @@ jobs:
 
       - name: Install native build dependencies (Linux)
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y pkg-config cmake ninja-build libclang-dev
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config cmake ninja-build clang libclang-dev
 
       - name: Install native build dependencies (macOS)
         if: runner.os == 'macOS'
         run: brew install pkgconf cmake ninja
+
+      - name: Install native build dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install ninja --no-progress -y
 
       - name: Setup MSVC environment (Windows)
         if: runner.os == 'Windows'
@@ -63,6 +77,14 @@ jobs:
       - name: Build release binary (Unix)
         if: runner.os != 'Windows'
         run: cargo build --release --target ${{ matrix.target }} --bin runidbg-cli
+
+      - name: Sign macOS binary with Hypervisor.framework entitlement
+        if: matrix.sign_hypervisor
+        run: |
+          codesign --force --sign - \
+            --entitlements entitlements/hypervisor.plist \
+            "target/${{ matrix.target }}/release/runidbg-cli"
+          codesign --display --entitlements - "target/${{ matrix.target }}/release/runidbg-cli"
 
       - name: Build release binary (Windows)
         if: runner.os == 'Windows'
@@ -81,6 +103,9 @@ jobs:
           mkdir -p "${STAGE}" dist
           cp "target/${{ matrix.target }}/release/runidbg-cli${{ matrix.bin_ext }}" "${STAGE}/"
           cp LICENSE README.md README_EN.md "${STAGE}/"
+          if [ "${{ matrix.sign_hypervisor }}" = "true" ]; then
+            cp entitlements/hypervisor.plist "${STAGE}/"
+          fi
           tar -czf "dist/${STAGE}.tar.gz" "${STAGE}"
           if command -v sha256sum >/dev/null 2>&1; then
             (cd dist && sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256")
