@@ -36,8 +36,10 @@ fn parse_hex_bytes(s: &str) -> Result<Vec<u8>> {
 }
 
 fn print_usage() {
+    let compiled_backends = runidbg_arm64_emu_tracer::BackendKind::compiled_names();
     eprintln!(
         "runidbg-arm64-emu-tracer 工具集 (runidbg-cli)\n\
+         已编译执行后端: {compiled_backends}（Trace / GDB 模式仅支持 unicorn，其余后端仅限仿真模式）\n\
          全局选项 (置于子命令之前):\n\
            [--log-level <trace|debug|info|warn|error>] [--log-format <compact|json>]\n\
          用法:\n\
@@ -46,7 +48,7 @@ fn print_usage() {
                      [--max-queue 1024] [--timeout-ms 30000] [--max-insns 0]\n\
                      [--allow-reload] [--allow-eval] [-- <args...>]\n\
            runidbg-cli mcp [--script <init.js>] [--cwd <dir>] [--http 127.0.0.1:8090]         启动 MCP 服务端 (stdio / HTTP)\n\
-           runidbg-cli debug <lib.so> <symbol|0xaddr> [--listen 127.0.0.1:1234] [--pkg PKG]   启动 GDB RSP 远程调试服务端\n\
+           runidbg-cli debug <lib.so> <symbol|0xaddr> [--listen 127.0.0.1:1234] [--pkg PKG]   启动 GDB RSP 远程调试服务端（仅 Unicorn）\n\
            runidbg-cli init-types [dir]                                                       生成 runidbg.d.ts 类型声明\n\
            runidbg-cli dump <trace.idx> [--ext <trace.ext>] [--base <hex>] [--skip N] [--limit N]\n\
            runidbg-cli search <trace.idx> [--ext <trace.ext>] [--base <hex>] [--val <hex>] [--addr <hex>] [--pc <hex>]\n\
@@ -311,6 +313,15 @@ fn debug_gdb_command(args: &[String]) -> Result<()> {
             }
             "--pkg" if i + 1 < args.len() => {
                 pkg = args[i + 1].clone();
+                i += 2;
+            }
+            "--backend" if i + 1 < args.len() => {
+                let kind: runidbg_arm64_emu_tracer::BackendKind = args[i + 1].parse()?;
+                if !kind.supports_gdb() {
+                    bail!(
+                        "GDB 调试模式仅支持 `unicorn` 后端，后端 `{kind}` 仅限仿真模式使用"
+                    );
+                }
                 i += 2;
             }
             other => bail!("debug 未知参数: {other}"),

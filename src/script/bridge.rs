@@ -78,7 +78,7 @@ fn with_unicorn_only<R>(
     let uc = entry.emu.try_uc_mut().ok_or_else(|| {
         throw_err(
             ctx,
-            format!("当前后端 `{kind}` 不支持 `{op_name}`（仅 `unicorn` 后端支持原生指令/内存/Syscall Hook）"),
+            format!("当前后端 `{kind}` 仅支持仿真模式，不支持 `{op_name}`（仅 `unicorn` 后端支持原生指令/内存/Syscall Hook）"),
         )
     })?;
     (f.take().unwrap())(uc)
@@ -345,6 +345,36 @@ pub(super) fn register_native_bridge<'js>(
                     }
                 }
             })?,
+        )?;
+    }
+
+    // emuCompiledBackends() -> string[]
+    native.set(
+        "emuCompiledBackends",
+        Function::new(ctx.clone(), move || -> rquickjs::Result<Vec<String>> {
+            Ok(BackendKind::compiled_backends()
+                .iter()
+                .map(|b| b.as_str().to_string())
+                .collect())
+        })?,
+    )?;
+
+    // emuBackend(emuId) -> string
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "emuBackend",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize| -> rquickjs::Result<String> {
+                    let h = host.borrow();
+                    let entry = h
+                        .emus
+                        .get(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    Ok(entry.emu.backend_kind().as_str().to_string())
+                },
+            )?,
         )?;
     }
 
@@ -2947,6 +2977,15 @@ pub(super) fn register_native_bridge<'js>(
                         .emus
                         .get_mut(emu_id)
                         .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    if !entry.emu.backend_kind().supports_trace() {
+                        return Err(throw_err(
+                            &ctx,
+                            format!(
+                                "当前后端 `{}` 仅支持仿真模式，不支持 Trace 模式（Trace 仅支持 `unicorn` 后端）",
+                                entry.emu.backend_kind()
+                            ),
+                        ));
+                    }
                     let level = match level_str.as_str() {
                         "fast" => TraceLevel::Fast,
                         "full" => TraceLevel::Full,
@@ -3006,6 +3045,15 @@ pub(super) fn register_native_bridge<'js>(
                         .emus
                         .get_mut(emu_id)
                         .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    if !entry.emu.backend_kind().supports_trace() {
+                        return Err(throw_err(
+                            &ctx,
+                            format!(
+                                "当前后端 `{}` 仅支持仿真模式，不支持 Trace 模式（Trace 仅支持 `unicorn` 后端）",
+                                entry.emu.backend_kind()
+                            ),
+                        ));
+                    }
                     entry.emu.detach_tracer().map_err(|e| throw_err(&ctx, e))?;
                     let stats = entry.emu.tracer().stats;
                     let obj = Object::new(ctx.clone())?;

@@ -10,6 +10,10 @@ categories = ["emulators", "development-tools::debugging"]
 description = "Lightweight high-performance Android ARM64 .so emulator & binary tracer in pure Rust"
 
 [features]
+# 默认编译全部核心特性与当前平台可用的执行后端：
+# - Linux 默认编译: unicorn, dynarmic, kvm（hypervisor 仅在 macOS 编译）
+# - macOS 默认编译: unicorn, dynarmic, hypervisor（kvm 仅在 Linux 编译）
+# - `--no-default-features`: 仅保留 Unicorn 最小核心（Trace / GDB 仅支持 Unicorn）
 default = ["js", "rpc", "mcp", "apk", "ui", "dynarmic", "kvm", "hypervisor"]
 js = ["dep:rquickjs"]
 rpc = ["js", "dep:serde_json", "dep:tokio", "dep:axum", "dep:async-channel"]

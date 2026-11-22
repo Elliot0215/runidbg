@@ -22,6 +22,8 @@ use runidbg_arm64_emu_tracer::jni::{JObject, JObjectRef, JValue};
 use runidbg_arm64_emu_tracer::loader::HleBuiltin;
 #[cfg(feature = "dynarmic")]
 use runidbg_arm64_emu_tracer::memory::{read_guest_cstr, MemoryManager};
+#[cfg(feature = "dynarmic")]
+use runidbg_arm64_emu_tracer::tracer::TraceLevel;
 #[cfg(any(feature = "dynarmic", feature = "kvm", feature = "hypervisor"))]
 use runidbg_arm64_emu_tracer::AndroidEmulator;
 #[cfg(any(feature = "dynarmic", feature = "hypervisor"))]
@@ -313,11 +315,19 @@ fn dynarmic_hle_pc_redirect_fault_pc_and_neon_128bit_cross_page() {
         other => panic!("expected GuestCrash, got {other:?}"),
     }
 
-    // 4. Unicorn-only 边界拦截：attach_tracer / GdbServer 在 Dynarmic 上必须显式报错
+    // 4. Unicorn-only 边界拦截：builder(with_memory_trace) / attach_tracer / GdbServer 在 Dynarmic 上必须显式报错
+    assert!(matches!(
+        AndroidEmulator::builder()
+            .backend(BackendKind::Dynarmic)
+            .with_memory_trace(1024, TraceLevel::Fast)
+            .build(),
+        Err(EmuError::Backend(_))
+    ));
     assert!(matches!(
         emu.attach_tracer(0, u64::MAX),
         Err(EmuError::Backend(_))
     ));
+    assert!(GdbServer::serve(&mut emu, "127.0.0.1:0", code_base, &[]).is_err());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     assert!(GdbServer::serve_listener(&mut emu, listener, code_base, &[]).is_err());
 }
@@ -327,28 +337,53 @@ fn dynarmic_hle_pc_redirect_fault_pc_and_neon_128bit_cross_page() {
 fn dynarmic_js_backend_selection_and_metasec_parity() {
     use runidbg_arm64_emu_tracer::script::JsSession;
 
-    // 1. JS 指定 backend: "dynarmic" + 验证 Unicorn-only hook.code 返回明确错误
-    let script = r#"
-        const emu = Emu.create({ backend: "dynarmic", packageName: "com.example.dyn" });
+    // 1. JS 指定 backend: "dynarmic" + 验证 Unicorn-only hook.code / trace.start 返回明确错误且不落盘
+    let trace_tmp = std::env::temp_dir().join(format!(
+        "runidbg_non_uc_trace_{}.idx",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&trace_tmp);
+    let script = format!(
+        r#"
+        const compiled = Emu.backends();
+        const emu = Emu.create({{ backend: "dynarmic", packageName: "com.example.dyn" }});
         const mod = emu.load("samples/libstatic-webp.so");
         const ver = mod.call("WebPGetDecoderVersion");
         let hookErr = null;
-        try {
-            emu.hook.code(mod.base, () => {});
-        } catch (e) {
+        try {{
+            emu.hook.code(mod.base, () => {{}});
+        }} catch (e) {{
             hookErr = String(e);
-        }
-        rpc.exports = {
-            verify() {
-                return { backend: emu.backend, ver, hookErr };
-            },
-        };
-    "#;
+        }}
+        let traceErr = null;
+        try {{
+            emu.trace.start({{ output: {:?}, level: "fast" }});
+        }} catch (e) {{
+            traceErr = String(e);
+        }}
+        rpc.exports = {{
+            verify() {{
+                return {{
+                    compiled,
+                    backend: emu.backend,
+                    supportsTrace: emu.supportsTrace,
+                    supportsGdb: emu.supportsGdb,
+                    ver,
+                    hookErr,
+                    traceErr,
+                }};
+            }},
+        }};
+    "#,
+        trace_tmp.to_string_lossy()
+    );
     let session = JsSession::new(&[], Path::new("."), true).unwrap();
-    session.eval_source(script).unwrap();
+    session.eval_source(&script).unwrap();
     let raw = session.call_rpc_json("verify", "[]").unwrap();
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
     assert_eq!(v["backend"].as_str(), Some("dynarmic"));
+    assert_eq!(v["supportsTrace"].as_bool(), Some(false));
+    assert_eq!(v["supportsGdb"].as_bool(), Some(false));
     assert!(v["ver"].as_u64().unwrap_or(0) > 0);
     assert!(
         v["hookErr"]
@@ -356,6 +391,17 @@ fn dynarmic_js_backend_selection_and_metasec_parity() {
             .is_some_and(|s| s.contains("unicorn")),
         "expected unicorn-only guard error, got: {:?}",
         v["hookErr"]
+    );
+    assert!(
+        v["traceErr"]
+            .as_str()
+            .is_some_and(|s| s.contains("unicorn")),
+        "expected unicorn-only trace guard error, got: {:?}",
+        v["traceErr"]
+    );
+    assert!(
+        !trace_tmp.exists(),
+        "trace.start on non-Unicorn backend must fail before creating trace file"
     );
 
     // 2. TikTok libmetasec_ov.so 在 Dynarmic 上离线生成全套 X-Cylons/X-Argus/X-Gorgon/X-Khronos/X-Ladon
@@ -557,18 +603,61 @@ fn dynarmic_conscrypt_boringssl_and_cronet_143_parity() {
 fn kvm_and_hypervisor_platform_guards_and_capabilities() {
     assert!(BackendKind::Unicorn.supports_trace());
     assert!(BackendKind::Unicorn.supports_gdb());
+    assert!(BackendKind::Unicorn.supports_native_hooks());
     assert!(!BackendKind::Dynarmic.supports_trace());
     assert!(!BackendKind::Dynarmic.supports_gdb());
+    assert!(!BackendKind::Dynarmic.supports_native_hooks());
     assert!(!BackendKind::Kvm.supports_trace());
+    assert!(!BackendKind::Kvm.supports_gdb());
+    assert!(!BackendKind::Hypervisor.supports_trace());
     assert!(!BackendKind::Hypervisor.supports_gdb());
     assert_eq!("dynarmic".parse::<BackendKind>().unwrap(), BackendKind::Dynarmic);
+    assert_eq!("hyper".parse::<BackendKind>().unwrap(), BackendKind::Hypervisor);
     assert_eq!("hvf".parse::<BackendKind>().unwrap(), BackendKind::Hypervisor);
+
+    // 平台条件编译校验：Linux 默认编译 unicorn+dynarmic+kvm，macOS 默认编译 unicorn+dynarmic+hypervisor
+    let compiled = BackendKind::compiled_backends();
+    assert!(compiled.contains(&BackendKind::Unicorn));
+    assert!(BackendKind::Unicorn.is_compiled());
+    #[cfg(all(target_os = "macos", feature = "dynarmic", feature = "hypervisor"))]
+    {
+        assert_eq!(
+            compiled,
+            &[
+                BackendKind::Unicorn,
+                BackendKind::Dynarmic,
+                BackendKind::Hypervisor
+            ]
+        );
+        assert!(!BackendKind::Kvm.is_compiled());
+    }
+    #[cfg(all(target_os = "linux", feature = "dynarmic", feature = "kvm"))]
+    {
+        assert_eq!(
+            compiled,
+            &[
+                BackendKind::Unicorn,
+                BackendKind::Dynarmic,
+                BackendKind::Kvm
+            ]
+        );
+        assert!(!BackendKind::Hypervisor.is_compiled());
+    }
 
     // 非 Linux aarch64 宿主机请求 KVM 应返回清晰 Backend 错误
     #[cfg(all(feature = "kvm", not(all(target_os = "linux", target_arch = "aarch64"))))]
     {
         let res = AndroidEmulator::builder()
             .backend(BackendKind::Kvm)
+            .build();
+        assert!(matches!(res, Err(EmuError::Backend(_))));
+    }
+
+    // 非 macOS 宿主机请求 Hypervisor 应返回清晰 Backend 错误
+    #[cfg(all(feature = "hypervisor", not(target_os = "macos")))]
+    {
+        let res = AndroidEmulator::builder()
+            .backend(BackendKind::Hypervisor)
             .build();
         assert!(matches!(res, Err(EmuError::Backend(_))));
     }

@@ -806,6 +806,7 @@ fn tool_definitions() -> Value {
             "inputSchema": {
                 "type": "object",
                 "properties": {
+                    "backend": { "type": "string", "description": "CPU backend: unicorn (default; required for trace/GDB/native hooks), dynarmic, kvm (Linux), hypervisor/hyper (macOS). Non-Unicorn backends are emulation-only." },
                     "packageName": { "type": "string", "description": "Android package name (default: com.example.app)" },
                     "searchPaths": { "type": "array", "items": { "type": "string" }, "description": "Sysroot / .so search directories" },
                     "hleAccel": { "type": "boolean", "description": "Enable Rust HLE libc acceleration (default: true)" }
@@ -976,7 +977,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "emu_trace_call",
-            "description": "Attach a temporary tracer, invoke a symbol/address, detach tracer, and return return value + trace stats.",
+            "description": "Attach a temporary tracer, invoke a symbol/address, detach tracer, and return return value + trace stats (Unicorn backend only).",
             "inputSchema": {
                 "type": "object",
                 "required": ["emuId", "target"],
@@ -992,7 +993,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "emu_hook_capture",
-            "description": "Temporarily attach onEnter/onLeave hook at hookAddr, call callTarget, and return all captured arguments and return values.",
+            "description": "Temporarily attach onEnter/onLeave hook at hookAddr, call callTarget, and return all captured arguments and return values (Unicorn backend only).",
             "inputSchema": {
                 "type": "object",
                 "required": ["emuId", "hookAddr", "callTarget"],

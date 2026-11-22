@@ -6,11 +6,15 @@ use unicorn_engine::{RegisterARM64, UcHookId, Unicorn};
 
 #[cfg(feature = "dynarmic")]
 use crate::backend::dynarmic_backend::DynarmicCpu;
-#[cfg(feature = "hypervisor")]
+#[cfg(all(feature = "hypervisor", target_os = "macos"))]
 use crate::backend::hypervisor_backend::HypervisorCpu;
-#[cfg(feature = "kvm")]
+#[cfg(all(feature = "kvm", target_os = "linux"))]
 use crate::backend::kvm_backend::KvmCpu;
-#[cfg(any(feature = "dynarmic", feature = "kvm", feature = "hypervisor"))]
+#[cfg(any(
+    feature = "dynarmic",
+    all(feature = "kvm", target_os = "linux"),
+    all(feature = "hypervisor", target_os = "macos")
+))]
 use crate::backend::ExternalBackend;
 use crate::backend::{
     BackendKind, BackendWithData, CpuBackend, CpuEngine, RunStopReason, SVC_IMM_HLE_TRAMPOLINE,
@@ -145,6 +149,12 @@ impl AndroidEmulatorBuilder {
 
     /// 构建并初始化完整的 `AndroidEmulator` 实例
     pub fn build(self) -> EmuResult<AndroidEmulator> {
+        if self.auto_attach_trace && !self.backend.supports_trace() {
+            return Err(EmuError::Backend(format!(
+                "当前后端 `{}` 仅支持仿真模式，不支持 Trace 模式（Trace 仅支持 `unicorn` 后端）",
+                self.backend
+            )));
+        }
         let mut mem = MemoryManager::new(self.heap_base, self.heap_size);
         let mut vfs = VirtualFs::new(&self.package_name);
         let mut trampolines = TrampolineTable::new();
@@ -192,25 +202,37 @@ impl AndroidEmulatorBuilder {
                 }
             }
             BackendKind::Kvm => {
-                #[cfg(feature = "kvm")]
+                #[cfg(all(feature = "kvm", target_os = "linux"))]
                 {
                     CpuEngine::Kvm(Box::new(ExternalBackend::new(KvmCpu::new()?, placeholder)))
                 }
-                #[cfg(not(feature = "kvm"))]
+                #[cfg(not(all(feature = "kvm", target_os = "linux")))]
                 {
+                    #[cfg(not(target_os = "linux"))]
+                    return Err(EmuError::Backend(format!(
+                        "KVM 后端仅在 Linux 平台编译与支持（当前平台已编译后端: {}）",
+                        BackendKind::compiled_names()
+                    )));
+                    #[cfg(target_os = "linux")]
                     return Err(EmuError::Backend("当前构建未启用 `kvm` feature".to_string()));
                 }
             }
             BackendKind::Hypervisor => {
-                #[cfg(feature = "hypervisor")]
+                #[cfg(all(feature = "hypervisor", target_os = "macos"))]
                 {
                     CpuEngine::Hypervisor(Box::new(ExternalBackend::new(
                         HypervisorCpu::new()?,
                         placeholder,
                     )))
                 }
-                #[cfg(not(feature = "hypervisor"))]
+                #[cfg(not(all(feature = "hypervisor", target_os = "macos")))]
                 {
+                    #[cfg(not(target_os = "macos"))]
+                    return Err(EmuError::Backend(format!(
+                        "Hypervisor.framework 后端仅在 macOS 平台编译与支持（当前平台已编译后端: {}）",
+                        BackendKind::compiled_names()
+                    )));
+                    #[cfg(target_os = "macos")]
                     return Err(EmuError::Backend(
                         "当前构建未启用 `hypervisor` feature".to_string(),
                     ));
@@ -724,7 +746,7 @@ impl AndroidEmulator {
     pub fn attach_tracer(&mut self, begin: u64, end: u64) -> EmuResult<()> {
         if !self.backend_kind().supports_trace() {
             return Err(EmuError::Backend(format!(
-                "当前后端 `{}` 不支持指令级 Trace（请切换到 `unicorn` 后端）",
+                "当前后端 `{}` 仅支持仿真模式，不支持 Trace 模式（Trace 仅支持 `unicorn` 后端）",
                 self.backend_kind()
             )));
         }
@@ -750,7 +772,7 @@ impl AndroidEmulator {
     pub fn set_tracer(&mut self, tracer: BinaryTracer) -> EmuResult<()> {
         if !self.backend_kind().supports_trace() {
             return Err(EmuError::Backend(format!(
-                "当前后端 `{}` 不支持指令级 Trace（请切换到 `unicorn` 后端）",
+                "当前后端 `{}` 仅支持仿真模式，不支持 Trace 模式（Trace 仅支持 `unicorn` 后端）",
                 self.backend_kind()
             )));
         }

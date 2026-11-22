@@ -3,10 +3,15 @@
 
 #[cfg(feature = "dynarmic")]
 pub mod dynarmic_backend;
-#[cfg(feature = "hypervisor")]
+#[cfg(all(feature = "hypervisor", target_os = "macos"))]
 pub mod hypervisor_backend;
-#[cfg(feature = "kvm")]
+#[cfg(all(feature = "kvm", target_os = "linux"))]
 pub mod kvm_backend;
+#[cfg(any(
+    all(feature = "kvm", target_os = "linux"),
+    all(feature = "hypervisor", target_os = "macos"),
+    test
+))]
 pub mod vm_common;
 
 use std::fmt;
@@ -53,19 +58,58 @@ impl BackendKind {
         }
     }
 
-    /// 是否支持逐指令 / 内存读写 Trace Hook（仅 Unicorn 支持）
+    /// 是否支持逐指令 / 内存读写 Trace Hook（仅 Unicorn 支持；其他后端仅限仿真模式）
     pub const fn supports_trace(self) -> bool {
         matches!(self, Self::Unicorn)
     }
 
-    /// 是否支持 GDB Stub 远程单步调试（仅 Unicorn 支持）
+    /// 是否支持 GDB Stub 远程单步调试（仅 Unicorn 支持；其他后端仅限仿真模式）
     pub const fn supports_gdb(self) -> bool {
+        matches!(self, Self::Unicorn)
+    }
+
+    /// 是否支持原生指令/内存/Syscall Hook（仅 Unicorn 支持；其他后端仅限仿真模式）
+    pub const fn supports_native_hooks(self) -> bool {
         matches!(self, Self::Unicorn)
     }
 
     /// 是否使用 `SVC #imm16` 跳板与统一外部陷阱循环（非 Unicorn 后端均为 true）
     pub const fn uses_svc_trampolines(self) -> bool {
         !matches!(self, Self::Unicorn)
+    }
+
+    /// 当前构建与目标平台实际编译启用的执行后端列表：
+    /// - Linux 默认编译：`[Unicorn, Dynarmic, Kvm]`
+    /// - macOS 默认编译：`[Unicorn, Dynarmic, Hypervisor]`
+    pub const fn compiled_backends() -> &'static [Self] {
+        &[
+            Self::Unicorn,
+            #[cfg(feature = "dynarmic")]
+            Self::Dynarmic,
+            #[cfg(all(feature = "kvm", target_os = "linux"))]
+            Self::Kvm,
+            #[cfg(all(feature = "hypervisor", target_os = "macos"))]
+            Self::Hypervisor,
+        ]
+    }
+
+    /// 当前构建与目标平台是否已编译该后端
+    pub const fn is_compiled(self) -> bool {
+        match self {
+            Self::Unicorn => true,
+            Self::Dynarmic => cfg!(feature = "dynarmic"),
+            Self::Kvm => cfg!(all(feature = "kvm", target_os = "linux")),
+            Self::Hypervisor => cfg!(all(feature = "hypervisor", target_os = "macos")),
+        }
+    }
+
+    /// 返回当前已编译后端的逗号分隔名称列表
+    pub fn compiled_names() -> String {
+        Self::compiled_backends()
+            .iter()
+            .map(|k| k.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -83,9 +127,10 @@ impl FromStr for BackendKind {
             "unicorn" | "uc" => Ok(Self::Unicorn),
             "dynarmic" | "jit" => Ok(Self::Dynarmic),
             "kvm" => Ok(Self::Kvm),
-            "hypervisor" | "hvf" => Ok(Self::Hypervisor),
+            "hypervisor" | "hyper" | "hvf" => Ok(Self::Hypervisor),
             other => Err(EmuError::Backend(format!(
-                "未知的执行后端 `{other}`（可选: unicorn, dynarmic, kvm, hypervisor）"
+                "未知的执行后端 `{other}`（当前平台已编译: {}）",
+                Self::compiled_names()
             ))),
         }
     }
@@ -443,9 +488,9 @@ pub enum CpuEngine<D: 'static> {
     Unicorn(Unicorn<'static, D>),
     #[cfg(feature = "dynarmic")]
     Dynarmic(Box<ExternalBackend<dynarmic_backend::DynarmicCpu, D>>),
-    #[cfg(feature = "kvm")]
+    #[cfg(all(feature = "kvm", target_os = "linux"))]
     Kvm(Box<ExternalBackend<kvm_backend::KvmCpu, D>>),
-    #[cfg(feature = "hypervisor")]
+    #[cfg(all(feature = "hypervisor", target_os = "macos"))]
     Hypervisor(Box<ExternalBackend<hypervisor_backend::HypervisorCpu, D>>),
 }
 
@@ -458,12 +503,12 @@ macro_rules! dispatch_engine {
                 let $cpu = $cpu.as_ref();
                 $body
             }
-            #[cfg(feature = "kvm")]
+            #[cfg(all(feature = "kvm", target_os = "linux"))]
             CpuEngine::Kvm($cpu) => {
                 let $cpu = $cpu.as_ref();
                 $body
             }
-            #[cfg(feature = "hypervisor")]
+            #[cfg(all(feature = "hypervisor", target_os = "macos"))]
             CpuEngine::Hypervisor($cpu) => {
                 let $cpu = $cpu.as_ref();
                 $body
@@ -481,12 +526,12 @@ macro_rules! dispatch_engine_mut {
                 let $cpu = $cpu.as_mut();
                 $body
             }
-            #[cfg(feature = "kvm")]
+            #[cfg(all(feature = "kvm", target_os = "linux"))]
             CpuEngine::Kvm($cpu) => {
                 let $cpu = $cpu.as_mut();
                 $body
             }
-            #[cfg(feature = "hypervisor")]
+            #[cfg(all(feature = "hypervisor", target_os = "macos"))]
             CpuEngine::Hypervisor($cpu) => {
                 let $cpu = $cpu.as_mut();
                 $body
@@ -530,11 +575,11 @@ impl<D: 'static> CpuEngine<D> {
             CpuEngine::Dynarmic(ext) => {
                 Ok(ext.cpu.run_until_trap(start_pc, timeout_us, max_instructions))
             }
-            #[cfg(feature = "kvm")]
+            #[cfg(all(feature = "kvm", target_os = "linux"))]
             CpuEngine::Kvm(ext) => {
                 Ok(ext.cpu.run_until_trap(start_pc, timeout_us, max_instructions))
             }
-            #[cfg(feature = "hypervisor")]
+            #[cfg(all(feature = "hypervisor", target_os = "macos"))]
             CpuEngine::Hypervisor(ext) => {
                 Ok(ext.cpu.run_until_trap(start_pc, timeout_us, max_instructions))
             }

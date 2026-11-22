@@ -106,6 +106,13 @@ impl GdbServer {
         start_pc: u64,
         args: &[u64],
     ) -> Result<()> {
+        if !emu.backend_kind().supports_gdb() {
+            return Err(crate::error::EmuError::Backend(format!(
+                "当前后端 `{}` 仅支持仿真模式，不支持 GDB 调试模式（GDB 仅支持 `unicorn` 后端）",
+                emu.backend_kind()
+            ))
+            .into());
+        }
         let listener = TcpListener::bind(listen_addr)
             .with_context(|| format!("绑定 GDB Stub 监听地址失败: {listen_addr}"))?;
         tracing::info!(
@@ -126,7 +133,7 @@ impl GdbServer {
     ) -> Result<()> {
         if !emu.backend_kind().supports_gdb() {
             return Err(crate::error::EmuError::Backend(format!(
-                "当前后端 `{}` 不支持 GDB Stub 远程调试（请切换到 `unicorn` 后端）",
+                "当前后端 `{}` 仅支持仿真模式，不支持 GDB 调试模式（GDB 仅支持 `unicorn` 后端）",
                 emu.backend_kind()
             ))
             .into());

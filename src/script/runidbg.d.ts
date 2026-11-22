@@ -60,10 +60,14 @@ interface DeviceProfileConfig {
   androidId?: string;
 }
 
-type EmuBackendKind = "unicorn" | "dynarmic" | "kvm" | "hypervisor";
+type EmuBackendKind = "unicorn" | "dynarmic" | "kvm" | "hypervisor" | "hyper";
 
 interface EmuOptions {
-  /** 底层 CPU 执行后端（默认 `"unicorn"`；`"dynarmic"` 提速 1.4x–6x；`"kvm"`/`"hypervisor"` 硬件虚拟化） */
+  /**
+   * 底层 CPU 执行后端（默认 `"unicorn"`）：
+   * - `"unicorn"`: 支持完整仿真 + Trace + GDB + 原生 Hook
+   * - `"dynarmic"` / `"kvm"`（Linux 默认编译） / `"hypervisor"`（`"hyper"`，macOS 默认编译）: 仅限仿真模式
+   */
   backend?: EmuBackendKind;
   packageName?: string;
   searchPaths?: string[];
@@ -495,8 +499,12 @@ interface DexNamespace {
 }
 
 interface EmuHandle {
-  /** 当前实例使用的底层 CPU 执行后端 */
-  readonly backend: EmuBackendKind;
+  /** 当前实例使用的规范化 CPU 执行后端名 */
+  readonly backend: "unicorn" | "dynarmic" | "kvm" | "hypervisor";
+  /** 是否支持 Trace 模式（仅 `"unicorn"` 为 true） */
+  readonly supportsTrace: boolean;
+  /** 是否支持 GDB 调试模式（仅 `"unicorn"` 为 true） */
+  readonly supportsGdb: boolean;
   load(path: string, opts?: LoadOptions): ModuleHandle;
   /** 加载单个 `.dex`、路径数组或包含 `classes*.dex` 的目录到轻量元数据索引并挂载到 VFS */
   loadDex(pathOrPaths: string | string[]): {
@@ -525,5 +533,7 @@ interface EmuHandle {
 }
 
 declare namespace Emu {
+  /** 返回当前构建在当前操作系统上默认编译启用的执行后端列表 */
+  function backends(): Array<"unicorn" | "dynarmic" | "kvm" | "hypervisor">;
   function create(options?: EmuOptions): EmuHandle;
 }
