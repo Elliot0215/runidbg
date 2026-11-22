@@ -5,21 +5,21 @@
 
 # ⚡ runidbg (`runidbg-arm64-emu-tracer`)
 
-**`Rust + unidbg = runidbg` · 纯 Rust 实现的高性能 Android ARM64 `.so` 仿真器、零拷贝二进制 Tracer 与 QuickJS 脚本引擎**  
-内置异步多核 RPC 服务 · MCP AI 逆向闭环 · GDB RSP 远程调试 · 统一设备画像模拟
+**`Rust + unidbg = runidbg` · 纯 Rust 实现的多后端高性能 Android ARM64 `.so` 仿真器、零拷贝二进制 Tracer 与 QuickJS 脚本引擎**  
+Unicorn / Dynarmic JIT / Linux KVM / macOS Hypervisor.framework 四引擎 · 异步多核 RPC · MCP AI 逆向闭环 · GDB RSP · 统一设备画像
 
 **简体中文** | [English](./README_EN.md) | [完整使用指南](./docs/GUIDE.md) | [AI Agent Skill](./docs/SKILL.md)
 
 ![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
 ![Target](https://img.shields.io/badge/Target-Android%20ARM64-3DDC84?logo=android&logoColor=white)
-![Engine](https://img.shields.io/badge/Unicorn-2.1-blueviolet)
+![Engines](https://img.shields.io/badge/Backends-Unicorn%20%7C%20Dynarmic%20%7C%20KVM%20%7C%20Hypervisor-blueviolet)
 ![Script](https://img.shields.io/badge/QuickJS-TypeScript%20d.ts-F7DF1E?logo=javascript&logoColor=black)
 ![Protocol](https://img.shields.io/badge/RPC%20%7C%20MCP%20%7C%20GDB%20RSP-ready-0A66C2)
-![Tests](https://img.shields.io/badge/Tests-45%2F45%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-73%2F73%20passing-brightgreen)
 
-| 🚀 冷启动速度 | 🔥 全模块 Trace 吞吐 | 💾 单实例 RPC 内存 | ⚙️ 多核 RPC 吞吐 | 📦 单条 Trace 体积 |
+| 🚀 冷启动速度 | ⚡ 硬件/JIT 纯算加速 | 🔥 全模块 Trace 吞吐 | 💾 单实例 RPC 内存 | ⚙️ 多核 RPC 吞吐 |
 | :---: | :---: | :---: | :---: | :---: |
-| **77 ms** (`22.6×` vs unidbg) | **17.03 M insns/s** (`114×` vs unidbg) | **21.7 MB** (省 `82%`) | **1,141 QPS** (10 核) | **32 B / insn** (省 `3.7×`) |
+| **77 ms** (`22.6×` vs unidbg) | **最高 480×** (Hyper/KVM) / **102×** (Dynarmic) | **17.03 M insns/s** (`114×` vs unidbg) | **21.7 MB** (省 `82%`) | **1,141 QPS** (10 核) |
 
 </div>
 
@@ -38,7 +38,12 @@
 
 ## ✨ 核心特性
 
-- **🦀 Android ARM64 原生仿真底座**：基于 Unicorn 2.1 + `goblin`，完整支持 ELF 动态链接（`.init_array`、`IRELATIVE`、符号重定位、`DT_NEEDED` 递归加载、TLS `TPIDR_EL0`）、高频 libc/libm HLE 加速（含真实 AAPCS64 `vsnprintf`/`__snprintf_chk`/`sscanf`/`asprintf`/`atoll`）、带前后空闲块合并（Coalescing Free-List）的真实堆分配器、完整快照回滚（CPU + 可写内存 + 堆元数据 + JNI 引用表）与防反调试。
+- **⚡ 四引擎可插拔 ARM64 执行后端（`CpuBackend` + `CpuEngine`）**：
+  - **`unicorn`（默认，全功能）**：基于 Unicorn 2.1，**唯一支持指令级/内存 Trace、GDB RSP 远程调试及原生指令/内存/Syscall Hook** 的后端；
+  - **`dynarmic`（跨平台 JIT 加速，仅限仿真模式）**：基于 `dynarmic 0.1.3` 动态二进制翻译（零系统 Boost 依赖，Unix 4GB 连续 `mmap` Arena 规避 128-bit NEON 跨页越界 + 完整 `ExclusiveMonitor` 原子指令支持），重计算加速 **7×–100×**、真实业务加速 **1.4×–5×**；
+  - **`kvm`（Linux ARM64 硬件虚拟化，仅限仿真模式，Linux 默认编译）**：零外部 crate 直调 `/dev/kvm` ioctl，内置 Stage-1 L1+L2 恒等页表、ARM64 `dc cvau + ic ivau` I-Cache 维护与局部 `mem_unmap`；
+  - **`hypervisor` / `hyper`（macOS Apple Silicon 硬件虚拟化，仅限仿真模式，macOS 默认编译）**：零外部 crate 直调 `Hypervisor.framework`，16KB 宿主物理页 + 4KB Android 逻辑页视图 + Stage-1 L1+L2 恒等页表，纯算加速高达 **480×** vs Unicorn、**4.7×** vs Dynarmic。
+- **🦀 Android ARM64 原生运行时底座**：基于 `goblin` 完整支持 ELF 动态链接（`.init_array`、`R_AARCH64_IRELATIVE`、符号重定位、`DT_NEEDED` 递归加载、`dlopen`/`dlsym`/`dladdr`/`dl_iterate_phdr`、TLS `TPIDR_EL0`）、高频 libc/libm/libz/AAssetManager/pthread/`setjmp`/`longjmp`/目录枚举 HLE 加速、带前后空闲块合并（Coalescing Free-List）的真实堆分配器、完整快照回滚（CPU + 可写内存 + 堆元数据 + JNI 引用表）与防反调试。
 - **📱 统一设备画像与双模式时钟（`DeviceProfile`）**：内置 `pixel5` / `pixel8pro` / `s24ultra` / `xiaomi14` 真机画像与任意字段覆盖，一处配置自动联动 **30+ 系统属性**、`/proc/cpuinfo`、`/proc/meminfo`、`/proc/version`、`/sys/devices/system/cpu/online` 与 `uname`；支持确定性虚拟时钟与宿主机实时时钟（`realClock`）一键切换。
 - **🧬 JNI 1.6 完整环境**：支持 `JNI_OnLoad`、`RegisterNatives`、容器安全的引用生命周期与 `PushLocalFrame`/`PopLocalFrame`（JS 侧 `emu.jni.withLocalFrame` 自动回收常驻 RPC 临时引用与缓冲）、内置常用 Java 模型（`String` 构造与方法、`Thread.currentThread()`、基础类型装箱 `valueOf` 等）以及可插拔 JS/Rust JNI Hook。
 - **🌍 宿主机 Socket 透传、异步事件原语与虚拟网卡（`emu.net`）**：零额外依赖内置真实 TCP/UDP Socket 透传、`epoll`/`ppoll`/`eventfd2`/`pipe2` 异步事件循环、`getaddrinfo`/`getifaddrs`/`ioctl(SIOCGIF*)` 与 `/proc/net/*` 虚拟网卡画像，支持 QuickJS 抓包与 `onSend`/`onRecv` 实时改包；**运行期默认关闭真实联网（`-EACCES` 离线护栏），支持 `allowHosts` 白名单显式放行**。
@@ -98,16 +103,40 @@ xychart-beta
     bar [0.15, 4.68, 5.14, 17.03]
 ```
 
+### 4. 多执行后端实测对比（`Unicorn` vs `Dynarmic` vs `Hypervisor` / `KVM`）
+
+> [!NOTE]
+> 以下为同一 `runidbg-cli` 在 **Apple Silicon M4**（dev 构建，对比 Unicorn / Dynarmic / Hypervisor.framework）与 **Ubuntu 26.04 Linux 7.0 `aarch64`**（M4 嵌套虚拟化真 `/dev/kvm`）上 100% 比特级一致输出的实测数据：
+
+| 场景 | Unicorn | Dynarmic (JIT) | Hypervisor (macOS M4) | KVM (Linux ARM64 嵌套) | 最高加速比 |
+| --- | ---: | ---: | ---: | ---: | :---: |
+| **ZSTD 256KB lv6 × 20 轮**（重纯算/NEON） | 24,964 ms | 245 ms (`102×`) | **52 ms (`480×`)** | 105 ms (`192×`) | **480×** |
+| **ZSTD 26.4KB lv3 × 100 轮**（轻纯算/高频调用） | 493 ms | **10 ms (`49×`)** | 14 ms (`35×`) | 113 ms (`8.3×`) | **49×** |
+| **TikTok `libmetasec_ov.so` 10× 签名**（重 HLE/JNI） | 398 ms | 76 ms (`5.2×`) | **37 ms (`10.8×`)** | 623 ms（裸机 ~30–40ms） | **10.8×** |
+
+```mermaid
+xychart-beta
+    title "ZSTD 256KB lv6 x20 Speedup vs Unicorn (Higher is Better)"
+    x-axis ["Unicorn", "Dynarmic JIT", "Linux KVM (Nested)", "macOS Hypervisor"]
+    y-axis "Speedup (x)" 0 --> 500
+    bar [1, 102, 192, 480]
+```
+
+> [!TIP]
+> **后端选择建议**：
+> - **逆向分析 / 指令 Trace / GDB 调试 / 原生指令与内存 Hook** → 必须选 **`unicorn`**（其余后端仅限仿真模式，调用 Trace / GDB / 原生 Hook 会立即返回明确错误）。
+> - **高吞吐算法计算 / 批量离线签名 / RPC 生产服务** → 优先选 **`dynarmic`**（无签名限制、支持单进程多 Worker 并发）或硬件虚拟化 **`hypervisor`**（macOS Apple Silicon，需 `com.apple.security.hypervisor` 签名，单进程限 1 VM）/ **`kvm`**（Linux ARM64 `/dev/kvm`，支持单进程多 VM）。
+
 ---
 
 ## ⚖️ 与 Java `unidbg` 全面对比
 
 | 维度 | `runidbg`（本项目） | Java `unidbg` |
 | --- | --- | --- |
-| **运行性能与内存** | ✅ 原生 Rust，冷启动快 **22.6×**、单核热态快 **2.9×**、RPC 内存仅 **1/5.6**（21.7 MB vs 122.1 MB） | ⚠️ JVM + JNI/JNA 跨边界开销，冷启动 ~1.7s，单实例 ~122 MB |
+| **运行性能与内存** | ✅ 原生 Rust + **四执行引擎（Unicorn / Dynarmic / KVM / Hypervisor）**，冷启动快 **22.6×**、纯算硬件加速最高 **480×**、RPC 内存仅 **1/5.6**（21.7 MB vs 122.1 MB） | ⚠️ JVM + JNI/JNA 跨边界开销，冷启动 ~1.7s，单实例 ~122 MB |
 | **指令级 Trace** | ✅ 零拷贝 mmap 二进制双流 + 离线 `bad64` 解码，吞吐高 **31×–114×**，自带 `dump`/`search`/IDA/BN 导出 | ⚠️ 热路径实时 Capstone 文本反汇编落盘，吞吐 ~0.15 M/s，文本体积大 3.7× |
 | **脚本开发体验** | ✅ **零编译 QuickJS** + 完整 `runidbg.d.ts` 智能提示 + Frida 风格 Hook + `EnvDiag` 自动生成补环境 JS | ⚠️ 需配置 Maven/JDK 工程并编写/编译 Java 代码，迭代周期更长 |
-| **工程化与 AI 集成** | ✅ 原生内置多核异步 HTTP/JSON-RPC 2.0、Prometheus `/metrics`、热重载、**MCP 17 工具**、Host Socket 透传与抓包、GDB RSP、APK 加载 | ⚠️ 核心定位为 Java 库，RPC 服务池、监控、AI Agent 接入需自行二次封装 |
+| **工程化与 AI 集成** | ✅ 原生内置多核异步 HTTP/JSON-RPC 2.0、Prometheus `/metrics`、热重载、**MCP 21 工具**、Host Socket 透传与抓包、GDB RSP、APK 加载 | ⚠️ 核心定位为 Java 库，RPC 服务池、监控、AI Agent 接入需自行二次封装 |
 | **平台与架构支持** | ⚠️ **目前仅支持 Android ARM64（`aarch64`）**，暂不支持 ARM32 与 iOS | ✅ **支持 Android ARM32 / ARM64 以及 iOS（Mach-O / ObjC）** |
 | **成熟度与样本生态** | ⚠️ **项目较新**，已验证 Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / 真实 MSSDK 等，但冷门系统库与长尾样本覆盖仍在持续扩充 | ✅ **多年社区沉淀**，公开案例、教程、Android 系统类桩与边缘 syscall 覆盖非常成熟 |
 | **Java 字节码执行** | ⚠️ 无内置 ART/Dalvik 解释器，Java 侧回调依赖内置模型与 JS Hook 补全 | ⚠️ 同样不直接解释执行 DEX 字节码，依赖 `AbstractJni` 补环境 |
@@ -124,31 +153,38 @@ xychart-beta
 ```mermaid
 flowchart TB
     subgraph Entry["接入与协议层 (CLI / Script / Service / Debugger)"]
-        CLI["runidbg-cli\nrun / serve / mcp / debug / trace"]
+        CLI["runidbg-cli\nrun / serve / mcp / debug / trace / ui"]
         RPC["Async RPC Server (tokio + axum)\nKeep-Alive · Batch · /metrics · Hot Reload"]
-        MCP["MCP Server (stdio / HTTP)\n14 Reverse-Engineering Tools"]
-        GDB["GDB RSP Stub (TCP)\nIDA Pro · Binary Ninja · pwndbg"]
+        MCP["MCP Server (stdio / HTTP)\n21 Reverse-Engineering Tools"]
+        GDB["GDB RSP Stub (TCP · 仅 Unicorn)\nIDA Pro · Binary Ninja · pwndbg"]
     end
 
     subgraph ScriptLayer["QuickJS 脚本与多核调度层 (src/script/)"]
         Pool["Worker Pool (async-channel MPMC)\n默认 1 实例 · 支持 --workers auto"]
-        Session["JsSession + bootstrap.js\nrpc.exports · Promise · require() · LogSink"]
-        Bridge["Native Bridge & Hooks\nattach · replace · code · mem · syscall · JNI"]
+        Session["JsSession + bootstrap.js\nEmu.backends() · rpc.exports · Promise · require()"]
+        Bridge["Native Bridge & Hooks\nJNI Hook (全后端) · 原生 Hook (仅 Unicorn)"]
     end
 
     subgraph Facade["高层仿真门面与分析引擎"]
-        Emu["AndroidEmulator\nUnicorn 硬超时 · 指令预算 · 统一调度"]
-        Snap["EmuSnapshot\nCPU + 可写页毫秒级快照回放"]
-        Tracer["BinaryTracer (mmap + bad64)\nfast / reg_delta / full · IDA/BN 导出"]
-        Diag["EnvDiag\n缺失 JNI / VFS / Prop / Syscall 诊断与模板生成"]
+        Emu["AndroidEmulator\n超时/指令预算 · 统一外部 SVC 陷阱循环"]
+        Snap["EmuSnapshot\nCPU + 可写页 + 堆 + JNI 完整快照回放"]
+        Tracer["BinaryTracer (mmap + bad64 · 仅 Unicorn)\nfast / reg_delta / full · Web UI · IDA/BN"]
+        Diag["EnvDiag\n缺失 JNI / VFS / Prop / Syscall / HLE 诊断"]
     end
 
     subgraph Runtime["Android ARM64 运行时底座"]
-        Loader["DynamicLinker + ApkPackage\nELF 重定位 · DT_NEEDED 内存库 · AXML"]
-        HLE["TrampolineTable\nHLE libc / libm 加速跳板"]
-        JNI["JniVm (JNI 1.6)\nObjectTable · va_list · RegisterNatives"]
-        OS["DeviceProfile + VirtualFs + Syscall\n30+ 系统属性 · /proc · uname · SVC · 防反调试"]
-        Core["Unicorn 2.1 ARM64 + MemoryManager (VMA/MMU) + CpuContext"]
+        Loader["DynamicLinker + ApkPackage + DexIndex\nELF / IRELATIVE / dlopen / DT_NEEDED / AXML"]
+        HLE["TrampolineTable\nHLE libc / libm / libz / pthread / AAsset"]
+        JNI["JniVm (JNI 1.6)\nObjectTable · LocalFrame · va_list · RegisterNatives"]
+        OS["DeviceProfile + VirtualFs + Net + Syscall\n30+ SysProps · /proc · Socket/epoll · SVC"]
+        Mem["MemoryManager (VMA/Coalescing Free-List) + CpuContext"]
+    end
+
+    subgraph Backends["统一多执行后端层 (CpuBackend + CpuEngine · src/backend/)"]
+        UC["Unicorn 2.1 (全平台默认)\n仿真 + Trace + GDB + 原生 Hook"]
+        DYN["Dynarmic JIT (跨平台默认 · 仅仿真)\n4GB mmap Arena · ExclusiveMonitor"]
+        KVM["Linux ARM64 KVM (Linux 默认 · 仅仿真)\n/dev/kvm · Stage-1 L1+L2 MMU · EL1 BRK 陷阱"]
+        HVF["macOS Hypervisor.framework (macOS 默认 · 仅仿真)\n16KB IPA · Stage-1 L1+L2 MMU · EL1 HVC 陷阱"]
     end
 
     CLI --> RPC
@@ -168,10 +204,18 @@ flowchart TB
     Emu --> HLE
     Emu --> JNI
     Emu --> OS
-    Loader --> Core
-    HLE --> Core
-    JNI --> Core
-    OS --> Core
+
+    Loader --> Mem
+    HLE --> Mem
+    JNI --> Mem
+    OS --> Mem
+
+    Mem --> UC
+    Mem --> DYN
+    Mem --> KVM
+    Mem --> HVF
+    Tracer -. 仅限 Unicorn .-> UC
+    GDB -. 仅限 Unicorn .-> UC
 ```
 
 <details>
@@ -179,38 +223,47 @@ flowchart TB
 
 ```text
 src/
-├── lib.rs              # 库入口与核心导出
-├── main.rs             # 最小命令行示例入口（直接加载 .so 并执行指定符号）
-├── emulator.rs         # AndroidEmulator / AndroidEmulatorBuilder 门面
-├── cpu.rs              # ARM64 寄存器与调用约定封装
-├── crash.rs            # Guest 崩溃报告捕获（反汇编、寄存器、调用栈与面包屑）
-├── logging.rs          # 结构化日志初始化（compact / json）
-├── diag.rs             # 缺环境自动诊断器与 JS 补环境模板生成
-├── debug/gdbstub.rs    # ARM64 GDB Remote Serial Protocol 远程调试服务端
-├── memory.rs           # VMA 虚拟内存管理与访存辅助
-├── snapshot.rs         # 内存 + 寄存器快照保存与恢复
-├── error.rs            # 统一错误类型
-├── loader/             # ELF 解析、动态链接器、APK 一键加载与 HLE Trampoline
-├── os/                 # 设备画像（DeviceProfile）、SVC 系统调用、VFS 虚拟文件系统、协作调度
-├── jni/                # JNI 1.6 Env、对象表、va_list 解析与 Hook 处理
-├── tracer/             # 高速二进制追踪引擎、记录格式与离线 Reader
-├── script/             # QuickJS 脚本引擎、RPC 与 MCP
-│   ├── mod.rs          # JsSession / JsRunner / RUNIDBG_DTS 门面
-│   ├── bridge.rs       # QuickJS ↔ Rust 原生桥接实现
-│   ├── hooks.rs        # 原生函数/指令/内存/Syscall Hook 与 TB 缓存刷新
-│   ├── jni_bridge.rs   # JS JNI Hook 桥接
-│   ├── bootstrap.js    # JS 运行时封装与 rpc.exports / Promise 调度
-│   ├── runidbg.d.ts    # TypeScript 类型声明
-│   ├── rpc.rs          # 异步 HTTP + JSON-RPC 2.0 + 多 Worker 池 + Metrics + 热重载
-│   └── mcp.rs          # MCP stdio / Streamable HTTP 服务端（14 个逆向工具）
-└── bin/runidbg-cli.rs  # 统一命令行工具（run / serve / mcp / debug / trace 分析）
+├── lib.rs                      # 库入口与核心导出（含 BackendKind / CpuBackend）
+├── main.rs                     # 最小命令行示例入口（直接加载 .so 并执行指定符号）
+├── emulator.rs                 # AndroidEmulator / AndroidEmulatorBuilder 门面与外部 SVC 陷阱循环
+├── backend/                    # 多执行后端统一抽象层
+│   ├── mod.rs                  # CpuBackend / BackendWithData / CpuEngine / 统一 SVC #imm16 编码
+│   ├── dynarmic_backend.rs     # Dynarmic 0.1.3 JIT 后端（4GB mmap Arena + ExclusiveMonitor）
+│   ├── kvm_backend.rs          # Linux ARM64 KVM 后端（零依赖 /dev/kvm ioctl + 局部 mem_unmap）
+│   ├── hypervisor_backend.rs   # macOS Apple Silicon Hypervisor.framework 后端（16KB IPA）
+│   └── vm_common.rs            # ARM64 EL1 向量表、ESR_EL1 解码与 Stage-1 L1+L2 恒等页表
+├── cpu.rs                      # ARM64 寄存器与调用约定封装
+├── crash.rs                    # Guest 崩溃报告捕获（反汇编、寄存器、调用栈与面包屑）
+├── logging.rs                  # 结构化日志初始化（compact / json）
+├── diag.rs                     # 缺环境自动诊断器与 JS 补环境模板生成
+├── debug/gdbstub.rs            # ARM64 GDB Remote Serial Protocol 远程调试服务端（仅 Unicorn）
+├── memory.rs                   # VMA 虚拟内存管理、Coalescing Free-List 堆与访存辅助
+├── snapshot.rs                 # 内存 + 寄存器 + 堆 + JNI 快照保存与恢复
+├── error.rs                    # 统一错误类型
+├── loader/                     # ELF 解析、动态链接器、APK/DEX 加载与 HLE Trampoline
+├── os/                         # DeviceProfile、SVC 系统调用、VFS、Socket/Net 与协作调度
+├── jni/                        # JNI 1.6 Env、对象表、LocalFrame、va_list 与 Hook 处理
+├── tracer/                     # 高速二进制追踪引擎、记录格式与离线 Reader（仅 Unicorn）
+├── ui/                         # 内置暗黑 Trace 分析 Web UI
+├── script/                     # QuickJS 脚本引擎、RPC 与 MCP
+│   ├── mod.rs                  # JsSession / JsRunner / RUNIDBG_DTS 门面
+│   ├── bridge.rs               # QuickJS ↔ Rust 原生桥接实现
+│   ├── hooks.rs                # 原生函数/指令/内存/Syscall Hook 与 TB 缓存刷新
+│   ├── jni_bridge.rs           # JS JNI Hook 桥接
+│   ├── bootstrap.js            # JS 运行时封装与 Emu.backends() / rpc.exports 调度
+│   ├── runidbg.d.ts            # TypeScript 类型声明
+│   ├── rpc.rs                  # 异步 HTTP + JSON-RPC 2.0 + 多 Worker 池 + Metrics + 热重载
+│   └── mcp.rs                  # MCP stdio / Streamable HTTP 服务端（21 个逆向工具）
+└── bin/runidbg-cli.rs          # 统一命令行工具（run / serve / mcp / debug / ui / trace 分析）
+entitlements/
+└── hypervisor.plist            # macOS Hypervisor.framework ad-hoc 签名权限配置
 ```
 
 </details>
 
 ---
 
-## 🧩 Feature 开关
+## 🧩 Feature 开关与按平台默认编译
 
 | Feature | 默认启用 | 说明 |
 | --- | :---: | --- |
@@ -218,8 +271,14 @@ src/
 | `rpc` | ✅ | 异步高并发 HTTP / JSON-RPC 2.0 服务（`tokio`、`axum`、`async-channel`、`serde_json`） |
 | `mcp` | ✅ | MCP stdio / HTTP JSON-RPC 2.0 服务端（`serde_json`） |
 | `apk` | ✅ | APK 一键解析与内存加载（`zip`） |
+| `ui` | ✅ | 内置离线 Trace 暗黑 Web UI（`runidbg-cli ui`） |
+| `dynarmic` | ✅ | 跨平台 Dynarmic ARM64 JIT 加速后端（**仅仿真模式**，编译需 `cmake` + `ninja`） |
+| `kvm` | ✅（Linux 编译） | Linux ARM64 `/dev/kvm` 硬件虚拟化后端（**仅仿真模式**，仅在 Linux 平台参与编译） |
+| `hypervisor` | ✅（macOS 编译） | macOS Apple Silicon `Hypervisor.framework` 硬件虚拟化后端（**仅仿真模式**，仅在 macOS 平台参与编译） |
 
-纯核心库最小构建（不引入 JS / HTTP / ZIP 依赖，仍包含核心仿真、DeviceProfile、Tracer、EnvDiag 与 GDB Stub）：
+- **Linux 默认编译**：`unicorn, dynarmic, kvm`（需系统安装 `cmake ninja-build clang libclang-dev`）
+- **macOS 默认编译**：`unicorn, dynarmic, hypervisor`（本机源码构建后若需使用 `hypervisor`，执行 `codesign --force --sign - --entitlements entitlements/hypervisor.plist target/release/runidbg-cli`；GitHub Release 产物已预签）
+- **纯 Unicorn 最小核心构建**（零 JS / HTTP / ZIP / Dynarmic 依赖，仍包含 Unicorn 仿真、DeviceProfile、Tracer、EnvDiag 与 GDB Stub）：
 
 ```bash
 cargo build --no-default-features
@@ -235,6 +294,7 @@ cargo build --no-default-features
 /// <reference path="./runidbg.d.ts" />
 
 const emu = Emu.create({
+  backend: "unicorn",      // 默认 "unicorn"（支持 Trace/GDB/Hook）；纯仿真加速可选 "dynarmic" | "kvm" | "hypervisor" ("hyper")
   packageName: "com.example.app",
   device: "pixel8pro",     // 内置 pixel5 / pixel8pro / s24ultra / xiaomi14，也支持自定义对象覆盖
   realClock: true,         // 启用宿主机实时时钟（默认确定性虚拟时钟）
@@ -338,7 +398,7 @@ runidbg-cli debug samples/libstatic-webp.so WebPGetDecoderVersion --listen 127.0
 ## 🧪 测试与校验
 
 ```bash
-# 全量测试（39/39 通过，覆盖 Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / TikTok MSSDK / JS / RPC / MCP / GDB / APK / DeviceProfile）
+# 全量测试（73/73 通过，覆盖四引擎一致性 / Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / TikTok MSSDK / JS / RPC / MCP / GDB / APK / DeviceProfile）
 cargo test
 
 # 全 feature 组合 Clippy 零警告校验
@@ -346,6 +406,7 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --no-default-features --all-targets -- -D warnings
 cargo clippy --no-default-features --features js --all-targets -- -D warnings
 cargo clippy --no-default-features --features mcp --all-targets -- -D warnings
+cargo clippy --no-default-features --features dynarmic --all-targets -- -D warnings
 ```
 
 ---
@@ -353,4 +414,4 @@ cargo clippy --no-default-features --features mcp --all-targets -- -D warnings
 ## 🙏 致谢
 
 - 特别致谢 [**unidbg**](https://github.com/zhkl0228/unidbg) 及其作者 **`zhkl0228`**：`runidbg`（`Rust + unidbg`）的命名、Android 沙箱架构与 JNI 桥接思路均深受 `unidbg` 启发。尤其令人由衷佩服的是，在那个还没有 AI 辅助编程、全靠纯手搓代码的年代，独自啃下 Android ARM32/ARM64 与 iOS 仿真并多年持续维护出如此优秀的开源项目，背后需要极其扎实的底层技术功底与罕见的毅力。
-- 同时感谢 [Unicorn Engine](https://github.com/unicorn-engine/unicorn)、[QuickJS](https://bellard.org/quickjs/) / `rquickjs`、`goblin`、`bad64` 等优秀开源项目。
+- 同时感谢 [Unicorn Engine](https://github.com/unicorn-engine/unicorn)、[Dynarmic](https://github.com/merryhime/dynarmic)、[QuickJS](https://bellard.org/quickjs/) / `rquickjs`、`goblin`、`bad64` 等优秀开源项目。

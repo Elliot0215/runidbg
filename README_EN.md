@@ -5,21 +5,21 @@
 
 # ⚡ runidbg (`runidbg-arm64-emu-tracer`)
 
-**`Rust + unidbg = runidbg` · High-Performance Android ARM64 `.so` Emulator, Zero-Copy Binary Tracer & QuickJS Scripting Engine in Pure Rust**  
-Built-in Async Multi-Core RPC Server · MCP AI Reverse-Engineering Loop · GDB RSP Debugger · Unified Device Profile
+**`Rust + unidbg = runidbg` · Multi-Backend High-Performance Android ARM64 `.so` Emulator, Zero-Copy Binary Tracer & QuickJS Engine in Pure Rust**  
+Unicorn / Dynarmic JIT / Linux KVM / macOS Hypervisor.framework · Async Multi-Core RPC · MCP AI Loop · GDB RSP · Unified Device Profile
 
 [简体中文](./README.md) | **English** | [Full Guide](./docs/GUIDE.md) | [AI Agent Skill](./docs/SKILL.md)
 
 ![Rust](https://img.shields.io/badge/Rust-2021-orange?logo=rust)
 ![Target](https://img.shields.io/badge/Target-Android%20ARM64-3DDC84?logo=android&logoColor=white)
-![Engine](https://img.shields.io/badge/Unicorn-2.1-blueviolet)
+![Engines](https://img.shields.io/badge/Backends-Unicorn%20%7C%20Dynarmic%20%7C%20KVM%20%7C%20Hypervisor-blueviolet)
 ![Script](https://img.shields.io/badge/QuickJS-TypeScript%20d.ts-F7DF1E?logo=javascript&logoColor=black)
 ![Protocol](https://img.shields.io/badge/RPC%20%7C%20MCP%20%7C%20GDB%20RSP-ready-0A66C2)
-![Tests](https://img.shields.io/badge/Tests-45%2F45%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-73%2F73%20passing-brightgreen)
 
-| 🚀 Cold Start | 🔥 Full-Module Trace | 💾 Single-Worker RPC RAM | ⚙️ Multi-Core RPC | 📦 Trace Footprint |
+| 🚀 Cold Start | ⚡ HW / JIT Compute | 🔥 Full-Module Trace | 💾 Single-Worker RPC RAM | ⚙️ Multi-Core RPC |
 | :---: | :---: | :---: | :---: | :---: |
-| **77 ms** (`22.6×` vs unidbg) | **17.03 M insns/s** (`114×` vs unidbg) | **21.7 MB** (`82%` less) | **1,141 QPS** (10 cores) | **32 B / insn** (`3.7×` smaller) |
+| **77 ms** (`22.6×` vs unidbg) | **Up to 480×** (Hyper/KVM) / **102×** (Dynarmic) | **17.03 M insns/s** (`114×` vs unidbg) | **21.7 MB** (`82%` less) | **1,141 QPS** (10 cores) |
 
 </div>
 
@@ -38,7 +38,12 @@ When opening an Issue or PR, please redact any private credentials (cookies/toke
 
 ## ✨ Key Features
 
-- **🦀 Pure-Rust Android ARM64 Runtime**: Built on Unicorn 2.1 + `goblin` with full ELF dynamic linking (`.init_array`, `IRELATIVE`, symbol relocations, recursive `DT_NEEDED`, TLS `TPIDR_EL0`), high-level libc/libm HLE acceleration (including real AAPCS64 `vsnprintf`/`__snprintf_chk`/`sscanf`/`asprintf`/`atoll`), a coalescing Free-List guest heap allocator, full snapshot/restore (CPU + writable RAM + heap metadata + JNI tables), and anti-debugging evasion.
+- **⚡ Pluggable 4-Backend ARM64 Execution Engine (`CpuBackend` + `CpuEngine`)**:
+  - **`unicorn` (default, full-featured)**: Powered by Unicorn 2.1 — **the only backend supporting instruction/memory Trace, GDB RSP debugging, and native code/mem/syscall hooks**;
+  - **`dynarmic` (cross-platform JIT, emulation-only)**: Powered by `dynarmic 0.1.3` (zero system Boost dependency, 4GB contiguous Unix `mmap` arena preventing 128-bit NEON cross-page corruption, and `ExclusiveMonitor` for ARM64 atomics), delivering **7×–100×** compute speedups and **1.4×–5×** end-to-end speedups;
+  - **`kvm` (Linux ARM64 hardware virtualization, emulation-only, compiled by default on Linux)**: Zero external crates talking directly to `/dev/kvm` ioctls with Stage-1 L1+L2 identity page tables, ARM64 `dc cvau + ic ivau` I-cache maintenance, and partial `mem_unmap`;
+  - **`hypervisor` / `hyper` (macOS Apple Silicon hardware virtualization, emulation-only, compiled by default on macOS)**: Zero external crates calling `Hypervisor.framework` with 16KB host IPA + 4KB logical guest pages and Stage-1 L1+L2 page tables, up to **480×** faster than Unicorn and **4.7×** faster than Dynarmic on heavy compute.
+- **🦀 Pure-Rust Android ARM64 Runtime**: Built on `goblin` with full ELF dynamic linking (`.init_array`, `R_AARCH64_IRELATIVE`, symbol relocations, recursive `DT_NEEDED`, `dlopen`/`dlsym`/`dladdr`/`dl_iterate_phdr`, TLS `TPIDR_EL0`), libc/libm/libz/AAssetManager/pthread/`setjmp`/`longjmp`/directory HLE acceleration, a coalescing Free-List guest heap allocator, full snapshot/restore (CPU + writable RAM + heap metadata + JNI tables), and anti-debugging evasion.
 - **📱 Unified `DeviceProfile` & Dual-Mode Clock**: Ships with realistic Android presets (`pixel5` / `pixel8pro` / `s24ultra` / `xiaomi14`) plus per-field overrides that automatically synchronize **30+ Android system properties**, `/proc/cpuinfo`, `/proc/meminfo`, `/proc/version`, `/sys/devices/system/cpu/online`, and `uname`. Switch between deterministic virtual time and live host time (`realClock`) in one line.
 - **🧬 Complete JNI 1.6 Environment**: Supports `JNI_OnLoad`, `RegisterNatives`, container-safe local/global reference lifecycles with `PushLocalFrame`/`PopLocalFrame` (plus `emu.jni.withLocalFrame` in JS for leak-free long-lived RPC workers), built-in Java models (`String` constructors & methods, `Thread.currentThread()`, primitive boxing `valueOf`), and pluggable Rust/JS JNI hooks.
 - **🌍 Host Socket Passthrough, Event Loop & Virtual NIC (`emu.net`)**: Zero-dependency real TCP/UDP passthrough, `epoll`/`ppoll`/`eventfd2`/`pipe2` async multiplexing primitives, `getaddrinfo`/`getifaddrs`/`ioctl(SIOCGIF*)`, `/proc/net/*` virtual NIC profile, and QuickJS packet capture + `onSend`/`onRecv` live interception — **offline-safe by default (`-EACCES`) with explicit opt-in & `allowHosts` allowlist**.
@@ -98,16 +103,40 @@ xychart-beta
     bar [0.15, 4.68, 5.14, 17.03]
 ```
 
+### 4. Multi-Backend Benchmark (`Unicorn` vs `Dynarmic` vs `Hypervisor` / `KVM`)
+
+> [!NOTE]
+> Measured with the same `runidbg-cli` (dev build) on **Apple Silicon M4** (Unicorn / Dynarmic / Hypervisor.framework) and **Ubuntu 26.04 Linux 7.0 `aarch64`** (nested virtualization `/dev/kvm` on M4), verifying 100% bit-exact outputs across all backends:
+
+| Workload | Unicorn | Dynarmic (JIT) | Hypervisor (macOS M4) | KVM (Linux ARM64 Nested) | Peak Speedup |
+| --- | ---: | ---: | ---: | ---: | :---: |
+| **ZSTD 256KB lv6 × 20** (heavy compute / NEON) | 24,964 ms | 245 ms (`102×`) | **52 ms (`480×`)** | 105 ms (`192×`) | **480×** |
+| **ZSTD 26.4KB lv3 × 100** (light compute / high call rate) | 493 ms | **10 ms (`49×`)** | 14 ms (`35×`) | 113 ms (`8.3×`) | **49×** |
+| **TikTok `libmetasec_ov.so` 10× Sign** (heavy HLE / JNI) | 398 ms | 76 ms (`5.2×`) | **37 ms (`10.8×`)** | 623 ms (bare-metal ~30–40ms) | **10.8×** |
+
+```mermaid
+xychart-beta
+    title "ZSTD 256KB lv6 x20 Speedup vs Unicorn (Higher is Better)"
+    x-axis ["Unicorn", "Dynarmic JIT", "Linux KVM (Nested)", "macOS Hypervisor"]
+    y-axis "Speedup (x)" 0 --> 500
+    bar [1, 102, 192, 480]
+```
+
+> [!TIP]
+> **Choosing a Backend**:
+> - **Reverse Engineering / Tracing / GDB / Native Code & Mem Hooks** → Use **`unicorn`** (other backends are emulation-only and explicitly reject Trace / GDB / native hooks).
+> - **High-Throughput Compute / Batch Signing / Production RPC** → Use **`dynarmic`** (no signing requirement, unlimited concurrent workers per process) or hardware virtualization via **`hypervisor`** (macOS Apple Silicon, requires `com.apple.security.hypervisor` entitlement, 1 VM/process) or **`kvm`** (Linux ARM64 `/dev/kvm`, multi-VM per process).
+
 ---
 
 ## ⚖️ Honest Comparison with Java `unidbg`
 
 | Dimension | `runidbg` (This Project) | Java `unidbg` |
 | --- | --- | --- |
-| **Performance & Footprint** | ✅ Pure Rust: **22.6×** faster cold start, **2.9×** faster warm calls, **5.6×** lower single-worker RPC RAM (21.7 MB vs 122.1 MB) | ⚠️ JVM + JNI/JNA overhead (~1.7s cold start, ~122 MB per instance) |
+| **Performance & Footprint** | ✅ Pure Rust + **4 execution backends (Unicorn / Dynarmic / KVM / Hypervisor)**: **22.6×** faster cold start, up to **480×** HW compute speedup, **5.6×** lower single-worker RPC RAM (21.7 MB vs 122.1 MB) | ⚠️ JVM + JNI/JNA overhead (~1.7s cold start, ~122 MB per instance) |
 | **Instruction Tracing** | ✅ Zero-copy binary mmap + offline `bad64` decoding: **31×–114×** faster, 3.7× smaller, built-in `dump`/`search`/IDA/BN export | ⚠️ Online Capstone text formatting in hot path (~0.15 M insns/s, ~118 B/insn) |
 | **Scripting Ergonomics** | ✅ **Zero-compile QuickJS** + `runidbg.d.ts` IntelliSense + Frida-style hooks + `EnvDiag` auto-patch generator | ⚠️ Requires JDK/Maven project setup and Java compilation per iteration |
-| **Engineering & AI Integration** | ✅ Built-in async multi-core HTTP/JSON-RPC 2.0, Prometheus `/metrics`, hot reload, **17-tool MCP server**, Host Socket passthrough & packet capture, GDB RSP, APK loader | ⚠️ Primarily a Java library; RPC pooling, metrics, and AI agent integration require custom wrappers |
+| **Engineering & AI Integration** | ✅ Built-in async multi-core HTTP/JSON-RPC 2.0, Prometheus `/metrics`, hot reload, **21-tool MCP server**, Host Socket passthrough & packet capture, GDB RSP, APK loader | ⚠️ Primarily a Java library; RPC pooling, metrics, and AI agent integration require custom wrappers |
 | **Platform & Arch Support** | ⚠️ **Android ARM64 (`aarch64`) only** — no ARM32 or iOS support yet | ✅ **Supports Android ARM32 / ARM64 and iOS (Mach-O / ObjC)** |
 | **Maturity & Sample Ecosystem** | ⚠️ **Newer project** — verified on Cronet, Conscrypt, MMKV, SQLite, WebP, Zstd, and real MSSDK, but long-tail Android framework stubs & edge syscalls are still growing | ✅ **Years of community battle-testing** with extensive public examples, tutorials, and edge-case stubs |
 | **Java Bytecode Execution** | ⚠️ No built-in ART/Dalvik bytecode interpreter; Java callbacks rely on built-in models + JS hooks | ⚠️ Same — relies on `AbstractJni` stubs rather than executing DEX bytecode |
@@ -124,31 +153,38 @@ xychart-beta
 ```mermaid
 flowchart TB
     subgraph Entry["Entry & Protocol Layer (CLI / Script / Service / Debugger)"]
-        CLI["runidbg-cli\nrun / serve / mcp / debug / trace"]
+        CLI["runidbg-cli\nrun / serve / mcp / debug / trace / ui"]
         RPC["Async RPC Server (tokio + axum)\nKeep-Alive · Batch · /metrics · Hot Reload"]
-        MCP["MCP Server (stdio / HTTP)\n14 Reverse-Engineering Tools"]
-        GDB["GDB RSP Stub (TCP)\nIDA Pro · Binary Ninja · pwndbg"]
+        MCP["MCP Server (stdio / HTTP)\n21 Reverse-Engineering Tools"]
+        GDB["GDB RSP Stub (TCP · Unicorn Only)\nIDA Pro · Binary Ninja · pwndbg"]
     end
 
     subgraph ScriptLayer["QuickJS & Multi-Core Worker Layer (src/script/)"]
         Pool["Worker Pool (async-channel MPMC)\nDefault 1 worker · --workers auto"]
-        Session["JsSession + bootstrap.js\nrpc.exports · Promise · require() · LogSink"]
-        Bridge["Native Bridge & Hooks\nattach · replace · code · mem · syscall · JNI"]
+        Session["JsSession + bootstrap.js\nEmu.backends() · rpc.exports · Promise · require()"]
+        Bridge["Native Bridge & Hooks\nJNI Hook (All Backends) · Native Hook (Unicorn Only)"]
     end
 
     subgraph Facade["High-Level Facade & Analysis Engines"]
-        Emu["AndroidEmulator\nHard Timeout · Instruction Budget · Unified Dispatch"]
-        Snap["EmuSnapshot\nMillisecond CPU + Writable-Page Snapshot Replay"]
-        Tracer["BinaryTracer (mmap + bad64)\nfast / reg_delta / full · IDA/BN Export"]
-        Diag["EnvDiag\nMissing JNI / VFS / Prop / Syscall Diagnosis & Patch Gen"]
+        Emu["AndroidEmulator\nTimeout/Insn Budget · Unified External SVC Trap Loop"]
+        Snap["EmuSnapshot\nCPU + Writable Pages + Heap + JNI Snapshot Replay"]
+        Tracer["BinaryTracer (mmap + bad64 · Unicorn Only)\nfast / reg_delta / full · Web UI · IDA/BN Export"]
+        Diag["EnvDiag\nMissing JNI / VFS / Prop / Syscall / HLE Diagnosis"]
     end
 
     subgraph Runtime["Android ARM64 Runtime Core"]
-        Loader["DynamicLinker + ApkPackage\nELF Relocations · DT_NEEDED · AXML"]
-        HLE["TrampolineTable\nHLE libc / libm Acceleration"]
-        JNI["JniVm (JNI 1.6)\nObjectTable · va_list · RegisterNatives"]
-        OS["DeviceProfile + VirtualFs + Syscall\n30+ SysProps · /proc · uname · SVC · Anti-Debug"]
-        Core["Unicorn 2.1 ARM64 + MemoryManager (VMA/MMU) + CpuContext"]
+        Loader["DynamicLinker + ApkPackage + DexIndex\nELF / IRELATIVE / dlopen / DT_NEEDED / AXML"]
+        HLE["TrampolineTable\nHLE libc / libm / libz / pthread / AAsset"]
+        JNI["JniVm (JNI 1.6)\nObjectTable · LocalFrame · va_list · RegisterNatives"]
+        OS["DeviceProfile + VirtualFs + Net + Syscall\n30+ SysProps · /proc · Socket/epoll · SVC"]
+        Mem["MemoryManager (VMA/Coalescing Free-List) + CpuContext"]
+    end
+
+    subgraph Backends["Unified Multi-Backend Layer (CpuBackend + CpuEngine · src/backend/)"]
+        UC["Unicorn 2.1 (Default on All OS)\nEmulation + Trace + GDB + Native Hooks"]
+        DYN["Dynarmic JIT (Cross-Platform Default · Emulation Only)\n4GB mmap Arena · ExclusiveMonitor"]
+        KVM["Linux ARM64 KVM (Linux Default · Emulation Only)\n/dev/kvm · Stage-1 L1+L2 MMU · EL1 BRK Trap"]
+        HVF["macOS Hypervisor.framework (macOS Default · Emulation Only)\n16KB IPA · Stage-1 L1+L2 MMU · EL1 HVC Trap"]
     end
 
     CLI --> RPC
@@ -168,15 +204,23 @@ flowchart TB
     Emu --> HLE
     Emu --> JNI
     Emu --> OS
-    Loader --> Core
-    HLE --> Core
-    JNI --> Core
-    OS --> Core
+
+    Loader --> Mem
+    HLE --> Mem
+    JNI --> Mem
+    OS --> Mem
+
+    Mem --> UC
+    Mem --> DYN
+    Mem --> KVM
+    Mem --> HVF
+    Tracer -. Unicorn Only .-> UC
+    GDB -. Unicorn Only .-> UC
 ```
 
 ---
 
-## 🧩 Feature Flags
+## 🧩 Feature Flags & Platform Defaults
 
 | Feature | Default | Description |
 | --- | :---: | --- |
@@ -184,8 +228,14 @@ flowchart TB
 | `rpc` | ✅ | Async multi-core HTTP / JSON-RPC 2.0 server (`tokio`, `axum`, `async-channel`, `serde_json`) |
 | `mcp` | ✅ | MCP stdio / HTTP JSON-RPC 2.0 server (`serde_json`) |
 | `apk` | ✅ | In-memory APK parser & `.so` loader (`zip`) |
+| `ui` | ✅ | Embedded offline Trace dark-mode Web UI (`runidbg-cli ui`) |
+| `dynarmic` | ✅ | Cross-platform Dynarmic ARM64 JIT backend (**emulation-only**, requires `cmake` + `ninja`) |
+| `kvm` | ✅ (Linux) | Linux ARM64 `/dev/kvm` hardware virtualization backend (**emulation-only**, compiled on Linux only) |
+| `hypervisor` | ✅ (macOS) | macOS Apple Silicon `Hypervisor.framework` backend (**emulation-only**, compiled on macOS only) |
 
-Minimal core-only build (no JS / HTTP / ZIP dependencies; still includes emulation, `DeviceProfile`, Tracer, `EnvDiag`, and GDB Stub):
+- **Linux default build**: `unicorn, dynarmic, kvm` (install `cmake ninja-build clang libclang-dev`)
+- **macOS default build**: `unicorn, dynarmic, hypervisor` (for local builds, sign with `codesign --force --sign - --entitlements entitlements/hypervisor.plist target/release/runidbg-cli`; GitHub Release binaries are pre-signed)
+- **Minimal Unicorn-only core build** (no JS / HTTP / ZIP / Dynarmic dependencies; still includes emulation, `DeviceProfile`, Tracer, `EnvDiag`, and GDB Stub):
 
 ```bash
 cargo build --no-default-features
@@ -254,7 +304,7 @@ runidbg-cli debug samples/libstatic-webp.so WebPGetDecoderVersion --listen 127.0
 ## 🧪 Testing & Verification
 
 ```bash
-# Full test suite (39/39 passing: Cronet, Conscrypt, MMKV, SQLite, WebP, Zstd, TikTok MSSDK, JS, RPC, MCP, GDB, APK, DeviceProfile)
+# Full test suite (73/73 passing: 4-backend parity, Cronet, Conscrypt, MMKV, SQLite, WebP, Zstd, TikTok MSSDK, JS, RPC, MCP, GDB, APK, DeviceProfile)
 cargo test
 
 # Zero-warning Clippy across all feature combinations
@@ -262,6 +312,7 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --no-default-features --all-targets -- -D warnings
 cargo clippy --no-default-features --features js --all-targets -- -D warnings
 cargo clippy --no-default-features --features mcp --all-targets -- -D warnings
+cargo clippy --no-default-features --features dynarmic --all-targets -- -D warnings
 ```
 
 ---
@@ -269,4 +320,4 @@ cargo clippy --no-default-features --features mcp --all-targets -- -D warnings
 ## 🙏 Acknowledgements
 
 - Special thanks to [**unidbg**](https://github.com/zhkl0228/unidbg) and its author **`zhkl0228`**: the name `runidbg` (`Rust + unidbg`), Android sandbox architecture, and JNI bridging model are deeply inspired by `unidbg`. Building and continuously maintaining such a comprehensive Android ARM32/ARM64 and iOS emulator entirely by hand in the pre-AI era reflects extraordinary low-level engineering mastery and remarkable perseverance.
-- Thanks as well to [Unicorn Engine](https://github.com/unicorn-engine/unicorn), [QuickJS](https://bellard.org/quickjs/) / `rquickjs`, `goblin`, and `bad64`.
+- Thanks as well to [Unicorn Engine](https://github.com/unicorn-engine/unicorn), [Dynarmic](https://github.com/merryhime/dynarmic), [QuickJS](https://bellard.org/quickjs/) / `rquickjs`, `goblin`, and `bad64`.
