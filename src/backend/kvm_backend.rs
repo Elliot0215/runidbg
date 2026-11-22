@@ -20,8 +20,9 @@ mod imp {
     use unicorn_engine::RegisterARM64;
 
     use crate::backend::vm_common::{
-        build_el1_vector_table, decode_esr_el1, EsrException, CPACR_EL1_FPEN_ALL,
-        KVM_BRK_TRAP_INSN, PSTATE_EL0T, SCTLR_EL1_FLAT, VBAR_EL1_ADDR,
+        build_el1_vector_table, build_identity_page_tables, decode_esr_el1, EsrException,
+        CPACR_EL1_FPEN_ALL, KVM_BRK_TRAP_INSN, MAIR_EL1_DEFAULT, PSTATE_EL0T, SCTLR_EL1_MMU_ON,
+        TCR_EL1_4KB_39BIT, TTBR0_PAGE_ADDR, TTBR0_TABLES_SIZE, VBAR_EL1_ADDR,
     };
     use crate::backend::{
         BackendKind, CpuBackend, CpuContextBlob, GenericCpuContext, RunStopReason,
@@ -94,10 +95,13 @@ mod imp {
 
     const SYS_SCTLR_EL1: u64 = sys_reg(3, 0, 1, 0, 0);
     const SYS_CPACR_EL1: u64 = sys_reg(3, 0, 1, 0, 2);
+    const SYS_TTBR0_EL1: u64 = sys_reg(3, 0, 2, 0, 0);
+    const SYS_TCR_EL1: u64 = sys_reg(3, 0, 2, 0, 2);
     const SYS_SPSR_EL1: u64 = sys_reg(3, 0, 4, 0, 0);
     const SYS_ELR_EL1: u64 = sys_reg(3, 0, 4, 0, 1);
     const SYS_ESR_EL1: u64 = sys_reg(3, 0, 5, 2, 0);
     const SYS_FAR_EL1: u64 = sys_reg(3, 0, 6, 0, 0);
+    const SYS_MAIR_EL1: u64 = sys_reg(3, 0, 10, 2, 0);
     const SYS_VBAR_EL1: u64 = sys_reg(3, 0, 12, 0, 0);
     const SYS_TPIDR_EL0: u64 = sys_reg(3, 3, 13, 0, 2);
     const SYS_SP_EL1: u64 = sys_reg(3, 4, 4, 1, 0);
@@ -266,14 +270,22 @@ mod imp {
                 stop_requested: false,
             };
 
-            // 映射 EL1 异常向量表（填充 BRK #0x1337，使 EL0 SVC/Abort 经 EL1 向量表退回宿主）
+            // 1. 映射 Stage-1 L1+L2 恒等页表（512GB Normal Cacheable WBWA，仅前 2MB 只读保 VBAR_EL1）
+            cpu.mem_map(TTBR0_PAGE_ADDR, TTBR0_TABLES_SIZE as u64, Prot::READ | Prot::WRITE)?;
+            let page_tables = build_identity_page_tables();
+            cpu.mem_write(TTBR0_PAGE_ADDR, &page_tables)?;
+
+            // 2. 映射 EL1 异常向量表（填充 BRK #0x1337，使 EL0 SVC/Abort 经 EL1 向量表退回宿主）
             cpu.mem_map(VBAR_EL1_ADDR, PAGE_SIZE, Prot::READ | Prot::EXEC)?;
             let vec_table = build_el1_vector_table(KVM_BRK_TRAP_INSN);
             cpu.mem_write(VBAR_EL1_ADDR, &vec_table)?;
 
             cpu.set_one_reg_u64(SYS_VBAR_EL1, VBAR_EL1_ADDR)?;
             cpu.set_one_reg_u64(SYS_CPACR_EL1, CPACR_EL1_FPEN_ALL)?;
-            cpu.set_one_reg_u64(SYS_SCTLR_EL1, SCTLR_EL1_FLAT)?;
+            cpu.set_one_reg_u64(SYS_MAIR_EL1, MAIR_EL1_DEFAULT)?;
+            cpu.set_one_reg_u64(SYS_TCR_EL1, TCR_EL1_4KB_39BIT)?;
+            cpu.set_one_reg_u64(SYS_TTBR0_EL1, TTBR0_PAGE_ADDR)?;
+            cpu.set_one_reg_u64(SYS_SCTLR_EL1, SCTLR_EL1_MMU_ON)?;
             cpu.set_one_reg_u64(SYS_SP_EL1, VBAR_EL1_ADDR + PAGE_SIZE)?;
             cpu.set_one_reg_u64(REG_PSTATE, PSTATE_EL0T)?;
 

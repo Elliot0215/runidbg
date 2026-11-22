@@ -8,6 +8,12 @@ pub const VBAR_EL1_ADDR: u64 = 0x0000_8000;
 /// 恒等映射一级页表地址（16KB 对齐，满足 Hypervisor.framework IPA 16KB 对齐约束）
 pub const TTBR0_PAGE_ADDR: u64 = 0x0000_4000;
 
+/// 恒等映射二级页表地址（紧跟 L1 之后，用于细化 `0..1GB` 区域权限，与 L1 共占同一 16KB 宿主页）
+pub const TTBR0_L2_PAGE_ADDR: u64 = 0x0000_5000;
+
+/// 恒等映射页表总字节数（4KB L1 + 4KB L2）
+pub const TTBR0_TABLES_SIZE: usize = 8192;
+
 /// KVM 使用的 EL1 向量入口陷阱指令：`BRK #0x1337`（触发 `KVM_EXIT_DEBUG`）
 pub const KVM_BRK_TRAP_INSN: u32 = 0xD422_66E0;
 
@@ -20,12 +26,18 @@ pub const CPACR_EL1_FPEN_ALL: u64 = 0x3 << 20;
 /// `MAIR_EL1`: Attr0 = Normal Write-Back Read/Write Allocate (`0xFF`), Attr1 = Device-nGnRnE (`0x00`)
 pub const MAIR_EL1_DEFAULT: u64 = 0x0000_0000_0000_00FF;
 
+/// `TCR_EL1`: T0SZ=25 (39-bit VA，从 L1 直接起查，单张 4KB 页即可恒等映射 512GB),
+/// TG0=4KB, SH0=Inner Shareable, ORGN0/IRGN0=WBWA, EPD1=1 (禁用 TTBR1), IPS=40-bit
+pub const TCR_EL1_4KB_39BIT: u64 =
+    25u64 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12) | (1 << 23) | (0b010 << 32);
+
 /// `TCR_EL1`: T0SZ=16 (48-bit VA), TG0=0b00 (4KB granule), SH0=Inner Shareable, ORGN0/IRGN0=WBWA, IPS=40-bit
 pub const TCR_EL1_4KB_48BIT: u64 =
     16u64 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12) | (0b010 << 32);
 
-/// `SCTLR_EL1`: 开启 MMU (M=1)、数据缓存 (C=1)、指令缓存 (I=1)，关闭对齐强制陷阱 (A=0, SA=0)
-pub const SCTLR_EL1_MMU_ON: u64 = (1 << 0) | (1 << 2) | (1 << 12);
+/// `SCTLR_EL1`: 开启 MMU (M=1)、数据缓存 (C=1)、指令缓存 (I=1)，关闭对齐强制陷阱 (A=0, SA=0, SA0=0)，
+/// 保留 RES1 位以符合 ARMv8-A 规范
+pub const SCTLR_EL1_MMU_ON: u64 = 0x00C5_0838 | (1 << 0) | (1 << 2) | (1 << 12);
 
 /// `SCTLR_EL1`（无 MMU / 恒等 IPA 直通模式）：允许未对齐访存，M=0
 pub const SCTLR_EL1_FLAT: u64 = 0x00C5_0838;
@@ -98,6 +110,38 @@ pub fn decode_esr_el1(esr: u64) -> EsrException {
     }
 }
 
+/// 构造 8KB（4KB L1 + 4KB L2）恒等映射页表，映射 512GB Normal WBWA 可缓存内存：
+/// - `L1[0]` 指向 `TTBR0_L2_PAGE_ADDR`（512 × 2MB Block 细化 `0..1GB`）：
+///   - `L2[0]` (`0x0000_0000..0x0020_0000`，含 `TTBR0=0x4000` 与 `VBAR_EL1=0x8000`) 使用 `AP=0b11`（EL0/EL1 只读可执行），
+///     满足 ARMv8 铁律「EL0 可写页隐含 PXN=1，不可在 EL1 执行」，保证 EL1 异常向量表正常取指；
+///   - `L2[1..512]` (`0x0020_0000..0x4000_0000`，覆盖 `0x1000_0000` 跳板与 `0x2000_0000` 系统共享库如 `libc++_shared.so`) 使用 `AP=0b01`（EL0 RWX）；
+/// - `L1[1..512]` (`0x4000_0000..512GB`，覆盖用户 `.so`/Heap/TLS/Stack/RET_MAGIC) 使用 `AP=0b01`（EL0 RWX），
+///   启用硬件 L1/L2/L3 缓存并允许任意未对齐访存（如 `STP Q0, Q0`）。
+pub fn build_identity_page_tables() -> [u8; TTBR0_TABLES_SIZE] {
+    let mut tables = [0u8; TTBR0_TABLES_SIZE];
+    // L1[0] -> L2 Table at TTBR0_L2_PAGE_ADDR
+    let l1_0 = pte_table_desc(TTBR0_L2_PAGE_ADDR);
+    tables[0..8].copy_from_slice(&l1_0.to_le_bytes());
+    // L1[1..512] -> 1GB RWX Normal WBWA blocks (1GB..512GB)
+    for i in 1..512u64 {
+        let desc = pte_block_1gb_desc(i << 30);
+        let off = (i as usize) * 8;
+        tables[off..off + 8].copy_from_slice(&desc.to_le_bytes());
+    }
+
+    // L2[0]: 0..2MB, Normal WBWA, AP=0b11 (EL0/EL1 RO+RX, PXN=0, UXN=0)
+    let l2_base = 4096usize;
+    let l2_0 = (1u64 << 10) | (0b11 << 8) | (0b11 << 6) | 0b01;
+    tables[l2_base..l2_base + 8].copy_from_slice(&l2_0.to_le_bytes());
+    // L2[1..512]: 2MB..1GB, Normal WBWA, AP=0b01 (EL0 RWX)
+    for i in 1..512u64 {
+        let desc = pte_block_2mb_desc(i << 21);
+        let off = l2_base + (i as usize) * 8;
+        tables[off..off + 8].copy_from_slice(&desc.to_le_bytes());
+    }
+    tables
+}
+
 /// 编码 ARMv8 4KB 粒度页表目录项（Table Descriptor，用于 L0/L1/L2）
 #[inline]
 pub const fn pte_table_desc(next_table_pa: u64) -> u64 {
@@ -109,6 +153,13 @@ pub const fn pte_table_desc(next_table_pa: u64) -> u64 {
 pub const fn pte_block_1gb_desc(pa_1gb_aligned: u64) -> u64 {
     // Valid=1, Type=0(Block) -> 0b01; AF=bit 10; SH=Inner(0b11)<<8; AP=EL0/EL1 RW(0b01)<<6; AttrIdx=0
     (pa_1gb_aligned & 0x0000_FFFF_C000_0000) | (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01
+}
+
+/// 编码 ARMv8 4KB 粒度 L2 2MB 恒等块映射项（Block Descriptor，Normal RWX，EL0/EL1 可访）
+#[inline]
+pub const fn pte_block_2mb_desc(pa_2mb_aligned: u64) -> u64 {
+    // Valid=1, Type=0(Block) -> 0b01; AF=bit 10; SH=Inner(0b11)<<8; AP=EL0/EL1 RW(0b01)<<6; AttrIdx=0
+    (pa_2mb_aligned & 0x0000_FFFF_FFE0_0000) | (1 << 10) | (0b11 << 8) | (0b01 << 6) | 0b01
 }
 
 /// 编码 ARMv8 4KB 粒度 L3 页映射项（Page Descriptor，按权限控制 AP/UXN/PXN）
@@ -197,5 +248,24 @@ mod tests {
         let rw = pte_page_4kb_desc(0x5000_0000, true, false);
         assert_ne!(rw & (1 << 54), 0); // UXN set
         assert_eq!((rw >> 6) & 0b11, 0b01); // RW
+
+        let tables = build_identity_page_tables();
+        assert_eq!(tables.len(), TTBR0_TABLES_SIZE);
+        // L1[0] points to L2 table at TTBR0_L2_PAGE_ADDR
+        let l1_0 = u64::from_le_bytes(tables[0..8].try_into().unwrap());
+        assert_eq!(l1_0, pte_table_desc(TTBR0_L2_PAGE_ADDR));
+        // L1[1] maps 1GB..2GB as EL0 RWX (AP=0b01)
+        let l1_1 = u64::from_le_bytes(tables[8..16].try_into().unwrap());
+        assert_eq!(l1_1 & 0b11, 0b01);
+        assert_eq!((l1_1 >> 6) & 0b11, 0b01);
+        // L2[0] maps 0..2MB as EL0/EL1 RO+RX (AP=0b11) so VBAR_EL1=0x8000 is executable in EL1
+        let l2_0 = u64::from_le_bytes(tables[4096..4104].try_into().unwrap());
+        assert_eq!(l2_0 & 0b11, 0b01);
+        assert_eq!((l2_0 >> 6) & 0b11, 0b11);
+        // L2[256] maps 0x2000_0000..0x2020_0000 as EL0 RWX (AP=0b01) for shared libs
+        let off = 4096 + 256 * 8;
+        let l2_256 = u64::from_le_bytes(tables[off..off + 8].try_into().unwrap());
+        assert_eq!(l2_256 & 0x0000_FFFF_FFE0_0000, 0x2000_0000);
+        assert_eq!((l2_256 >> 6) & 0b11, 0b01);
     }
 }

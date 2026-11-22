@@ -26,8 +26,9 @@ mod imp {
     use unicorn_engine::RegisterARM64;
 
     use crate::backend::vm_common::{
-        build_el1_vector_table, decode_esr_el1, EsrException, CPACR_EL1_FPEN_ALL,
-        HVF_HVC_TRAP_INSN, PSTATE_EL0T, SCTLR_EL1_FLAT, VBAR_EL1_ADDR,
+        build_el1_vector_table, build_identity_page_tables, decode_esr_el1, EsrException,
+        CPACR_EL1_FPEN_ALL, HVF_HVC_TRAP_INSN, MAIR_EL1_DEFAULT, PSTATE_EL0T, SCTLR_EL1_MMU_ON,
+        TCR_EL1_4KB_39BIT, TTBR0_PAGE_ADDR, TTBR0_TABLES_SIZE, VBAR_EL1_ADDR,
     };
     use crate::backend::{
         BackendKind, CpuBackend, CpuContextBlob, GenericCpuContext, RunStopReason,
@@ -54,11 +55,14 @@ mod imp {
 
     const HV_SYS_REG_SCTLR_EL1: u16 = 0xC080;
     const HV_SYS_REG_CPACR_EL1: u16 = 0xC082;
+    const HV_SYS_REG_TTBR0_EL1: u16 = 0xC100;
+    const HV_SYS_REG_TCR_EL1: u16 = 0xC102;
     const HV_SYS_REG_SPSR_EL1: u16 = 0xC200;
     const HV_SYS_REG_ELR_EL1: u16 = 0xC201;
     const HV_SYS_REG_SP_EL0: u16 = 0xC208;
     const HV_SYS_REG_ESR_EL1: u16 = 0xC290;
     const HV_SYS_REG_FAR_EL1: u16 = 0xC300;
+    const HV_SYS_REG_MAIR_EL1: u16 = 0xC510;
     const HV_SYS_REG_VBAR_EL1: u16 = 0xC600;
     const HV_SYS_REG_TPIDR_EL0: u16 = 0xDE82;
     const HV_SYS_REG_SP_EL1: u16 = 0xE208;
@@ -164,14 +168,22 @@ mod imp {
                 stop_requested: false,
             };
 
-            // 映射 EL1 异常向量表（填充 HVC #0 触发 HV_EXIT_REASON_EXCEPTION）
+            // 1. 映射 16KB 对齐的 Stage-1 L1+L2 恒等页表（512GB Normal Cacheable WBWA，仅前 2MB 只读保 VBAR_EL1）
+            cpu.mem_map(TTBR0_PAGE_ADDR, TTBR0_TABLES_SIZE as u64, Prot::READ | Prot::WRITE)?;
+            let page_tables = build_identity_page_tables();
+            cpu.mem_write(TTBR0_PAGE_ADDR, &page_tables)?;
+
+            // 2. 映射 EL1 异常向量表（填充 HVC #0 触发 HV_EXIT_REASON_EXCEPTION）
             cpu.mem_map(VBAR_EL1_ADDR, PAGE_SIZE, Prot::READ | Prot::EXEC)?;
             let vec_table = build_el1_vector_table(HVF_HVC_TRAP_INSN);
             cpu.mem_write(VBAR_EL1_ADDR, &vec_table)?;
 
             cpu.set_sys_reg(HV_SYS_REG_VBAR_EL1, VBAR_EL1_ADDR)?;
             cpu.set_sys_reg(HV_SYS_REG_CPACR_EL1, CPACR_EL1_FPEN_ALL)?;
-            cpu.set_sys_reg(HV_SYS_REG_SCTLR_EL1, SCTLR_EL1_FLAT)?;
+            cpu.set_sys_reg(HV_SYS_REG_MAIR_EL1, MAIR_EL1_DEFAULT)?;
+            cpu.set_sys_reg(HV_SYS_REG_TCR_EL1, TCR_EL1_4KB_39BIT)?;
+            cpu.set_sys_reg(HV_SYS_REG_TTBR0_EL1, TTBR0_PAGE_ADDR)?;
+            cpu.set_sys_reg(HV_SYS_REG_SCTLR_EL1, SCTLR_EL1_MMU_ON)?;
             cpu.set_sys_reg(HV_SYS_REG_SP_EL1, VBAR_EL1_ADDR + PAGE_SIZE)?;
             cpu.set_reg(HV_REG_CPSR, PSTATE_EL0T)?;
 
