@@ -13,7 +13,9 @@ use crate::error::{EmuError, EmuResult};
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 mod imp {
     use std::collections::BTreeMap;
-    use std::ffi::{c_char, c_int, c_ulong, c_void};
+    use std::ffi::{c_int, c_ulong, c_void};
+    use std::fs::OpenOptions;
+    use std::os::fd::IntoRawFd;
     use std::ptr;
 
     use unicorn_engine::unicorn_const::Prot;
@@ -30,8 +32,6 @@ mod imp {
     use crate::error::{EmuError, EmuResult};
     use crate::memory::{align_down, align_up, PAGE_SIZE};
 
-    const O_RDWR: c_int = 2;
-    const O_CLOEXEC: c_int = 0o2000000;
     const PROT_READ: c_int = 0x1;
     const PROT_WRITE: c_int = 0x2;
     const MAP_SHARED: c_int = 0x01;
@@ -135,7 +135,6 @@ mod imp {
     }
 
     unsafe extern "C" {
-        fn open(path: *const c_char, oflag: c_int) -> c_int;
         fn close(fd: c_int) -> c_int;
         fn ioctl(fd: c_int, request: c_ulong, ...) -> c_int;
         fn mmap(
@@ -169,13 +168,16 @@ mod imp {
 
     impl KvmCpu {
         pub fn new() -> EmuResult<Self> {
-            let kvm_fd = unsafe { open(c"/dev/kvm".as_ptr(), O_RDWR | O_CLOEXEC) };
-            if kvm_fd < 0 {
-                return Err(EmuError::Backend(
-                    "无法打开 /dev/kvm（请确认内核启用 KVM 且当前用户具备 /dev/kvm 权限）"
-                        .to_string(),
-                ));
-            }
+            let kvm_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/kvm")
+                .map_err(|e| {
+                    EmuError::Backend(format!(
+                        "无法打开 /dev/kvm（请确认内核启用 KVM 且当前用户具备 /dev/kvm 权限）: {e}"
+                    ))
+                })?;
+            let kvm_fd: c_int = kvm_file.into_raw_fd();
             let vm_fd = unsafe { ioctl(kvm_fd, KVM_CREATE_VM, 0 as c_ulong) };
             if vm_fd < 0 {
                 unsafe { close(kvm_fd) };
@@ -445,7 +447,7 @@ mod imp {
 
     impl Drop for KvmCpu {
         fn drop(&mut self) {
-            for (_, slot) in self.slots.iter() {
+            for slot in self.slots.values() {
                 unsafe {
                     munmap(slot.host_ptr.cast(), slot.size as usize);
                 }
