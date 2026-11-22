@@ -8,11 +8,18 @@ use std::time::Instant;
 use runidbg_arm64_emu_tracer::backend::BackendKind;
 #[cfg(feature = "dynarmic")]
 use runidbg_arm64_emu_tracer::backend::BackendWithData;
-#[cfg(any(feature = "dynarmic", feature = "hypervisor"))]
+#[cfg(any(
+    feature = "dynarmic",
+    all(feature = "kvm", target_os = "linux", target_arch = "aarch64"),
+    all(feature = "hypervisor", target_os = "macos", target_arch = "aarch64")
+))]
 use runidbg_arm64_emu_tracer::backend::CpuBackend;
 #[cfg(feature = "dynarmic")]
 use runidbg_arm64_emu_tracer::cpu::RET_MAGIC_ADDR;
-#[cfg(feature = "dynarmic")]
+#[cfg(any(
+    feature = "dynarmic",
+    all(feature = "kvm", target_os = "linux", target_arch = "aarch64")
+))]
 use runidbg_arm64_emu_tracer::debug::GdbServer;
 #[cfg(any(feature = "dynarmic", feature = "kvm", feature = "hypervisor"))]
 use runidbg_arm64_emu_tracer::error::EmuError;
@@ -26,7 +33,11 @@ use runidbg_arm64_emu_tracer::memory::{read_guest_cstr, MemoryManager};
 use runidbg_arm64_emu_tracer::tracer::TraceLevel;
 #[cfg(any(feature = "dynarmic", feature = "kvm", feature = "hypervisor"))]
 use runidbg_arm64_emu_tracer::AndroidEmulator;
-#[cfg(any(feature = "dynarmic", feature = "hypervisor"))]
+#[cfg(any(
+    feature = "dynarmic",
+    all(feature = "kvm", target_os = "linux", target_arch = "aarch64"),
+    all(feature = "hypervisor", target_os = "macos", target_arch = "aarch64")
+))]
 use unicorn_engine::unicorn_const::Prot;
 
 #[cfg(feature = "dynarmic")]
@@ -651,6 +662,37 @@ fn kvm_and_hypervisor_platform_guards_and_capabilities() {
             .backend(BackendKind::Kvm)
             .build();
         assert!(matches!(res, Err(EmuError::Backend(_))));
+    }
+
+    // Linux aarch64 宿主机请求 KVM：若 /dev/kvm 可用则直接实跑 ARM64 指令与 Unicorn-only 守卫，否则应返回清晰的 /dev/kvm 错误
+    #[cfg(all(feature = "kvm", target_os = "linux", target_arch = "aarch64"))]
+    {
+        match AndroidEmulator::builder().backend(BackendKind::Kvm).build() {
+            Ok(mut emu) => {
+                let code_base = 0x4800_0000u64;
+                emu.cpu_mut()
+                    .mem_map(code_base, 0x4000, Prot::READ | Prot::WRITE | Prot::EXEC)
+                    .unwrap();
+                // add x0, x0, x1; ret
+                let mut code = Vec::new();
+                code.extend_from_slice(&0x8B01_0000u32.to_le_bytes());
+                code.extend_from_slice(&0xD65F_03C0u32.to_le_bytes());
+                emu.cpu_mut().mem_write(code_base, &code).unwrap();
+                assert_eq!(emu.call_address(code_base, &[19, 23]).unwrap(), 42);
+                assert!(matches!(
+                    emu.attach_tracer(0, u64::MAX),
+                    Err(EmuError::Backend(_))
+                ));
+                assert!(GdbServer::serve(&mut emu, "127.0.0.1:0", code_base, &[]).is_err());
+            }
+            Err(EmuError::Backend(msg)) => {
+                assert!(
+                    msg.contains("/dev/kvm") || msg.contains("KVM"),
+                    "unexpected kvm error: {msg}"
+                );
+            }
+            Err(other) => panic!("unexpected error variant: {other:?}"),
+        }
     }
 
     // 非 macOS 宿主机请求 Hypervisor 应返回清晰 Backend 错误

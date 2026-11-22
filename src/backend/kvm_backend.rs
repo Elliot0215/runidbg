@@ -44,7 +44,7 @@ mod imp {
     const KVM_CREATE_VCPU: c_ulong = 0xAE41;
     const KVM_SET_USER_MEMORY_REGION: c_ulong = 0x4020_AE46;
     const KVM_RUN: c_ulong = 0xAE80;
-    const KVM_SET_GUEST_DEBUG: c_ulong = 0x4048_AE9B;
+    const KVM_SET_GUEST_DEBUG: c_ulong = 0x4208_AE9B;
     const KVM_GET_ONE_REG: c_ulong = 0x4010_AEAB;
     const KVM_SET_ONE_REG: c_ulong = 0x4010_AEAC;
     const KVM_ARM_VCPU_INIT: c_ulong = 0x4020_AEAE;
@@ -90,6 +90,9 @@ mod imp {
     const REG_SP_EL0: u64 = core_reg_u64(0x3E);
     const REG_PC: u64 = core_reg_u64(0x40);
     const REG_PSTATE: u64 = core_reg_u64(0x42);
+    const REG_SP_EL1: u64 = core_reg_u64(0x44);
+    const REG_ELR_EL1: u64 = core_reg_u64(0x46);
+    const REG_SPSR_EL1: u64 = core_reg_u64(0x48);
     const REG_FPSR: u64 = core_reg_u32(0xD4);
     const REG_FPCR: u64 = core_reg_u32(0xD5);
 
@@ -97,14 +100,11 @@ mod imp {
     const SYS_CPACR_EL1: u64 = sys_reg(3, 0, 1, 0, 2);
     const SYS_TTBR0_EL1: u64 = sys_reg(3, 0, 2, 0, 0);
     const SYS_TCR_EL1: u64 = sys_reg(3, 0, 2, 0, 2);
-    const SYS_SPSR_EL1: u64 = sys_reg(3, 0, 4, 0, 0);
-    const SYS_ELR_EL1: u64 = sys_reg(3, 0, 4, 0, 1);
     const SYS_ESR_EL1: u64 = sys_reg(3, 0, 5, 2, 0);
     const SYS_FAR_EL1: u64 = sys_reg(3, 0, 6, 0, 0);
     const SYS_MAIR_EL1: u64 = sys_reg(3, 0, 10, 2, 0);
     const SYS_VBAR_EL1: u64 = sys_reg(3, 0, 12, 0, 0);
     const SYS_TPIDR_EL0: u64 = sys_reg(3, 3, 13, 0, 2);
-    const SYS_SP_EL1: u64 = sys_reg(3, 4, 4, 1, 0);
 
     #[repr(C)]
     struct KvmVcpuInit {
@@ -131,7 +131,8 @@ mod imp {
     struct KvmGuestDebug {
         control: u32,
         pad: u32,
-        arch_pad: [u64; 8],
+        // ARM64 kvm_guest_debug_arch = dbg_bcr[16] + dbg_bvr[16] + dbg_wcr[16] + dbg_wvr[16] = 64 * u64 (512B)
+        arch_pad: [u64; 64],
     }
 
     unsafe extern "C" {
@@ -249,16 +250,19 @@ mod imp {
             let dbg = KvmGuestDebug {
                 control: KVM_GUESTDBG_ENABLE | KVM_GUESTDBG_USE_SW_BP,
                 pad: 0,
-                arch_pad: [0; 8],
+                arch_pad: [0; 64],
             };
             if unsafe { ioctl(vcpu_fd, KVM_SET_GUEST_DEBUG, &dbg) } < 0 {
+                let err = std::io::Error::last_os_error();
                 unsafe {
                     munmap(run_ptr, run_size);
                     close(vcpu_fd);
                     close(vm_fd);
                     close(kvm_fd);
                 }
-                return Err(EmuError::Backend("KVM_SET_GUEST_DEBUG 失败".to_string()));
+                return Err(EmuError::Backend(format!(
+                    "KVM_SET_GUEST_DEBUG 失败: {err}"
+                )));
             }
 
             let mut cpu = Self {
@@ -288,7 +292,7 @@ mod imp {
             cpu.set_one_reg_u64(SYS_TCR_EL1, TCR_EL1_4KB_39BIT)?;
             cpu.set_one_reg_u64(SYS_TTBR0_EL1, TTBR0_PAGE_ADDR)?;
             cpu.set_one_reg_u64(SYS_SCTLR_EL1, SCTLR_EL1_MMU_ON)?;
-            cpu.set_one_reg_u64(SYS_SP_EL1, VBAR_EL1_ADDR + PAGE_SIZE)?;
+            cpu.set_one_reg_u64(REG_SP_EL1, VBAR_EL1_ADDR + PAGE_SIZE)?;
             cpu.set_one_reg_u64(REG_PSTATE, PSTATE_EL0T)?;
 
             Ok(cpu)
@@ -376,11 +380,18 @@ mod imp {
                 };
             }
 
-            if unsafe { ioctl(self.vcpu_fd, KVM_RUN, 0 as c_ulong) } < 0 {
-                return RunStopReason::IllegalInstruction {
-                    pc: start_pc,
-                    detail: "KVM_RUN ioctl 返回错误".to_string(),
-                };
+            loop {
+                if unsafe { ioctl(self.vcpu_fd, KVM_RUN, 0 as c_ulong) } < 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() == Some(4) {
+                        continue; // EINTR
+                    }
+                    return RunStopReason::IllegalInstruction {
+                        pc: start_pc,
+                        detail: format!("KVM_RUN ioctl 返回错误: {err}"),
+                    };
+                }
+                break;
             }
 
             // struct kvm_run.exit_reason 位于偏移 +8 (u32)
@@ -388,9 +399,9 @@ mod imp {
             match exit_reason {
                 KVM_EXIT_DEBUG => {
                     let esr = self.get_one_reg_u64(SYS_ESR_EL1).unwrap_or(0);
-                    let elr = self.get_one_reg_u64(SYS_ELR_EL1).unwrap_or(start_pc);
+                    let elr = self.get_one_reg_u64(REG_ELR_EL1).unwrap_or(start_pc);
                     let far = self.get_one_reg_u64(SYS_FAR_EL1).unwrap_or(0);
-                    let spsr = self.get_one_reg_u64(SYS_SPSR_EL1).unwrap_or(PSTATE_EL0T);
+                    let spsr = self.get_one_reg_u64(REG_SPSR_EL1).unwrap_or(PSTATE_EL0T);
                     let _ = self.set_one_reg_u64(REG_PSTATE, spsr);
                     let _ = self.set_one_reg_u64(REG_PC, elr);
                     match decode_esr_el1(esr) {
