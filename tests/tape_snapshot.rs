@@ -1,8 +1,4 @@
-#[cfg(any(
-    all(feature = "js", feature = "rpc"),
-    feature = "dynarmic",
-    feature = "hypervisor"
-))]
+#[cfg(all(feature = "js", feature = "rpc"))]
 use std::path::Path;
 
 use runidbg_arm64_emu_tracer::backend::{BackendKind, BackendWithData, CpuBackend};
