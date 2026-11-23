@@ -21,10 +21,10 @@ const ARM64_RET_INSN: u32 = 0xD65F_03C0;
 
 /// 文件型 `mmap` 映射元数据，用于 `msync` / `munmap` 将脏页写回 `VirtualFs`
 #[derive(Debug, Clone)]
-struct MmapFileBacking {
-    path: String,
-    offset: usize,
-    len: usize,
+pub(crate) struct MmapFileBacking {
+    pub path: String,
+    pub offset: usize,
+    pub len: usize,
 }
 
 /// 内置高频 libc / Bionic / pthread / zlib HLE 劫持动作
@@ -543,36 +543,40 @@ impl HleBuiltin {
 }
 
 #[derive(Debug, Clone)]
-struct StdioStream {
-    fd: i32,
-    eof: bool,
-    err: bool,
-    ungetc_buf: Option<u8>,
+pub(crate) struct StdioStream {
+    pub fd: i32,
+    pub eof: bool,
+    pub err: bool,
+    pub ungetc_buf: Option<u8>,
 }
 
-struct DirStream {
-    entries: Vec<(String, u8)>,
-    cursor: usize,
-    dirent_buf: u64,
+#[derive(Debug, Clone)]
+pub(crate) struct DirStream {
+    pub entries: Vec<(String, u8)>,
+    pub cursor: usize,
+    pub dirent_buf: u64,
 }
 
-struct PropInfoEntry {
-    name: String,
-    value: String,
-    name_ptr: u64,
-    value_ptr: u64,
+#[derive(Debug, Clone)]
+pub(crate) struct PropInfoEntry {
+    pub name: String,
+    pub value: String,
+    pub name_ptr: u64,
+    pub value_ptr: u64,
 }
 
-struct AssetStream {
-    data: Vec<u8>,
-    pos: usize,
-    guest_buf: Option<u64>,
+#[derive(Debug, Clone)]
+pub(crate) struct AssetStream {
+    pub data: Vec<u8>,
+    pub pos: usize,
+    pub guest_buf: Option<u64>,
 }
 
-struct AssetDirStream {
-    files: Vec<String>,
-    cursor: usize,
-    name_buf: u64,
+#[derive(Debug, Clone)]
+pub(crate) struct AssetDirStream {
+    pub files: Vec<String>,
+    pub cursor: usize,
+    pub name_buf: u64,
 }
 
 enum ZlibStreamState {
@@ -835,6 +839,146 @@ impl TrampolineTable {
     pub fn get_addr(&self, name: &str) -> Option<u64> {
         self.name_to_addr.get(name).copied()
     }
+
+    pub(crate) fn export_tape_state(&self) -> TrampolineTapeState {
+        let mut slot_names = vec![String::new(); self.slots.len()];
+        for (name, &addr) in &self.name_to_addr {
+            if addr >= TRAMPOLINE_BASE && (addr - TRAMPOLINE_BASE).is_multiple_of(4) {
+                let idx = ((addr - TRAMPOLINE_BASE) / 4) as usize;
+                if idx < slot_names.len() {
+                    slot_names[idx] = name.clone();
+                }
+            }
+        }
+        TrampolineTapeState {
+            slot_names,
+            pthread_keys: self.pthread_keys.iter().map(|(&k, &v)| (k, v)).collect(),
+            next_pthread_key: self.next_pthread_key,
+            next_pthread_tid: self.next_pthread_tid,
+            pending_threads: self
+                .pending_threads
+                .iter()
+                .map(|(&tid, &(f, a))| (tid, f, a))
+                .collect(),
+            pthread_exit_stack: self.pthread_exit_stack.clone(),
+            sigactions: self.sigactions.iter().map(|(&k, &v)| (k, v)).collect(),
+            sigmask: self.sigmask,
+            mmap_backings: self
+                .mmap_backings
+                .iter()
+                .map(|(&k, v)| (k, v.clone()))
+                .collect(),
+            stdio_streams: self
+                .stdio_streams
+                .iter()
+                .map(|(&k, v)| (k, v.clone()))
+                .collect(),
+            dir_streams: self
+                .dir_streams
+                .iter()
+                .map(|(&k, v)| (k, v.clone()))
+                .collect(),
+            asset_streams: self
+                .asset_streams
+                .iter()
+                .map(|(&k, v)| (k, v.clone()))
+                .collect(),
+            asset_dirs: self
+                .asset_dirs
+                .iter()
+                .map(|(&k, v)| (k, v.clone()))
+                .collect(),
+            prop_infos: self
+                .prop_infos
+                .iter()
+                .map(|(&k, v)| (k, v.clone()))
+                .collect(),
+            last_dlerror: self.last_dlerror.clone(),
+            loaded_modules: self.loaded_modules.clone(),
+            lcg48_state: self.lcg48_state,
+            errno_addr: self.errno_addr,
+        }
+    }
+
+    /// 从 `.rtape` 恢复 HLE 跳板表元数据，并按目标后端重写全部 HLE 槽位指令（`RET` 或 `SVC #0x1001`）
+    pub(crate) fn restore_tape_state_and_rewrite<B: CpuBackend + ?Sized>(
+        &mut self,
+        uc: &mut B,
+        mem: &MemoryManager,
+        state: TrampolineTapeState,
+    ) -> EmuResult<()> {
+        if (state.slot_names.len() as u64).saturating_mul(4) > TRAMPOLINE_SIZE {
+            return Err(crate::error::EmuError::Backend(format!(
+                "磁带 HLE 跳板槽位数量超界: {}",
+                state.slot_names.len()
+            )));
+        }
+        let slot_insn = if uc.uses_svc_trampolines() {
+            ARM64_SVC_HLE_INSN
+        } else {
+            ARM64_RET_INSN
+        };
+        self.slots.clear();
+        self.name_to_addr.clear();
+        for (idx, name) in state.slot_names.into_iter().enumerate() {
+            let addr = TRAMPOLINE_BASE + (idx as u64) * 4;
+            let action = HleBuiltin::from_symbol(&name)
+                .unwrap_or_else(|| HleBuiltin::UnimplementedStub(name.clone()));
+            self.slots.push(action);
+            if !name.is_empty() {
+                self.name_to_addr.insert(name, addr);
+            }
+            mem.write_u32(uc, addr, slot_insn)?;
+        }
+        self.pthread_keys = state.pthread_keys.into_iter().collect();
+        self.next_pthread_key = state.next_pthread_key;
+        self.next_pthread_tid = state.next_pthread_tid;
+        self.pending_threads = state
+            .pending_threads
+            .into_iter()
+            .map(|(tid, f, a)| (tid, (f, a)))
+            .collect();
+        self.pthread_exit_stack = state.pthread_exit_stack;
+        self.sigactions = state.sigactions.into_iter().collect();
+        self.sigmask = state.sigmask;
+        self.mmap_backings = state.mmap_backings.into_iter().collect();
+        self.stdio_streams = state.stdio_streams.into_iter().collect();
+        self.dir_streams = state.dir_streams.into_iter().collect();
+        self.asset_streams = state.asset_streams.into_iter().collect();
+        self.asset_dirs = state.asset_dirs.into_iter().collect();
+        self.prop_infos = state.prop_infos.into_iter().collect();
+        self.zlib_streams.clear();
+        self.unimplemented_hits.clear();
+        self.last_dlerror = state.last_dlerror;
+        self.loaded_modules = state.loaded_modules;
+        self.lcg48_state = state.lcg48_state;
+        self.errno_addr = state.errno_addr;
+        self.initialized = true;
+        Ok(())
+    }
+}
+
+/// HLE 跳板表可序列化状态（供 `.rtape` 磁带持久化与跨后端重写）
+#[derive(Debug, Clone)]
+pub(crate) struct TrampolineTapeState {
+    pub slot_names: Vec<String>,
+    pub pthread_keys: Vec<(u32, u64)>,
+    pub next_pthread_key: u32,
+    pub next_pthread_tid: u64,
+    pub pending_threads: Vec<(u64, u64, u64)>,
+    pub pthread_exit_stack: Vec<(u64, u64)>,
+    pub sigactions: Vec<(i32, [u8; 32])>,
+    pub sigmask: u64,
+    pub mmap_backings: Vec<(u64, MmapFileBacking)>,
+    pub stdio_streams: Vec<(u64, StdioStream)>,
+    pub dir_streams: Vec<(u64, DirStream)>,
+    pub asset_streams: Vec<(u64, AssetStream)>,
+    pub asset_dirs: Vec<(u64, AssetDirStream)>,
+    pub prop_infos: Vec<(u64, PropInfoEntry)>,
+    pub last_dlerror: Option<String>,
+    pub loaded_modules: Vec<DlModuleEntry>,
+    pub lcg48_state: u64,
+    pub errno_addr: u64,
 }
 
 /// 解析 C 风格十进制有符号整数前缀（兼容 `atoi` / `atol` / `atoll`）
@@ -3416,7 +3560,13 @@ where
                                 (a, true)
                             };
                             if ok {
-                                let _ = uc.mem_write(addr, &ARM64_RET_INSN.to_le_bytes());
+                                let insn = if uc.uses_svc_trampolines() {
+                                    ARM64_SVC_HLE_INSN
+                                } else {
+                                    ARM64_RET_INSN
+                                };
+                                let _ = uc.mem_write(addr, &insn.to_le_bytes());
+                                let _ = uc.flush_cache(addr, addr + 4);
                             }
                             addr
                         }

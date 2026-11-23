@@ -166,6 +166,10 @@ mod imp {
         run_size: usize,
         slots: BTreeMap<u64, KvmSlot>,
         next_slot: u32,
+        /// 已卸载释放的 memslot ID 回收池，避免反复 seek_tape 耗尽 KVM_CAP_NR_MEMSLOTS
+        free_slot_ids: Vec<u32>,
+        /// 初始化完成后置为 true，保护 EL1 页表/向量表保留区间 [0x4000, 0x9000)
+        vm_initialized: bool,
         stop_requested: bool,
     }
 
@@ -275,6 +279,8 @@ mod imp {
                 run_size,
                 slots: BTreeMap::new(),
                 next_slot: 0,
+                free_slot_ids: Vec::new(),
+                vm_initialized: false,
                 stop_requested: false,
             };
 
@@ -287,6 +293,7 @@ mod imp {
             cpu.mem_map(VBAR_EL1_ADDR, PAGE_SIZE, Prot::READ | Prot::EXEC)?;
             let vec_table = build_el1_vector_table(KVM_BRK_TRAP_INSN);
             cpu.mem_write(VBAR_EL1_ADDR, &vec_table)?;
+            cpu.vm_initialized = true;
 
             cpu.set_one_reg_u64(SYS_VBAR_EL1, VBAR_EL1_ADDR)?;
             cpu.set_one_reg_u64(SYS_CPACR_EL1, CPACR_EL1_FPEN_ALL)?;
@@ -404,7 +411,9 @@ mod imp {
                     detail: e.to_string(),
                 };
             }
-            if let Err(e) = self.set_one_reg_u64(REG_PSTATE, PSTATE_EL0T) {
+            let cur_pstate = self.get_one_reg_u64(REG_PSTATE).unwrap_or(PSTATE_EL0T);
+            let next_pstate = (cur_pstate & 0xF000_0000) | PSTATE_EL0T;
+            if let Err(e) = self.set_one_reg_u64(REG_PSTATE, next_pstate) {
                 return RunStopReason::IllegalInstruction {
                     pc: start_pc,
                     detail: e.to_string(),
@@ -589,6 +598,11 @@ mod imp {
             match reg {
                 RegisterARM64::FPCR => return self.set_one_reg_u32(REG_FPCR, val as u32),
                 RegisterARM64::FPSR => return self.set_one_reg_u32(REG_FPSR, val as u32),
+                RegisterARM64::NZCV | RegisterARM64::PSTATE => {
+                    let cur = self.get_one_reg_u64(REG_PSTATE).unwrap_or(PSTATE_EL0T);
+                    let next = (cur & !0xF000_0000) | (val & 0xF000_0000);
+                    return self.set_one_reg_u64(REG_PSTATE, next);
+                }
                 _ => {}
             }
             if let Some(id) = reg_to_kvm_id(reg) {
@@ -661,6 +675,11 @@ mod imp {
             if len == 0 {
                 return Ok(());
             }
+            if self.vm_initialized && start < 0x9000 && end > 0x4000 {
+                return Err(EmuError::Backend(format!(
+                    "KVM 拒绝映射与 EL1 页表/向量表冲突的保留地址区间: [0x{start:x}, 0x{end:x})"
+                )));
+            }
             // 若目标区间与已有 KVM memslot 重叠（如 MAP_FIXED / 二次重映射），先局部裁剪/移除旧段
             let has_overlap = self
                 .slots
@@ -682,8 +701,13 @@ mod imp {
             if host_ptr == MAP_FAILED || host_ptr.is_null() {
                 return Err(EmuError::Backend("KVM 宿主内存分配失败".to_string()));
             }
-            let slot_id = self.next_slot;
-            self.next_slot += 1;
+            let slot_id = if let Some(recycled) = self.free_slot_ids.pop() {
+                recycled
+            } else {
+                let id = self.next_slot;
+                self.next_slot += 1;
+                id
+            };
             let region = KvmUserspaceMemoryRegion {
                 slot: slot_id,
                 flags: 0,
@@ -693,6 +717,7 @@ mod imp {
             };
             if unsafe { ioctl(self.vm_fd, KVM_SET_USER_MEMORY_REGION, &region) } < 0 {
                 let err = std::io::Error::last_os_error();
+                self.free_slot_ids.push(slot_id);
                 unsafe { munmap(host_ptr, len as usize) };
                 return Err(EmuError::Backend(format!(
                     "KVM_SET_USER_MEMORY_REGION 失败: addr=0x{start:x}, size=0x{len:x}: {err}"
@@ -715,6 +740,11 @@ mod imp {
             let end = align_up(addr.saturating_add(size), PAGE_SIZE);
             if end <= start {
                 return Ok(());
+            }
+            if self.vm_initialized && start < 0x9000 && end > 0x4000 {
+                return Err(EmuError::Backend(format!(
+                    "KVM 拒绝卸载 EL1 页表/向量表保留地址区间: [0x{start:x}, 0x{end:x})"
+                )));
             }
             let overlapping_keys: Vec<u64> = self
                 .slots
@@ -785,10 +815,15 @@ mod imp {
                     let suffix_len = slot_end - u_end;
                     let suffix_ptr = unsafe { slot.host_ptr.add(suffix_off) };
                     let suffix_slot_id = if reused_slot_id {
-                        let id = self.next_slot;
-                        self.next_slot += 1;
-                        id
+                        if let Some(recycled) = self.free_slot_ids.pop() {
+                            recycled
+                        } else {
+                            let id = self.next_slot;
+                            self.next_slot += 1;
+                            id
+                        }
                     } else {
+                        reused_slot_id = true;
                         slot.slot_id
                     };
                     let suffix_region = KvmUserspaceMemoryRegion {
@@ -801,6 +836,7 @@ mod imp {
                     if unsafe { ioctl(self.vm_fd, KVM_SET_USER_MEMORY_REGION, &suffix_region) } < 0
                     {
                         let err = std::io::Error::last_os_error();
+                        self.free_slot_ids.push(suffix_slot_id);
                         return Err(EmuError::Backend(format!(
                             "KVM 局部 mem_unmap 重注册后缀段失败(0x{u_end:x}+0x{suffix_len:x}): {err}"
                         )));
@@ -814,6 +850,9 @@ mod imp {
                             host_ptr: suffix_ptr,
                         },
                     );
+                }
+                if !reused_slot_id {
+                    self.free_slot_ids.push(slot.slot_id);
                 }
             }
             Ok(())

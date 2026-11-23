@@ -192,6 +192,39 @@ impl BumpAllocator {
     pub const fn high_water_mark(&self) -> u64 {
         self.cursor - self.base
     }
+
+    pub(crate) fn export_raw(&self) -> BumpAllocatorRaw {
+        BumpAllocatorRaw {
+            base: self.base,
+            size: self.size,
+            cursor: self.cursor,
+            free_blocks: self.free_blocks.iter().map(|(&k, &v)| (k, v)).collect(),
+            allocated: self.allocated.iter().map(|(&k, &v)| (k, v)).collect(),
+            in_use: self.in_use,
+        }
+    }
+
+    pub(crate) fn from_raw(raw: BumpAllocatorRaw) -> Self {
+        Self {
+            base: raw.base,
+            size: raw.size,
+            cursor: raw.cursor,
+            free_blocks: raw.free_blocks.into_iter().collect(),
+            allocated: raw.allocated.into_iter().collect(),
+            in_use: raw.in_use,
+        }
+    }
+}
+
+/// 堆分配器原始字段快照（供 `.rtape` 编解码使用）
+#[derive(Debug, Clone)]
+pub(crate) struct BumpAllocatorRaw {
+    pub base: u64,
+    pub size: u64,
+    pub cursor: u64,
+    pub free_blocks: Vec<(u64, u64)>,
+    pub allocated: Vec<(u64, u64)>,
+    pub in_use: u64,
 }
 
 /// 模拟堆元数据快照（供 `EmuSnapshot` 完整保存与恢复堆状态）
@@ -273,11 +306,13 @@ impl MemoryManager {
         let label_str = label.into();
 
         // 按连续未映射区间合并调用 mem_map，减少 FFI 调用次数
+        let mut widened_pages = Vec::new();
         let mut cur = start;
         while cur < end {
             if self.mapped_pages.contains(&cur) {
-                // 该页已被前一个 Segment 映射，放宽权限确保可写可执行
+                // 该页已被前一个 Segment 映射，放宽权限确保可写可执行（同步在 VMA 表中保留共享页 RWX 权限，避免磁带恢复降级）
                 uc.mem_protect(cur, PAGE_SIZE, Prot::ALL)?;
+                widened_pages.push(cur);
                 cur += PAGE_SIZE;
                 continue;
             }
@@ -298,6 +333,9 @@ impl MemoryManager {
             label: label_str,
             file_offset: align_down(file_offset, PAGE_SIZE),
         });
+        for wp in widened_pages {
+            self.widen_vma_page_perms(wp, Prot::ALL);
+        }
 
         Ok((start, end - start))
     }
@@ -457,6 +495,55 @@ impl MemoryManager {
         self.regions.insert(new_vma.start, new_vma);
     }
 
+    /// 将单个共享 4KB 页在 VMA 表中拆分并合并权限（确保相邻 ELF PT_LOAD 共享页权限在快照/磁带中不降级）
+    fn widen_vma_page_perms(&mut self, page_start: u64, extra_perms: Prot) {
+        let page_end = page_start + PAGE_SIZE;
+        let overlapping: Vec<VmaRegion> = self
+            .regions
+            .values()
+            .filter(|r| r.start < page_end && r.end > page_start)
+            .cloned()
+            .collect();
+        for r in overlapping {
+            let merged = Prot(r.perms.0 | extra_perms.0);
+            if merged == r.perms {
+                continue;
+            }
+            self.regions.remove(&r.start);
+            if r.start < page_start {
+                self.regions.insert(
+                    r.start,
+                    VmaRegion {
+                        end: page_start,
+                        ..r.clone()
+                    },
+                );
+            }
+            let mid_start = r.start.max(page_start);
+            let mid_end = r.end.min(page_end);
+            self.regions.insert(
+                mid_start,
+                VmaRegion {
+                    start: mid_start,
+                    end: mid_end,
+                    perms: merged,
+                    label: r.label.clone(),
+                    file_offset: r.file_offset + (mid_start - r.start),
+                },
+            );
+            if r.end > page_end {
+                self.regions.insert(
+                    page_end,
+                    VmaRegion {
+                        start: page_end,
+                        file_offset: r.file_offset + (page_end - r.start),
+                        ..r
+                    },
+                );
+            }
+        }
+    }
+
     fn remove_vma_range(&mut self, start: u64, end: u64) {
         let overlapping: Vec<VmaRegion> = self
             .regions
@@ -584,6 +671,175 @@ impl MemoryManager {
     pub fn restore_heap_snapshot(&mut self, snap: &HeapSnapshot) {
         self.heap = snap.heap.clone();
         self.brk_cursor = snap.brk_cursor;
+    }
+
+    #[inline]
+    pub fn is_page_mapped(&self, addr: u64) -> bool {
+        self.mapped_pages.contains(&align_down(addr, PAGE_SIZE))
+    }
+
+    pub(crate) fn mapped_pages(&self) -> &BTreeSet<u64> {
+        &self.mapped_pages
+    }
+
+    pub(crate) fn mmap_cursor(&self) -> u64 {
+        self.mmap_cursor
+    }
+
+    pub(crate) fn brk_cursor(&self) -> u64 {
+        self.brk_cursor
+    }
+
+    pub(crate) fn heap_ref(&self) -> &BumpAllocator {
+        &self.heap
+    }
+
+    /// 按 `.rtape` 磁带目标状态同步全部 VMA 映射、4KB 内存页与堆分配器元数据
+    ///
+    /// 支持首次恢复与运行中任意检查点快进/倒带（仅卸载多余页、映射新增页、写回差异/非零页并清零空页）。
+    pub(crate) fn restore_from_tape<B: CpuBackend + ?Sized>(
+        &mut self,
+        uc: &mut B,
+        target_vmas: &[VmaRegion],
+        target_pages: &BTreeMap<u64, [u8; 4096]>,
+        target_heap: BumpAllocator,
+        brk_cursor: u64,
+        mmap_cursor: u64,
+    ) -> EmuResult<()> {
+        const MIN_GUEST_VA: u64 = 0x1_0000;
+        const MAX_GUEST_VA: u64 = 0x0001_0000_0000_0000;
+        const MAX_TOTAL_PAGES: usize = 1_048_576; // 上限 4 GiB
+
+        let mut desired_pages: BTreeSet<u64> = BTreeSet::new();
+        let mut page_perms: BTreeMap<u64, Prot> = BTreeMap::new();
+        for vma in target_vmas {
+            if vma.start >= vma.end
+                || (vma.start & (PAGE_SIZE - 1)) != 0
+                || (vma.end & (PAGE_SIZE - 1)) != 0
+                || vma.start < MIN_GUEST_VA
+                || vma.end > MAX_GUEST_VA
+            {
+                return Err(EmuError::Backend(format!(
+                    "磁带包含非法 VMA 区间: [0x{:x}, 0x{:x})",
+                    vma.start, vma.end
+                )));
+            }
+            let page_count = ((vma.end - vma.start) / PAGE_SIZE) as usize;
+            if desired_pages.len().saturating_add(page_count) > MAX_TOTAL_PAGES {
+                return Err(EmuError::Backend("磁带总映射页数超过安全上限".to_string()));
+            }
+            let mut p = vma.start;
+            while p < vma.end {
+                desired_pages.insert(p);
+                page_perms
+                    .entry(p)
+                    .and_modify(|cur| *cur = Prot(cur.0 | vma.perms.0))
+                    .or_insert(vma.perms);
+                p = p
+                    .checked_add(PAGE_SIZE)
+                    .ok_or_else(|| EmuError::Backend("VMA 页枚举地址溢出".to_string()))?;
+            }
+        }
+        for &p in target_pages.keys() {
+            if (p & (PAGE_SIZE - 1)) != 0 || !(MIN_GUEST_VA..MAX_GUEST_VA).contains(&p) {
+                return Err(EmuError::Backend(format!(
+                    "磁带包含非法页地址: 0x{p:x}"
+                )));
+            }
+            desired_pages.insert(p);
+            page_perms.entry(p).or_insert(Prot::ALL);
+        }
+
+        // 1. 卸载当前存在但目标状态不存在的连续页段（逐段更新 mapped_pages 并刷清 Unicorn TB）
+        let to_unmap: Vec<u64> = self
+            .mapped_pages
+            .difference(&desired_pages)
+            .copied()
+            .collect();
+        let mut idx = 0;
+        while idx < to_unmap.len() {
+            let run_start = to_unmap[idx];
+            let mut run_end = run_start
+                .checked_add(PAGE_SIZE)
+                .ok_or_else(|| EmuError::Backend("卸载页段地址溢出".to_string()))?;
+            while idx + 1 < to_unmap.len() && to_unmap[idx + 1] == run_end {
+                idx += 1;
+                run_end = run_end
+                    .checked_add(PAGE_SIZE)
+                    .ok_or_else(|| EmuError::Backend("卸载页段地址溢出".to_string()))?;
+            }
+            let _ = uc.flush_cache(run_start, run_end);
+            uc.mem_unmap(run_start, run_end - run_start)?;
+            let mut p = run_start;
+            while p < run_end {
+                self.mapped_pages.remove(&p);
+                p += PAGE_SIZE;
+            }
+            idx += 1;
+        }
+
+        // 2. 映射目标存在但当前未映射的连续页段（逐段立即记入 mapped_pages 避免半失败脱同步）
+        let to_map: Vec<u64> = desired_pages
+            .difference(&self.mapped_pages)
+            .copied()
+            .collect();
+        let mut idx = 0;
+        while idx < to_map.len() {
+            let run_start = to_map[idx];
+            let mut run_end = run_start
+                .checked_add(PAGE_SIZE)
+                .ok_or_else(|| EmuError::Backend("映射页段地址溢出".to_string()))?;
+            while idx + 1 < to_map.len() && to_map[idx + 1] == run_end {
+                idx += 1;
+                run_end = run_end
+                    .checked_add(PAGE_SIZE)
+                    .ok_or_else(|| EmuError::Backend("映射页段地址溢出".to_string()))?;
+            }
+            uc.mem_map(run_start, run_end - run_start, Prot::ALL)?;
+            let mut p = run_start;
+            while p < run_end {
+                self.mapped_pages.insert(p);
+                p += PAGE_SIZE;
+            }
+            idx += 1;
+        }
+
+        // 3. 写入全部目标页镜像（未出现在 target_pages 中的已映射页清零，确保无残留脏数据）
+        const ZERO_PAGE: [u8; 4096] = [0u8; 4096];
+        for &page in &desired_pages {
+            if let Some(bytes) = target_pages.get(&page) {
+                uc.mem_write(page, bytes)?;
+            } else {
+                uc.mem_write(page, &ZERO_PAGE)?;
+            }
+        }
+
+        // 4. 按每页合并权限批量调用 mem_protect，并重建规范化 VMA 表
+        let perm_entries: Vec<(u64, Prot)> = page_perms.into_iter().collect();
+        let mut pidx = 0;
+        while pidx < perm_entries.len() {
+            let (run_start, prot) = perm_entries[pidx];
+            let mut run_end = run_start + PAGE_SIZE;
+            while pidx + 1 < perm_entries.len()
+                && perm_entries[pidx + 1].0 == run_end
+                && perm_entries[pidx + 1].1 == prot
+            {
+                pidx += 1;
+                run_end += PAGE_SIZE;
+            }
+            uc.mem_protect(run_start, run_end - run_start, prot)?;
+            pidx += 1;
+        }
+
+        self.regions.clear();
+        for vma in target_vmas {
+            self.record_vma(vma.clone());
+        }
+
+        self.heap = target_heap;
+        self.brk_cursor = brk_cursor;
+        self.mmap_cursor = mmap_cursor;
+        Ok(())
     }
 
     /// 读取指定地址内存到新 Vec

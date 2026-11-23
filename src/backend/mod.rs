@@ -156,7 +156,7 @@ pub enum RunStopReason {
     Stopped,
 }
 
-/// 跨后端通用的 ARM64 寄存器完整快照（供 Dynarmic / KVM / Hypervisor 使用）
+/// 跨后端通用的 ARM64 寄存器完整快照（供 Dynarmic / KVM / Hypervisor 与 `.rtape` 跨后端磁带使用）
 #[derive(Debug, Clone)]
 pub struct GenericCpuContext {
     pub x: [u64; 31],
@@ -167,6 +167,84 @@ pub struct GenericCpuContext {
     pub q: [u128; 32],
     pub fpcr: u32,
     pub fpsr: u32,
+}
+
+const GPR_REGS: [RegisterARM64; 31] = [
+    RegisterARM64::X0,
+    RegisterARM64::X1,
+    RegisterARM64::X2,
+    RegisterARM64::X3,
+    RegisterARM64::X4,
+    RegisterARM64::X5,
+    RegisterARM64::X6,
+    RegisterARM64::X7,
+    RegisterARM64::X8,
+    RegisterARM64::X9,
+    RegisterARM64::X10,
+    RegisterARM64::X11,
+    RegisterARM64::X12,
+    RegisterARM64::X13,
+    RegisterARM64::X14,
+    RegisterARM64::X15,
+    RegisterARM64::X16,
+    RegisterARM64::X17,
+    RegisterARM64::X18,
+    RegisterARM64::X19,
+    RegisterARM64::X20,
+    RegisterARM64::X21,
+    RegisterARM64::X22,
+    RegisterARM64::X23,
+    RegisterARM64::X24,
+    RegisterARM64::X25,
+    RegisterARM64::X26,
+    RegisterARM64::X27,
+    RegisterARM64::X28,
+    RegisterARM64::X29,
+    RegisterARM64::X30,
+];
+
+/// 从任意后端（含 Unicorn）提取平台与后端无关的完整 ARM64 通用寄存器状态
+pub fn capture_generic_context<B: CpuBackend + ?Sized>(cpu: &B) -> EmuResult<GenericCpuContext> {
+    let mut x = [0u64; 31];
+    for (slot, &reg) in x.iter_mut().zip(GPR_REGS.iter()) {
+        *slot = cpu.reg_read(reg)?;
+    }
+    let mut q = [0u128; 32];
+    for (i, slot) in q.iter_mut().enumerate() {
+        *slot = cpu.reg_read_q(i as u8)?;
+    }
+    // 仅持久化 EL0 条件标志位 NZCV (bits 31:28)，确保跨后端可移植且不会带入特权模式/保留位
+    let nzcv = cpu.reg_read(RegisterARM64::NZCV)? & 0xF000_0000;
+    Ok(GenericCpuContext {
+        x,
+        sp: cpu.reg_read(RegisterARM64::SP)?,
+        pc: cpu.reg_read(RegisterARM64::PC)?,
+        pstate: nzcv,
+        tpidr_el0: cpu.reg_read(RegisterARM64::TPIDR_EL0)?,
+        q,
+        fpcr: cpu.reg_read(RegisterARM64::FPCR)? as u32,
+        fpsr: cpu.reg_read(RegisterARM64::FPSR)? as u32,
+    })
+}
+
+/// 将跨后端通用寄存器状态写入任意后端（全后端统一直接写入所有寄存器含 `TPIDR_EL0` / `NZCV` / `FPCR` / `FPSR`）
+pub fn restore_generic_context<B: CpuBackend + ?Sized>(
+    cpu: &mut B,
+    ctx: &GenericCpuContext,
+) -> EmuResult<()> {
+    for (&reg, &val) in GPR_REGS.iter().zip(ctx.x.iter()) {
+        cpu.reg_write(reg, val)?;
+    }
+    for (i, &val) in ctx.q.iter().enumerate() {
+        cpu.reg_write_q(i as u8, val)?;
+    }
+    cpu.reg_write(RegisterARM64::SP, ctx.sp)?;
+    cpu.reg_write(RegisterARM64::PC, ctx.pc)?;
+    cpu.reg_write(RegisterARM64::NZCV, ctx.pstate & 0xF000_0000)?;
+    cpu.reg_write(RegisterARM64::FPCR, u64::from(ctx.fpcr))?;
+    cpu.reg_write(RegisterARM64::FPSR, u64::from(ctx.fpsr))?;
+    cpu.reg_write(RegisterARM64::TPIDR_EL0, ctx.tpidr_el0)?;
+    Ok(())
 }
 
 /// CPU 上下文快照载体（Unicorn 走零拷贝原生 `Context`，其他后端走通用结构体）

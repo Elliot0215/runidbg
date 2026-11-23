@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -17,8 +18,9 @@ use crate::backend::kvm_backend::KvmCpu;
 ))]
 use crate::backend::ExternalBackend;
 use crate::backend::{
-    BackendKind, BackendWithData, CpuBackend, CpuEngine, RunStopReason, SVC_IMM_HLE_TRAMPOLINE,
-    SVC_IMM_JNI_TRAMPOLINE, SVC_IMM_RET_MAGIC, SVC_IMM_SYSCALL,
+    capture_generic_context, restore_generic_context, BackendKind, BackendWithData, CpuBackend,
+    CpuEngine, RunStopReason, SVC_IMM_HLE_TRAMPOLINE, SVC_IMM_JNI_TRAMPOLINE, SVC_IMM_RET_MAGIC,
+    SVC_IMM_SYSCALL,
 };
 use crate::cpu::{CpuContext, RET_MAGIC_ADDR};
 use crate::crash::{BreadcrumbRing, CrashReport};
@@ -37,6 +39,9 @@ use crate::os::{
     attach_syscall_hook_with_interceptor, dispatch_syscall, DeviceProfile, VirtualFs,
 };
 use crate::snapshot::EmuSnapshot;
+use crate::tape::{
+    is_zero_page, Tape, TapeCheckpointInfo, TapeFullState, TapeMeta, TapeSelector, TapeSummary,
+};
 use crate::tracer::{attach_code_hook, attach_mem_trace_hook, BinaryTracer, TraceLevel};
 
 /// 默认模拟堆基址与大小（32MB）
@@ -802,6 +807,213 @@ impl AndroidEmulator {
     /// 完整回滚至指定快照状态（同步恢复 CPU、可写内存、堆指针/空闲链表与 JNI 引用表）
     pub fn restore_snapshot(&mut self, snapshot: &EmuSnapshot) -> EmuResult<()> {
         snapshot.restore_full(&mut self.engine, |d| (&mut d.mem, &mut d.jni))
+    }
+
+    /// 捕获完整可持久化磁带状态（稀疏 4KB 非零页 + 通用 ARM64 寄存器 + 全子系统元数据）
+    pub(crate) fn capture_tape_state(&self) -> EmuResult<TapeFullState> {
+        let regs = capture_generic_context(&self.engine)?;
+        let data = self.engine.get_data();
+        let vmas = data.mem.regions().cloned().collect();
+        let mut nonzero_pages = BTreeMap::new();
+        let mut page_buf = [0u8; 4096];
+        for &page_addr in data.mem.mapped_pages() {
+            self.engine.mem_read(page_addr, &mut page_buf)?;
+            if !is_zero_page(&page_buf) {
+                nonzero_pages.insert(page_addr, page_buf);
+            }
+        }
+        Ok(TapeFullState {
+            regs,
+            cpu_layout: self.cpu,
+            vmas,
+            heap: data.mem.heap_ref().clone(),
+            brk_cursor: data.mem.brk_cursor(),
+            mmap_cursor: data.mem.mmap_cursor(),
+            nonzero_pages,
+            linker: self.linker.export_tape_state(),
+            trampolines: data.trampolines.export_tape_state(),
+            jni: data.jni.export_tape_state(),
+            vfs: data.vfs.export_tape_state(),
+        })
+    }
+
+    /// 将物化后的磁带检查点完整应用到当前模拟器实例（自动按目标后端重写 HLE/JNI/RET 跳板并刷清缓存）
+    pub(crate) fn apply_tape_state(&mut self, state: TapeFullState) -> EmuResult<()> {
+        let target_vmas = state.vmas;
+        let target_pages = state.nonzero_pages;
+        let target_heap = state.heap;
+        let brk_cursor = state.brk_cursor;
+        let mmap_cursor = state.mmap_cursor;
+        let regs = state.regs;
+        let cpu_layout = state.cpu_layout;
+        let linker_state = state.linker;
+        let tramp_state = state.trampolines;
+        let jni_state = state.jni;
+        let vfs_state = state.vfs;
+
+        // 1. 取出 EmuState 中需要与 self.engine 同时可变借用的子系统
+        let (mut mem, mut trampolines, mut jni) = {
+            let d = self.engine.get_data_mut();
+            let mem = std::mem::replace(&mut d.mem, MemoryManager::new(0, 0));
+            let trampolines = std::mem::take(&mut d.trampolines);
+            let jni = std::mem::take(&mut d.jni);
+            (mem, trampolines, jni)
+        };
+
+        // 2. 恢复全部 VMA、4KB 内存页镜像与堆分配器元数据
+        let res = (|| -> EmuResult<()> {
+            mem.restore_from_tape(
+                &mut self.engine,
+                &target_vmas,
+                &target_pages,
+                target_heap,
+                brk_cursor,
+                mmap_cursor,
+            )?;
+            // 3. 跨后端跳板重写：RET_MAGIC + HLE 槽位 + JNI 槽位
+            CpuContext::rewrite_ret_magic(&mut self.engine, &mem)?;
+            trampolines.restore_tape_state_and_rewrite(&mut self.engine, &mem, tramp_state)?;
+            jni.restore_tape_state_and_rewrite(&mut self.engine, &mem, jni_state)?;
+            Ok(())
+        })();
+
+        // 4. 归还子系统；仅当上述步骤全部成功时才提交 VFS/Linker/CPU 状态，防止半失败状态撕裂
+        {
+            let d = self.engine.get_data_mut();
+            d.mem = mem;
+            d.trampolines = trampolines;
+            d.jni = jni;
+            if res.is_ok() {
+                d.vfs.restore_tape_state(vfs_state);
+                d.manual_stop = false;
+            }
+        }
+        res?;
+
+        self.linker.restore_tape_state(linker_state);
+        self.cpu = cpu_layout;
+        self.last_crash = None;
+
+        // 5. 刷清指令缓存 / JIT 翻译块缓存（Unicorn 按区间刷 TB；非 Unicorn 一次全局刷清含独占监视器）
+        if self.engine.uses_svc_trampolines() {
+            let _ = self.engine.flush_cache(0, 0);
+        } else {
+            for vma in &target_vmas {
+                let _ = self.engine.flush_cache(vma.start, vma.end);
+            }
+        }
+
+        // 6. 恢复完整通用 ARM64 寄存器（含 TPIDR_EL0 / NZCV / FPCR / FPSR / X0..X30 / Q0..Q31）
+        restore_generic_context(&mut self.engine, &regs)?;
+        Ok(())
+    }
+
+    /// 创建并保存新的 `.rtape` 磁盘运行快照磁带（首个全量稀疏基线检查点）
+    pub fn save_tape(
+        &self,
+        path: impl AsRef<Path>,
+        label: impl Into<String>,
+    ) -> EmuResult<TapeSummary> {
+        let state = self.capture_tape_state()?;
+        let label_str = label.into();
+        let mut meta = TapeMeta::new(
+            0,
+            if label_str.is_empty() {
+                "base".to_string()
+            } else {
+                label_str
+            },
+            self.backend_kind().as_str(),
+        );
+        meta.insn_count = self.tracer().stats.recorded_insns;
+        let mut tape = Tape::from_base(meta, state);
+        tape.save_file(path)
+    }
+
+    /// 向已有 `.rtape` 磁带追加一个 4KB 增量脏页检查点（若文件不存在或为空文件则自动创建基线磁带）
+    pub fn append_tape_checkpoint(
+        &self,
+        path: impl AsRef<Path>,
+        label: impl Into<String>,
+    ) -> EmuResult<TapeCheckpointInfo> {
+        let path = path.as_ref();
+        let state = self.capture_tape_state()?;
+        let label_str = label.into();
+        let has_existing_tape = std::fs::metadata(path).map(|m| m.len() > 0).unwrap_or(false);
+        let mut tape = if has_existing_tape {
+            Tape::load_file(path)?
+        } else {
+            let mut meta = TapeMeta::new(
+                0,
+                if label_str.is_empty() {
+                    "base".to_string()
+                } else {
+                    label_str
+                },
+                self.backend_kind().as_str(),
+            );
+            meta.insn_count = self.tracer().stats.recorded_insns;
+            let mut t = Tape::from_base(meta, state);
+            let summary = t.save_file(path)?;
+            return Ok(summary.checkpoints.into_iter().next().unwrap());
+        };
+        let next_idx = tape.len() as u32;
+        let final_label = if label_str.is_empty() {
+            format!("cp_{next_idx}")
+        } else {
+            label_str
+        };
+        let mut meta = TapeMeta::new(next_idx, final_label, self.backend_kind().as_str());
+        meta.insn_count = self.tracer().stats.recorded_insns;
+        tape.push_delta(meta, state)?;
+        let summary = tape.save_file(path)?;
+        Ok(summary.checkpoints.into_iter().last().unwrap())
+    }
+
+    /// 将当前模拟器实例快进或倒带到内存磁带 `tape` 中的指定检查点（支持序号、书签名或 Latest）
+    pub fn seek_tape(
+        &mut self,
+        tape: &Tape,
+        selector: &TapeSelector,
+    ) -> EmuResult<TapeCheckpointInfo> {
+        let (info, state) = tape.materialize(selector)?;
+        self.apply_tape_state(state)?;
+        Ok(info)
+    }
+
+    /// 从磁盘 `.rtape` 文件快进或倒带当前模拟器实例到指定检查点
+    pub fn seek_tape_file(
+        &mut self,
+        path: impl AsRef<Path>,
+        selector: &TapeSelector,
+    ) -> EmuResult<TapeCheckpointInfo> {
+        let tape = Tape::load_file(path)?;
+        self.seek_tape(&tape, selector)
+    }
+
+    /// 从磁盘 `.rtape` 磁带直接拉起一个新模拟器实例（支持跨后端无缝接力，默认恢复最新检查点）
+    pub fn from_tape(
+        path: impl AsRef<Path>,
+        backend: BackendKind,
+    ) -> EmuResult<(Self, TapeCheckpointInfo)> {
+        Self::from_tape_with_builder(
+            path,
+            &TapeSelector::Latest,
+            AndroidEmulatorBuilder::new().backend(backend),
+        )
+    }
+
+    /// 使用自定义 Builder（可指定目标后端、`JniHandler` 等）从 `.rtape` 指定检查点拉起新实例
+    pub fn from_tape_with_builder(
+        path: impl AsRef<Path>,
+        selector: &TapeSelector,
+        builder: AndroidEmulatorBuilder,
+    ) -> EmuResult<(Self, TapeCheckpointInfo)> {
+        let tape = Tape::load_file(path)?;
+        let (info, state) = tape.materialize(selector)?;
+        let mut emu = builder.build()?;
+        emu.apply_tape_state(state)?;
+        Ok((emu, info))
     }
 
     /// 便捷创建 `jstring`

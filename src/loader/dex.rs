@@ -76,6 +76,21 @@ impl DexIndex {
         self.classes.len()
     }
 
+    pub(crate) fn export_raw(&self) -> (usize, Vec<DexClassInfo>) {
+        (self.dex_count, self.classes.values().cloned().collect())
+    }
+
+    pub(crate) fn from_raw(dex_count: usize, classes: Vec<DexClassInfo>) -> Self {
+        let mut map = HashMap::with_capacity(classes.len());
+        for cls in classes {
+            map.insert(cls.name.clone(), cls);
+        }
+        Self {
+            classes: map,
+            dex_count,
+        }
+    }
+
     /// 从磁盘路径解析并合并一个 `.dex` 文件
     pub fn add_dex_path(&mut self, path: impl AsRef<Path>) -> EmuResult<usize> {
         let bytes = std::fs::read(path)?;

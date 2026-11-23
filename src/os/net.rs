@@ -197,6 +197,38 @@ pub enum NetFd {
     },
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PipeChannelTape {
+    pub buf: Vec<u8>,
+    pub write_closed: bool,
+    pub read_closed: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum NetVirtualFdTape {
+    Epoll {
+        interests: Vec<(i32, u32, u64)>,
+    },
+    EventFd {
+        counter: u64,
+        nonblocking: bool,
+    },
+    Pipe {
+        pipe_id: usize,
+        is_read_end: bool,
+        nonblocking: bool,
+    },
+}
+
+/// 网络子系统可序列化状态（持久化虚拟网卡配置与内存态 Epoll/EventFd/Pipe，不含宿主机真实 Socket）
+#[derive(Debug, Clone, Default)]
+pub(crate) struct NetTapeState {
+    pub config: NetConfig,
+    pub virtual_fds: Vec<(i32, NetVirtualFdTape)>,
+    pub pipes: Vec<(usize, PipeChannelTape)>,
+    pub next_pipe_id: usize,
+}
+
 #[derive(Debug, Default)]
 struct PipeChannel {
     buf: VecDeque<u8>,
@@ -255,6 +287,125 @@ impl NetManager {
 
     pub fn contains_fd(&self, fd: i32) -> bool {
         self.fds.contains_key(&fd)
+    }
+
+    pub(crate) fn export_tape_state(&self) -> NetTapeState {
+        let mut virtual_fds = Vec::new();
+        for (&fd, nfd) in &self.fds {
+            match nfd {
+                NetFd::Epoll { interests } => {
+                    virtual_fds.push((
+                        fd,
+                        NetVirtualFdTape::Epoll {
+                            interests: interests
+                                .iter()
+                                .map(|(&wfd, &(ev, ud))| (wfd, ev, ud))
+                                .collect(),
+                        },
+                    ));
+                }
+                NetFd::EventFd {
+                    counter,
+                    nonblocking,
+                } => {
+                    virtual_fds.push((
+                        fd,
+                        NetVirtualFdTape::EventFd {
+                            counter: *counter,
+                            nonblocking: *nonblocking,
+                        },
+                    ));
+                }
+                NetFd::Pipe {
+                    pipe_id,
+                    is_read_end,
+                    nonblocking,
+                } => {
+                    virtual_fds.push((
+                        fd,
+                        NetVirtualFdTape::Pipe {
+                            pipe_id: *pipe_id,
+                            is_read_end: *is_read_end,
+                            nonblocking: *nonblocking,
+                        },
+                    ));
+                }
+                // 宿主机真实 Socket 句柄不可跨进程/跨时间线持久化
+                NetFd::UnboundSocket { .. }
+                | NetFd::TcpStream { .. }
+                | NetFd::TcpListener { .. }
+                | NetFd::UdpSocket { .. } => {}
+            }
+        }
+        let pipes = self
+            .pipes
+            .iter()
+            .map(|(&id, ch)| {
+                (
+                    id,
+                    PipeChannelTape {
+                        buf: ch.buf.iter().copied().collect(),
+                        write_closed: ch.write_closed,
+                        read_closed: ch.read_closed,
+                    },
+                )
+            })
+            .collect();
+        NetTapeState {
+            config: self.config.clone(),
+            virtual_fds,
+            pipes,
+            next_pipe_id: self.next_pipe_id,
+        }
+    }
+
+    pub(crate) fn restore_tape_state(&mut self, state: NetTapeState) {
+        self.config = state.config;
+        // 清理旧宿主机 Socket 与抓包记录，仅恢复内存态 Epoll/EventFd/Pipe
+        self.fds.clear();
+        for (fd, vfd) in state.virtual_fds {
+            let entry = match vfd {
+                NetVirtualFdTape::Epoll { interests } => NetFd::Epoll {
+                    interests: interests
+                        .into_iter()
+                        .map(|(wfd, ev, ud)| (wfd, (ev, ud)))
+                        .collect(),
+                },
+                NetVirtualFdTape::EventFd {
+                    counter,
+                    nonblocking,
+                } => NetFd::EventFd {
+                    counter,
+                    nonblocking,
+                },
+                NetVirtualFdTape::Pipe {
+                    pipe_id,
+                    is_read_end,
+                    nonblocking,
+                } => NetFd::Pipe {
+                    pipe_id,
+                    is_read_end,
+                    nonblocking,
+                },
+            };
+            self.fds.insert(fd, entry);
+        }
+        self.pipes = state
+            .pipes
+            .into_iter()
+            .map(|(id, ch)| {
+                (
+                    id,
+                    PipeChannel {
+                        buf: ch.buf.into_iter().collect(),
+                        write_closed: ch.write_closed,
+                        read_closed: ch.read_closed,
+                    },
+                )
+            })
+            .collect();
+        self.next_pipe_id = state.next_pipe_id.max(1);
+        self.packets.clear();
     }
 
     fn is_target_allowed(&self, addr: &SocketAddr) -> bool {

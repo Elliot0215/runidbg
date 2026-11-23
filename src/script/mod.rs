@@ -31,7 +31,7 @@ pub(super) struct EmuEntry {
     pub(super) emu: AndroidEmulator,
     pub(super) hooks: Rc<RefCell<JsHookTable>>,
     pub(super) native_hooks: Rc<RefCell<JsNativeHookTable>>,
-    pub(super) modules: Rc<RefCell<Vec<LoadedModule>>>,
+    pub(super) modules: Rc<RefCell<Vec<Option<LoadedModule>>>>,
     pub(super) snapshots: Vec<EmuSnapshot>,
 }
 

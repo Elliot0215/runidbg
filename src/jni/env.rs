@@ -266,6 +266,26 @@ fn call_op_name(base_slot: usize) -> &'static str {
     }
 }
 
+/// JNI 完整可序列化状态（供 `.rtape` 磁带持久化）
+#[derive(Debug, Clone)]
+pub(crate) struct JniTapeState {
+    pub package_name: String,
+    pub device_profile: DeviceProfile,
+    pub objects: crate::jni::types::ObjectTableRaw,
+    pub registered_natives: Vec<RegisteredNative>,
+    pub methods: Vec<(u64, MethodDesc)>,
+    pub next_method_id: u64,
+    pub fields: Vec<(u64, FieldDesc)>,
+    pub next_field_id: u64,
+    pub static_fields: Vec<(String, String, JValue)>,
+    pub dex_count: usize,
+    pub dex_classes: Vec<crate::loader::dex::DexClassInfo>,
+    pub strict_find_class: bool,
+    pub pending_exception: JObjectRef,
+    pub utf_buffers: Vec<(u64, JObjectRef)>,
+    pub array_buffers: Vec<(u64, JObjectRef, usize)>,
+}
+
 /// JNI 运行时可变状态快照（供 `EmuSnapshot` 完整回滚对象表与临时缓冲映射）
 #[derive(Debug, Clone)]
 pub struct JniSnapshot {
@@ -547,6 +567,123 @@ impl JniVm {
 
         self.initialized = true;
         Ok(())
+    }
+
+    /// 按目标后端重写 `JavaVM*` 与 `JNIEnv*` 全部跳板槽位指令（`RET` 或 `SVC #0x1002`）
+    pub(crate) fn rewrite_trampolines_for_backend<B: CpuBackend + ?Sized>(
+        &self,
+        uc: &mut B,
+        mem: &MemoryManager,
+    ) -> EmuResult<()> {
+        let tramp_insn = if uc.uses_svc_trampolines() {
+            ARM64_SVC_JNI_INSN
+        } else {
+            ARM64_RET_INSN
+        };
+        for slot in 0..VM_SLOT_COUNT {
+            let tramp = JNI_TRAMPOLINE_BASE + (slot as u64) * 4;
+            mem.write_u32(uc, tramp, tramp_insn)?;
+        }
+        for slot in 0..ENV_SLOT_COUNT {
+            let tramp = JNI_TRAMPOLINE_BASE + ((ENV_TRAMPOLINE_SLOT_OFFSET + slot) as u64) * 4;
+            mem.write_u32(uc, tramp, tramp_insn)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn export_tape_state(&self) -> JniTapeState {
+        let (dex_count, dex_classes) = self.dex_index.export_raw();
+        JniTapeState {
+            package_name: self.package_name.clone(),
+            device_profile: self.device_profile.clone(),
+            objects: self.objects.export_raw(),
+            registered_natives: self.registered_natives.clone(),
+            methods: self
+                .methods
+                .iter()
+                .map(|(&id, m)| (id, m.clone()))
+                .collect(),
+            next_method_id: self.next_method_id,
+            fields: self
+                .fields
+                .iter()
+                .map(|(&id, f)| (id, f.clone()))
+                .collect(),
+            next_field_id: self.next_field_id,
+            static_fields: self
+                .static_fields
+                .iter()
+                .map(|((c, f), &v)| (c.clone(), f.clone(), v))
+                .collect(),
+            dex_count,
+            dex_classes,
+            strict_find_class: self.strict_find_class,
+            pending_exception: self.pending_exception,
+            utf_buffers: self.utf_buffers.iter().map(|(&a, &r)| (a, r)).collect(),
+            array_buffers: self
+                .array_buffers
+                .iter()
+                .map(|(&a, &(r, l))| (a, r, l))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn restore_tape_state_and_rewrite<B: CpuBackend + ?Sized>(
+        &mut self,
+        uc: &mut B,
+        mem: &MemoryManager,
+        state: JniTapeState,
+    ) -> EmuResult<()> {
+        self.package_name = state.package_name;
+        self.device_profile = state.device_profile;
+        self.objects = ObjectTable::from_raw(state.objects);
+        self.registered_natives = state.registered_natives;
+        self.methods.clear();
+        self.method_lookup.clear();
+        for (id, desc) in state.methods {
+            self.method_lookup.insert(
+                (
+                    desc.class_name.clone(),
+                    desc.name.clone(),
+                    desc.sig.clone(),
+                    desc.is_static,
+                ),
+                id,
+            );
+            self.methods.insert(id, desc);
+        }
+        self.next_method_id = state.next_method_id;
+        self.fields.clear();
+        self.field_lookup.clear();
+        for (id, desc) in state.fields {
+            self.field_lookup.insert(
+                (
+                    desc.class_name.clone(),
+                    desc.name.clone(),
+                    desc.sig.clone(),
+                    desc.is_static,
+                ),
+                id,
+            );
+            self.fields.insert(id, desc);
+        }
+        self.next_field_id = state.next_field_id;
+        self.static_fields = state
+            .static_fields
+            .into_iter()
+            .map(|(c, f, v)| ((c, f), v))
+            .collect();
+        self.dex_index = DexIndex::from_raw(state.dex_count, state.dex_classes);
+        self.strict_find_class = state.strict_find_class;
+        self.pending_exception = state.pending_exception;
+        self.utf_buffers = state.utf_buffers.into_iter().collect();
+        self.array_buffers = state
+            .array_buffers
+            .into_iter()
+            .map(|(a, r, l)| (a, (r, l)))
+            .collect();
+        self.initialized = true;
+        self.rewrite_trampolines_for_backend(uc, mem)
     }
 
     #[inline]

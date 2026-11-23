@@ -145,6 +145,8 @@ mod imp {
         host_pages_16k: BTreeMap<u64, *mut u8>,
         /// Android 4KB 逻辑已映射页集合
         logical_pages_4k: BTreeSet<u64>,
+        /// 初始化完成后置为 true，保护内部 EL1 页表/向量表保留区间 [0x4000, 0xC000) 不被 Guest 覆盖
+        vm_initialized: bool,
         stop_requested: bool,
     }
 
@@ -167,6 +169,7 @@ mod imp {
                 exit,
                 host_pages_16k: BTreeMap::new(),
                 logical_pages_4k: BTreeSet::new(),
+                vm_initialized: false,
                 stop_requested: false,
             };
 
@@ -179,6 +182,7 @@ mod imp {
             cpu.mem_map(VBAR_EL1_ADDR, PAGE_SIZE, Prot::READ | Prot::EXEC)?;
             let vec_table = build_el1_vector_table(HVF_HVC_TRAP_INSN);
             cpu.mem_write(VBAR_EL1_ADDR, &vec_table)?;
+            cpu.vm_initialized = true;
 
             cpu.set_sys_reg(HV_SYS_REG_VBAR_EL1, VBAR_EL1_ADDR)?;
             cpu.set_sys_reg(HV_SYS_REG_CPACR_EL1, CPACR_EL1_FPEN_ALL)?;
@@ -269,7 +273,9 @@ mod imp {
                     detail: e.to_string(),
                 };
             }
-            if let Err(e) = self.set_reg(HV_REG_CPSR, PSTATE_EL0T) {
+            let cur_cpsr = self.get_reg(HV_REG_CPSR).unwrap_or(PSTATE_EL0T);
+            let next_cpsr = (cur_cpsr & 0xF000_0000) | PSTATE_EL0T;
+            if let Err(e) = self.set_reg(HV_REG_CPSR, next_cpsr) {
                 return RunStopReason::IllegalInstruction {
                     pc: start_pc,
                     detail: e.to_string(),
@@ -500,7 +506,11 @@ mod imp {
             match reg {
                 RegisterARM64::SP => self.set_sys_reg(HV_SYS_REG_SP_EL0, val),
                 RegisterARM64::PC => self.set_reg(HV_REG_PC, val),
-                RegisterARM64::NZCV | RegisterARM64::PSTATE => self.set_reg(HV_REG_CPSR, val),
+                RegisterARM64::NZCV | RegisterARM64::PSTATE => {
+                    let cur = self.get_reg(HV_REG_CPSR).unwrap_or(PSTATE_EL0T);
+                    let next = (cur & !0xF000_0000) | (val & 0xF000_0000);
+                    self.set_reg(HV_REG_CPSR, next)
+                }
                 RegisterARM64::TPIDR_EL0 => self.set_sys_reg(HV_SYS_REG_TPIDR_EL0, val),
                 RegisterARM64::FPCR => self.set_reg(HV_REG_FPCR, val),
                 RegisterARM64::FPSR => self.set_reg(HV_REG_FPSR, val),
@@ -591,6 +601,11 @@ mod imp {
         fn mem_map(&mut self, addr: u64, size: u64, _prot: Prot) -> EmuResult<()> {
             let start = align_down(addr, PAGE_SIZE);
             let end = align_up(addr.saturating_add(size), PAGE_SIZE);
+            if self.vm_initialized && start < 0xC000 && end > 0x4000 {
+                return Err(EmuError::Backend(format!(
+                    "Hypervisor 拒绝映射与 EL1 页表/向量表冲突的保留地址区间: [0x{start:x}, 0x{end:x})"
+                )));
+            }
             let mut cur = start;
             while cur < end {
                 let ipa_16k = align_down(cur, HV_PAGE_SIZE);
@@ -604,6 +619,11 @@ mod imp {
         fn mem_unmap(&mut self, addr: u64, size: u64) -> EmuResult<()> {
             let start = align_down(addr, PAGE_SIZE);
             let end = align_up(addr.saturating_add(size), PAGE_SIZE);
+            if self.vm_initialized && start < 0xC000 && end > 0x4000 {
+                return Err(EmuError::Backend(format!(
+                    "Hypervisor 拒绝卸载 EL1 页表/向量表保留地址区间: [0x{start:x}, 0x{end:x})"
+                )));
+            }
             let mut touched_16k = BTreeSet::new();
             let mut cur = start;
             while cur < end {

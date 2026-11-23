@@ -234,20 +234,29 @@
     };
   }
 
-  global.Emu = {
-    backends() {
-      return __native.emuCompiledBackends();
-    },
-    create(opts = {}) {
-      const packageName = opts.packageName || "com.example.app";
-      const searchPaths = Array.isArray(opts.searchPaths) ? opts.searchPaths.map(String) : [];
-      const hleAccel = opts.hleAccel !== undefined ? Boolean(opts.hleAccel) : true;
-      const heapSize = opts.heapSize !== undefined ? Number(opts.heapSize) : 32 * 1024 * 1024;
-      const requestedBackend = opts.backend !== undefined ? String(opts.backend) : "unicorn";
-      const emuId = __native.emuCreate(packageName, searchPaths, hleAccel, heapSize, requestedBackend);
+  function normalizeTapeCheckpoint(cp) {
+    if (cp === undefined || cp === null) return null;
+    if (typeof cp === "number") {
+      if (!Number.isInteger(cp) || cp < 0) {
+        throw new RangeError(`无效的磁带检查点索引: ${cp}（必须为非负整数）`);
+      }
+      return `idx:${cp}`;
+    }
+    if (typeof cp === "string") {
+      if (cp.length === 0) {
+        throw new RangeError("磁带检查点书签名不能为空字符串（如需最新检查点请省略参数或传 'latest'）");
+      }
+      if (cp.toLowerCase() === "latest") return "latest";
+      return `label:${cp}`;
+    }
+    throw new TypeError(`无效的磁带检查点类型: ${typeof cp}（期望 number 或 string）`);
+  }
+
+  function buildEmuHandle(emuId, opts = {}, tapeCheckpoint = null) {
       const backend = __native.emuBackend(emuId);
       const supportsTrace = backend === "unicorn";
       const supportsGdb = backend === "unicorn";
+      let currentTapeCheckpoint = tapeCheckpoint;
 
       const memNs = {
         alloc(size) {
@@ -319,10 +328,27 @@
         backend,
         supportsTrace,
         supportsGdb,
+        get tapeCheckpoint() {
+          return currentTapeCheckpoint;
+        },
         load(path, loadOpts = {}) {
           const runInit = loadOpts && loadOpts.runInit === false ? false : true;
           const info = __native.emuLoad(emuId, String(path), runInit);
           return makeModule(emuId, info);
+        },
+        modules() {
+          return __native.emuModules(emuId).map((info) => makeModule(emuId, info));
+        },
+        module(name) {
+          const target = String(name);
+          const list = __native.emuModules(emuId);
+          const hit = list.find(
+            (m) =>
+              m.name === target ||
+              m.name.endsWith("/" + target) ||
+              target.endsWith("/" + m.name)
+          );
+          return hit ? makeModule(emuId, hit) : null;
         },
         loadDex(pathOrPaths) {
           const list = Array.isArray(pathOrPaths)
@@ -817,7 +843,61 @@
         restore(snapId) {
           __native.emuRestore(emuId, Number(snapId));
         },
+        saveTape(path, label) {
+          return __native.emuSaveTape(
+            emuId,
+            String(path),
+            label !== undefined && label !== null ? String(label) : null
+          );
+        },
+        checkpointTape(path, label) {
+          return __native.emuCheckpointTape(
+            emuId,
+            String(path),
+            label !== undefined && label !== null ? String(label) : null
+          );
+        },
+        seekTape(path, checkpoint) {
+          const info = __native.emuSeekTape(
+            emuId,
+            String(path),
+            normalizeTapeCheckpoint(checkpoint)
+          );
+          currentTapeCheckpoint = info;
+          return info;
+        },
       };
+  }
+
+  global.Emu = {
+    backends() {
+      return __native.emuCompiledBackends();
+    },
+    create(opts = {}) {
+      const packageName = opts.packageName || "com.example.app";
+      const searchPaths = Array.isArray(opts.searchPaths) ? opts.searchPaths.map(String) : [];
+      const hleAccel = opts.hleAccel !== undefined ? Boolean(opts.hleAccel) : true;
+      const heapSize = opts.heapSize !== undefined ? Number(opts.heapSize) : 32 * 1024 * 1024;
+      const requestedBackend =
+        opts.backend !== undefined && opts.backend !== null ? String(opts.backend) : "unicorn";
+      const emuId = __native.emuCreate(packageName, searchPaths, hleAccel, heapSize, requestedBackend);
+      return buildEmuHandle(emuId, opts, null);
+    },
+    loadTape(path, opts = {}) {
+      const safeOpts = opts || {};
+      const backend =
+        safeOpts.backend !== undefined && safeOpts.backend !== null
+          ? String(safeOpts.backend)
+          : "unicorn";
+      const checkpoint = normalizeTapeCheckpoint(safeOpts.checkpoint);
+      const searchPaths = Array.isArray(safeOpts.searchPaths)
+        ? safeOpts.searchPaths.map(String)
+        : null;
+      const res = __native.emuLoadTape(String(path), checkpoint, backend, searchPaths);
+      return buildEmuHandle(res.emuId, safeOpts, res.checkpoint);
+    },
+    inspectTape(path) {
+      return __native.emuInspectTape(String(path));
     },
   };
 })(globalThis);

@@ -25,6 +25,19 @@ const SYS_MODULE_BASE: u64 = 0x2000_0000;
 const APP_MODULE_BASE: u64 = 0x4000_0000;
 const MODULE_ALIGN: u64 = 0x0010_0000; // 1MB 模块间隔对齐
 
+/// 动态链接器可序列化状态（供 `.rtape` 磁带持久化）
+#[derive(Debug, Clone)]
+pub(crate) struct LinkerTapeState {
+    pub modules: Vec<LoadedModule>,
+    pub load_order: Vec<String>,
+    pub next_sys_base: u64,
+    pub next_app_base: u64,
+    pub hle_overrides: Vec<String>,
+    pub next_tls_offset: u64,
+    pub search_paths: Vec<String>,
+    pub memory_libs: Vec<(String, Vec<u8>)>,
+}
+
 /// 双轨混合动态链接器
 ///
 /// 支持：
@@ -114,9 +127,58 @@ impl DynamicLinker {
         &self.load_order
     }
 
+    /// 返回按加载顺序排列的全部已加载模块副本
+    pub fn all_modules(&self) -> Vec<LoadedModule> {
+        self.load_order
+            .iter()
+            .filter_map(|name| self.modules.get(name).cloned())
+            .collect()
+    }
+
     /// 按模块名查询已加载的 `LoadedModule`
     pub fn get_module(&self, name: &str) -> Option<&LoadedModule> {
         self.modules.get(name)
+    }
+
+    pub(crate) fn export_tape_state(&self) -> LinkerTapeState {
+        LinkerTapeState {
+            modules: self.all_modules(),
+            load_order: self.load_order.clone(),
+            next_sys_base: self.next_sys_base,
+            next_app_base: self.next_app_base,
+            hle_overrides: self.hle_overrides.iter().cloned().collect(),
+            next_tls_offset: self.next_tls_offset,
+            search_paths: self
+                .search_paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            memory_libs: self
+                .memory_libs
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn restore_tape_state(&mut self, state: LinkerTapeState) {
+        self.modules.clear();
+        for m in state.modules {
+            self.modules.insert(m.name.clone(), m);
+        }
+        self.load_order = state.load_order;
+        self.next_sys_base = state.next_sys_base;
+        self.next_app_base = state.next_app_base;
+        self.hle_overrides = state.hle_overrides.into_iter().collect();
+        self.next_tls_offset = state.next_tls_offset;
+        // 保留调用方在 Builder 中显式传入的 search_paths，并追加磁带中在当前宿主机存在的路径
+        for p in state.search_paths {
+            let pb = PathBuf::from(p);
+            if pb.exists() && !self.search_paths.contains(&pb) {
+                self.search_paths.push(pb);
+            }
+        }
+        self.memory_libs = state.memory_libs.into_iter().collect();
     }
 
     /// 从文件路径加载目标 `.so`（递归加载 `DT_NEEDED` 依赖，并可选执行 `.init_array`）

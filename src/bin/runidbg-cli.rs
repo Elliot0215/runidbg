@@ -49,6 +49,8 @@ fn print_usage() {
                      [--allow-reload] [--allow-eval] [-- <args...>]\n\
            runidbg-cli mcp [--script <init.js>] [--cwd <dir>] [--http 127.0.0.1:8090]         启动 MCP 服务端 (stdio / HTTP)\n\
            runidbg-cli debug <lib.so> <symbol|0xaddr> [--listen 127.0.0.1:1234] [--pkg PKG]   启动 GDB RSP 远程调试服务端（仅 Unicorn）\n\
+           runidbg-cli debug --tape <file.rtape> [--checkpoint <idx|label>] [sym|0xaddr]      从 .rtape 磁带接力启动 GDB RSP（支持跨后端）\n\
+           runidbg-cli tape info <file.rtape>                                                 查看 .rtape 磁带检查点时间线与压缩统计\n\
            runidbg-cli init-types [dir]                                                       生成 runidbg.d.ts 类型声明\n\
            runidbg-cli dump <trace.idx> [--ext <trace.ext>] [--base <hex>] [--skip N] [--limit N]\n\
            runidbg-cli search <trace.idx> [--ext <trace.ext>] [--base <hex>] [--val <hex>] [--addr <hex>] [--pc <hex>]\n\
@@ -296,40 +298,176 @@ fn ui_command(_args: &[String]) -> Result<()> {
     bail!("当前构建未启用 Web UI（默认关闭以保持精简），请使用 `cargo build --release --features ui` 重新编译")
 }
 
-fn debug_gdb_command(args: &[String]) -> Result<()> {
-    if args.len() < 2 {
-        bail!("用法: runidbg-cli debug <lib.so> <symbol|0xaddr> [--listen 127.0.0.1:1234] [--pkg com.example.app]");
+fn tape_command(args: &[String]) -> Result<()> {
+    if args.len() != 2 || args[0] != "info" {
+        bail!("用法: runidbg-cli tape info <file.rtape>");
     }
-    let so_path = PathBuf::from(&args[0]);
-    let target = args[1].as_str();
+    let path = PathBuf::from(&args[1]);
+    let summary = runidbg_arm64_emu_tracer::Tape::inspect_file(&path)?;
+    println!(
+        "RTAPE v{} | 文件: {} | 总大小: {:.2} KB ({} bytes) | 检查点数: {}",
+        summary.version,
+        path.display(),
+        summary.file_size as f64 / 1024.0,
+        summary.file_size,
+        summary.checkpoints.len()
+    );
+    println!(
+        "{:<4} {:<20} {:<6} {:<11} {:>7} {:>6} {:>7} {:>10} {:>10}  MODULES",
+        "IDX", "LABEL", "TYPE", "BACKEND", "PAGES", "ZERO", "UNMAP", "COMP(KB)", "RAW(KB)"
+    );
+    for cp in &summary.checkpoints {
+        let kind = if cp.is_delta { "DELTA" } else { "BASE" };
+        println!(
+            "{:<4} {:<20} {:<6} {:<11} {:>7} {:>6} {:>7} {:>10.1} {:>10.1}  {}",
+            cp.index,
+            cp.label,
+            kind,
+            cp.source_backend,
+            cp.stored_pages,
+            cp.zeroed_pages,
+            cp.removed_pages,
+            cp.compressed_bytes as f64 / 1024.0,
+            cp.uncompressed_bytes as f64 / 1024.0,
+            cp.modules.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn take_flag_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str> {
+    if *i + 1 >= args.len() || args[*i + 1].starts_with("--") {
+        bail!("debug 参数 `{flag}` 缺少参数值");
+    }
+    let val = args[*i + 1].as_str();
+    *i += 2;
+    Ok(val)
+}
+
+fn debug_gdb_command(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!(
+            "用法:\n  runidbg-cli debug <lib.so> <symbol|0xaddr> [--listen 127.0.0.1:1234] [--pkg com.example.app]\n  runidbg-cli debug --tape <file.rtape> [--checkpoint <idx|label>] [<symbol|0xaddr>] [--listen 127.0.0.1:1234]"
+        );
+    }
     let mut listen_addr = "127.0.0.1:1234".to_string();
-    let mut pkg = "com.example.app".to_string();
-    let mut i = 2;
+    let mut pkg: Option<String> = None;
+    let mut tape_path: Option<PathBuf> = None;
+    let mut checkpoint_sel: Option<runidbg_arm64_emu_tracer::TapeSelector> = None;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--listen" if i + 1 < args.len() => {
-                listen_addr = args[i + 1].clone();
-                i += 2;
+            "--listen" => {
+                listen_addr = take_flag_value(args, &mut i, "--listen")?.to_string();
             }
-            "--pkg" if i + 1 < args.len() => {
-                pkg = args[i + 1].clone();
-                i += 2;
+            "--pkg" => {
+                pkg = Some(take_flag_value(args, &mut i, "--pkg")?.to_string());
             }
-            "--backend" if i + 1 < args.len() => {
-                let kind: runidbg_arm64_emu_tracer::BackendKind = args[i + 1].parse()?;
+            "--tape" => {
+                tape_path = Some(PathBuf::from(take_flag_value(args, &mut i, "--tape")?));
+            }
+            "--checkpoint" => {
+                let raw = take_flag_value(args, &mut i, "--checkpoint")?;
+                checkpoint_sel = Some(runidbg_arm64_emu_tracer::TapeSelector::parse(raw));
+            }
+            "--backend" => {
+                let raw = take_flag_value(args, &mut i, "--backend")?;
+                let kind: runidbg_arm64_emu_tracer::BackendKind = raw.parse()?;
                 if !kind.supports_gdb() {
                     bail!(
                         "GDB 调试模式仅支持 `unicorn` 后端，后端 `{kind}` 仅限仿真模式使用"
                     );
                 }
-                i += 2;
             }
-            other => bail!("debug 未知参数: {other}"),
+            other if other.starts_with("--") => bail!("debug 未知参数: {other}"),
+            other => {
+                positional.push(other.to_string());
+                i += 1;
+            }
         }
     }
 
+    if let Some(tape) = tape_path {
+        if positional.len() > 1 {
+            bail!(
+                "debug --tape 最多只接受 1 个目标符号/地址，多余参数: {}",
+                positional[1..].join(" ")
+            );
+        }
+        if pkg.is_some() {
+            eprintln!("[runidbg-gdb] 警告: --tape 模式沿用磁带内保存的包名，--pkg 参数将被忽略");
+        }
+        let sel = checkpoint_sel.unwrap_or(runidbg_arm64_emu_tracer::TapeSelector::Latest);
+        let (mut emu, info) = runidbg_arm64_emu_tracer::AndroidEmulator::from_tape_with_builder(
+            &tape,
+            &sel,
+            runidbg_arm64_emu_tracer::AndroidEmulator::builder()
+                .backend(runidbg_arm64_emu_tracer::BackendKind::Unicorn),
+        )?;
+        if let Some(target) = positional.first() {
+            let start_pc = if target.starts_with("0x") || target.starts_with("0X") {
+                parse_u64_hex_or_dec(target)?
+            } else {
+                // 逆序查找模块（主业务库位于 DT_NEEDED 依赖之后，优先命中主库符号）
+                emu.linker()
+                    .all_modules()
+                    .iter()
+                    .rev()
+                    .find_map(|m| m.find_symbol(target).ok())
+                    .with_context(|| format!("磁带已加载模块中未找到导出符号: {target}"))?
+            };
+            eprintln!(
+                "[runidbg-gdb] 已从磁带 {} 接力恢复检查点 #{} `{}` (源后端={}, 模块={}) -> Unicorn GDB @ 0x{:016x}",
+                tape.display(),
+                info.index,
+                info.label,
+                info.source_backend,
+                info.modules.join(", "),
+                start_pc
+            );
+            return runidbg_arm64_emu_tracer::debug::GdbServer::serve(
+                &mut emu,
+                &listen_addr,
+                start_pc,
+                &[],
+            );
+        } else {
+            let saved_pc = runidbg_arm64_emu_tracer::CpuBackend::reg_read(
+                emu.cpu(),
+                unicorn_engine::RegisterARM64::PC,
+            )?;
+            if saved_pc == 0 || saved_pc == runidbg_arm64_emu_tracer::cpu::RET_MAGIC_ADDR {
+                eprintln!(
+                    "[runidbg-gdb] 警告: 该检查点保存的 PC 为 0x{saved_pc:016x}（处于函数返回/空闲态）；如需调试指定函数，请补充 <symbol|0xaddr> 参数"
+                );
+            }
+            eprintln!(
+                "[runidbg-gdb] 已从磁带 {} 无损恢复检查点 #{} `{}` (源后端={}, 模块={}) -> Unicorn GDB @ 0x{:016x} (保留原 LR/寄存器)",
+                tape.display(),
+                info.index,
+                info.label,
+                info.source_backend,
+                info.modules.join(", "),
+                saved_pc
+            );
+            return runidbg_arm64_emu_tracer::debug::GdbServer::serve_resume(
+                &mut emu,
+                &listen_addr,
+            );
+        }
+    }
+
+    if checkpoint_sel.is_some() {
+        bail!("--checkpoint 参数仅可与 --tape 配合使用");
+    }
+    if positional.len() != 2 {
+        bail!("用法: runidbg-cli debug <lib.so> <symbol|0xaddr> [--listen 127.0.0.1:1234] [--pkg com.example.app]");
+    }
+    let so_path = PathBuf::from(&positional[0]);
+    let target = positional[1].as_str();
     let mut emu = runidbg_arm64_emu_tracer::AndroidEmulator::builder()
-        .package_name(pkg)
+        .package_name(pkg.unwrap_or_else(|| "com.example.app".to_string()))
         .build()?;
     let module = emu.load_library(&so_path)?;
     let start_pc = if target.starts_with("0x") || target.starts_with("0X") {
@@ -392,6 +530,7 @@ fn main() -> Result<()> {
         "serve" => return serve_rpc_command(&args[2..]),
         "mcp" => return mcp_command(&args[2..]),
         "debug" => return debug_gdb_command(&args[2..]),
+        "tape" => return tape_command(&args[2..]),
         "ui" => return ui_command(&args[2..]),
         "init-types" => return init_types_command(&args[2..]),
         "-h" | "--help" | "help" => {

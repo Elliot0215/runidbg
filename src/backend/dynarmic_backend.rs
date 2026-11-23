@@ -1019,6 +1019,7 @@ impl CpuBackend for DynarmicCpu {
                 .invalidate_cache_range(begin, (end - begin) as usize);
         } else {
             self.jit.clear_cache();
+            self.jit.clear_exclusive_state();
         }
         Ok(())
     }

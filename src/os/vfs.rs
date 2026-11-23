@@ -21,7 +21,7 @@ pub const O_TRUNC: u32 = 0o1000;
 
 /// 打开的文件描述符状态
 #[derive(Debug, Clone)]
-enum OpenFileKind {
+pub(crate) enum OpenFileKind {
     /// 内存缓冲（合成文件或只读宿主机文件快照）
     Buffer { data: Vec<u8>, cursor: usize },
     /// 直接关联到 `overlay_files` 的可读写虚拟文件
@@ -38,9 +38,30 @@ enum OpenFileKind {
 }
 
 #[derive(Debug, Clone)]
-struct OpenFile {
-    path: String,
-    kind: OpenFileKind,
+pub(crate) struct OpenFile {
+    pub path: String,
+    pub kind: OpenFileKind,
+}
+
+/// `VirtualFs` 可序列化状态（供 `.rtape` 磁带持久化）
+#[derive(Debug, Clone)]
+pub(crate) struct VfsTapeState {
+    pub package_name: String,
+    pub pid: u32,
+    pub ppid: u32,
+    pub uid: u32,
+    pub tid: u32,
+    pub properties: Vec<(String, String)>,
+    pub device: DeviceProfile,
+    pub sysroot_mounts: Vec<(String, String)>,
+    pub overlay_files: Vec<(String, Vec<u8>)>,
+    pub overlay_dirs: Vec<String>,
+    pub fds: Vec<(i32, OpenFile)>,
+    pub next_fd: i32,
+    pub rng_state: u64,
+    pub mono_clock_ns: u64,
+    pub use_real_clock: bool,
+    pub net: crate::os::net::NetTapeState,
 }
 
 /// Overlay 虚拟文件系统与进程/设备属性上下文
@@ -177,6 +198,69 @@ impl VirtualFs {
 
     pub fn diag(&self) -> &EnvDiag {
         &self.diag
+    }
+
+    pub(crate) fn export_tape_state(&self) -> VfsTapeState {
+        VfsTapeState {
+            package_name: self.package_name.clone(),
+            pid: self.pid,
+            ppid: self.ppid,
+            uid: self.uid,
+            tid: self.tid,
+            properties: self
+                .properties
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            device: self.device.clone(),
+            sysroot_mounts: self
+                .sysroot_mounts
+                .iter()
+                .map(|(prefix, path)| (prefix.clone(), path.to_string_lossy().into_owned()))
+                .collect(),
+            overlay_files: self
+                .overlay_files
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            overlay_dirs: self.overlay_dirs.iter().cloned().collect(),
+            fds: self.fds.iter().map(|(&fd, f)| (fd, f.clone())).collect(),
+            next_fd: self.next_fd,
+            rng_state: self.rng_state,
+            mono_clock_ns: self.mono_clock_ns,
+            use_real_clock: self.use_real_clock,
+            net: self.net.export_tape_state(),
+        }
+    }
+
+    pub(crate) fn restore_tape_state(&mut self, state: VfsTapeState) {
+        self.package_name = state.package_name;
+        self.pid = state.pid;
+        self.ppid = state.ppid;
+        self.uid = state.uid;
+        self.tid = state.tid;
+        self.properties = state.properties.into_iter().collect();
+        self.device = state.device;
+        // 保留调用方显式挂载的 sysroot，同时补充磁带记录且在当前宿主机存在的挂载点
+        for (prefix, host_str) in state.sysroot_mounts {
+            let pb = PathBuf::from(host_str);
+            if pb.exists()
+                && !self
+                    .sysroot_mounts
+                    .iter()
+                    .any(|(p, h)| p == &prefix && h == &pb)
+            {
+                self.sysroot_mounts.push((prefix, pb));
+            }
+        }
+        self.overlay_files = state.overlay_files.into_iter().collect();
+        self.overlay_dirs = state.overlay_dirs.into_iter().collect();
+        self.fds = state.fds.into_iter().collect();
+        self.next_fd = state.next_fd.max(3);
+        self.rng_state = state.rng_state;
+        self.mono_clock_ns = state.mono_clock_ns;
+        self.use_real_clock = state.use_real_clock;
+        self.net.restore_tape_state(state.net);
     }
 
     pub fn breadcrumbs(&self) -> &BreadcrumbRing {

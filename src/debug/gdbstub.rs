@@ -124,7 +124,7 @@ impl GdbServer {
         Self::serve_listener(emu, listener, start_pc, args)
     }
 
-    /// 使用已绑定的 `TcpListener` 启动单次 GDB RSP 调试会话（便于测试使用 `127.0.0.1:0`）
+    /// 使用已绑定的 `TcpListener` 启动单次 GDB RSP 调试会话（重置调用帧 `X0..X7` / `LR=RET_MAGIC_ADDR` / `PC=start_pc`）
     pub fn serve_listener(
         emu: &mut AndroidEmulator,
         listener: TcpListener,
@@ -145,6 +145,43 @@ impl GdbServer {
         emu.uc_mut().reg_write(RegisterARM64::LR, RET_MAGIC_ADDR)?;
         emu.uc_mut().reg_write(RegisterARM64::PC, start_pc)?;
 
+        let (stream, _peer) = listener.accept().context("接收 GDB 客户端连接失败")?;
+        Self::handle_client(emu, stream)
+    }
+
+    /// 绑定并启动“无损恢复” GDB RSP 会话（不改写已保存的 `PC`/`LR`/`SP`/`X0..X7`，适用于 `.rtape` 断点/函数体中段恢复调试）
+    pub fn serve_resume(emu: &mut AndroidEmulator, listen_addr: &str) -> Result<()> {
+        if !emu.backend_kind().supports_gdb() {
+            return Err(crate::error::EmuError::Backend(format!(
+                "当前后端 `{}` 仅支持仿真模式，不支持 GDB 调试模式（GDB 仅支持 `unicorn` 后端）",
+                emu.backend_kind()
+            ))
+            .into());
+        }
+        let listener = TcpListener::bind(listen_addr)
+            .with_context(|| format!("绑定 GDB Stub 监听地址失败: {listen_addr}"))?;
+        let pc = emu.uc().reg_read(RegisterARM64::PC).unwrap_or(0);
+        tracing::info!(
+            target: "runidbg::gdb",
+            addr = %listener.local_addr()?,
+            pc = format_args!("0x{pc:016x}"),
+            "等待 GDB/IDA 调试器连入（无损恢复模式）"
+        );
+        Self::serve_listener_resume(emu, listener)
+    }
+
+    /// 使用已绑定的 `TcpListener` 启动无损恢复 GDB RSP 调试会话（保留当前所有寄存器，便于测试 `127.0.0.1:0`）
+    pub fn serve_listener_resume(
+        emu: &mut AndroidEmulator,
+        listener: TcpListener,
+    ) -> Result<()> {
+        if !emu.backend_kind().supports_gdb() {
+            return Err(crate::error::EmuError::Backend(format!(
+                "当前后端 `{}` 仅支持仿真模式，不支持 GDB 调试模式（GDB 仅支持 `unicorn` 后端）",
+                emu.backend_kind()
+            ))
+            .into());
+        }
         let (stream, _peer) = listener.accept().context("接收 GDB 客户端连接失败")?;
         Self::handle_client(emu, stream)
     }

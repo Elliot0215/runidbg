@@ -178,29 +178,31 @@ impl CpuContext {
         mem.write_u32(uc, pthread_struct_addr + 0x10, tid)?;
         mem.write_u32(uc, errno_addr, 0)?;
 
-        if uc.uses_svc_trampolines() {
-            // 非 Unicorn 后端直接写 TPIDR_EL0 寄存器，无需跑初始化小代码
-            uc.reg_write(RegisterARM64::TPIDR_EL0, tls_base)?;
-        } else {
-            // 执行 `msr tpidr_el0, x0; isb` 将 tls_base 写入 TPIDR_EL0
-            const SET_TPIDR_INSNS: [u32; 2] = [0xD51B_D040, 0xD503_3FDF];
-            let mut code = [0u8; 8];
-            for (i, insn) in SET_TPIDR_INSNS.iter().enumerate() {
-                code[i * 4..(i + 1) * 4].copy_from_slice(&insn.to_le_bytes());
-            }
-
-            let stub_addr = CPU_INIT_STUB_ADDR + 0x40;
-            mem.write(uc, stub_addr, &code)?;
-            uc.reg_write(RegisterARM64::X0, tls_base)?;
-            uc.run_simple(
-                stub_addr,
-                stub_addr + code.len() as u64,
-                0,
-                SET_TPIDR_INSNS.len(),
-            )?;
-        }
+        Self::write_tpidr_el0(uc, mem, tls_base)?;
 
         Ok(errno_addr)
+    }
+
+    /// 跨后端设置 `TPIDR_EL0` 寄存器（Unicorn 2.1.x 与 Dynarmic/Hypervisor/KVM 均支持直接写寄存器，不污染 Trace/Hook/VMA）
+    pub fn write_tpidr_el0<B: CpuBackend + ?Sized>(
+        uc: &mut B,
+        _mem: &mut MemoryManager,
+        tls_base: u64,
+    ) -> EmuResult<()> {
+        uc.reg_write(RegisterARM64::TPIDR_EL0, tls_base)
+    }
+
+    /// 按目标后端模式重写 `RET_MAGIC_ADDR` 返回哨兵指令（供跨后端磁带恢复使用）
+    pub fn rewrite_ret_magic<B: CpuBackend + ?Sized>(
+        uc: &mut B,
+        mem: &MemoryManager,
+    ) -> EmuResult<()> {
+        let insn: u32 = if uc.uses_svc_trampolines() {
+            ARM64_SVC_RET_INSN
+        } else {
+            0xD65F_03C0 // RET
+        };
+        mem.write_u32(uc, RET_MAGIC_ADDR, insn)
     }
 
     /// 重置函数调用帧并按 AAPCS64 调用约定写入前 8 个整型/指针参数 (X0..X7)

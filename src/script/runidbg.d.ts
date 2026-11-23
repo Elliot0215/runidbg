@@ -498,6 +498,39 @@ interface DexNamespace {
   classInfo(className: string): DexClassInfo | null;
 }
 
+interface TapeCheckpointInfo {
+  readonly index: number;
+  readonly label: string;
+  readonly timestampMs: number;
+  readonly sourceBackend: string;
+  readonly insnCount: number;
+  readonly isDelta: boolean;
+  readonly storedPages: number;
+  readonly zeroedPages: number;
+  readonly removedPages: number;
+  readonly compressedBytes: number;
+  readonly uncompressedBytes: number;
+  readonly modules: string[];
+}
+
+interface TapeSummary {
+  readonly version: number;
+  readonly fileSize: number;
+  readonly checkpoints: TapeCheckpointInfo[];
+}
+
+interface LoadTapeOptions {
+  /** 恢复到哪个目标后端（支持跨后端接力，如从 Dynarmic/Hyper/KVM 磁带切入 `"unicorn"` 做 Trace/GDB） */
+  backend?: EmuBackendKind;
+  /** 指定检查点序号、书签名或 `"latest"`（默认最新检查点） */
+  checkpoint?: number | string;
+  /** 额外追加的依赖库搜索路径（会保留并与磁带原路径合并） */
+  searchPaths?: string[];
+  device?: DevicePresetName | DeviceProfileConfig;
+  realClock?: boolean;
+  net?: boolean | NetOptions;
+}
+
 interface EmuHandle {
   /** 当前实例使用的规范化 CPU 执行后端名 */
   readonly backend: "unicorn" | "dynarmic" | "kvm" | "hypervisor";
@@ -505,7 +538,13 @@ interface EmuHandle {
   readonly supportsTrace: boolean;
   /** 是否支持 GDB 调试模式（仅 `"unicorn"` 为 true） */
   readonly supportsGdb: boolean;
+  /** 若由 `Emu.loadTape()` 恢复，记录所加载的检查点摘要 */
+  readonly tapeCheckpoint: TapeCheckpointInfo | null;
   load(path: string, opts?: LoadOptions): ModuleHandle;
+  /** 列出当前已加载的全部 ELF 模块（含从 `.rtape` 磁带恢复的模块） */
+  modules(): ModuleHandle[];
+  /** 按模块名查找已加载模块（适用于从 `.rtape` 磁带恢复后直接取回符号表） */
+  module(name: string): ModuleHandle | null;
   /** 加载单个 `.dex`、路径数组或包含 `classes*.dex` 的目录到轻量元数据索引并挂载到 VFS */
   loadDex(pathOrPaths: string | string[]): {
     classes: number;
@@ -530,10 +569,20 @@ interface EmuHandle {
   readonly trace: TraceNamespace;
   snapshot(): number;
   restore(snapshotId: number): void;
+  /** 将当前完整状态保存为 `.rtape` 磁盘磁带（首个全量稀疏基线检查点） */
+  saveTape(path: string, label?: string): TapeSummary;
+  /** 向已有 `.rtape` 磁带追加 4KB 脏页增量检查点（书签） */
+  checkpointTape(path: string, label?: string): TapeCheckpointInfo;
+  /** 将当前实例快进或倒带至 `.rtape` 磁带中的指定检查点（序号 / 书签名 / `"latest"`） */
+  seekTape(path: string, checkpoint?: number | string): TapeCheckpointInfo;
 }
 
 declare namespace Emu {
   /** 返回当前构建在当前操作系统上默认编译启用的执行后端列表 */
   function backends(): Array<"unicorn" | "dynarmic" | "kvm" | "hypervisor">;
   function create(options?: EmuOptions): EmuHandle;
+  /** 从 `.rtape` 磁盘磁带直接拉起实例（支持跨进程秒启与跨后端接力） */
+  function loadTape(path: string, options?: LoadTapeOptions): EmuHandle;
+  /** 读取 `.rtape` 磁带文件摘要与全部检查点时间线 */
+  function inspectTape(path: string): TapeSummary;
 }

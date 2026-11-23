@@ -761,6 +761,35 @@ impl JsNativeHookTable {
         self.syscall_id_to_nr.clear();
         uc.get_data_mut().syscall_interceptor = None;
     }
+
+    /// 磁带录制前临时还原所有 `replace_hooks` 的原始指令（防止将补丁 `RET` 永久烘烤进 `.rtape`）
+    pub fn temporarily_restore_replace_insns(&self, uc: &mut Unicorn<'static, EmuState>) {
+        for rec in self.replace_hooks.values() {
+            let _ = uc.mem_write(rec.addr, &rec.orig_insn);
+        }
+    }
+
+    /// 磁带录制/倒带后重新应用所有 `replace_hooks` 的 `RET` 补丁并刷清对应 TB 页
+    pub fn reapply_replace_ret_insns(&self, uc: &mut Unicorn<'static, EmuState>) {
+        const ARM64_RET_BYTES: [u8; 4] = 0xD65F_03C0u32.to_le_bytes();
+        for rec in self.replace_hooks.values() {
+            if uc.mem_write(rec.addr, &ARM64_RET_BYTES).is_ok() {
+                flush_tb_page(uc, rec.addr, rec.addr);
+            }
+        }
+    }
+
+    /// 磁带倒带/快进后清理残留 `attach` 栈帧与动态 LR Hook，并重打活跃 `replace` 补丁
+    pub fn sync_after_tape_seek(&self, uc: &mut Unicorn<'static, EmuState>) {
+        for rec in self.attach_hooks.values() {
+            let mut st = rec.state.borrow_mut();
+            for (_, lr_hid) in st.lr_hooks.drain() {
+                let _ = uc.remove_hook(lr_hid);
+            }
+            st.frames.clear();
+        }
+        self.reapply_replace_ret_insns(uc);
+    }
 }
 
 /// 解析通配符十六进制特征码（如 `"fd 7b ?? a9 ?? ?? 00 94"`）

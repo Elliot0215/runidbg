@@ -15,6 +15,7 @@ use crate::emulator::{EmuState, DEFAULT_HEAP_BASE};
 use crate::jni::{JObject, JObjectRef, JValue};
 use crate::loader::LoadedModule;
 use crate::memory::read_guest_cstr;
+use crate::tape::{Tape, TapeCheckpointInfo, TapeSelector, TapeSummary};
 use crate::tracer::{BinaryTracer, TraceLevel};
 use crate::AndroidEmulator;
 
@@ -86,6 +87,45 @@ fn with_unicorn_only<R>(
 
 fn throw_err(ctx: &Ctx<'_>, msg: impl std::fmt::Display) -> JsError {
     Exception::throw_message(ctx, &msg.to_string())
+}
+
+fn tape_checkpoint_to_js<'js>(
+    ctx: &Ctx<'js>,
+    info: &TapeCheckpointInfo,
+) -> rquickjs::Result<Object<'js>> {
+    let obj = Object::new(ctx.clone())?;
+    obj.set("index", info.index as f64)?;
+    obj.set("label", info.label.as_str())?;
+    obj.set("timestampMs", info.timestamp_ms as f64)?;
+    obj.set("sourceBackend", info.source_backend.as_str())?;
+    obj.set("insnCount", info.insn_count as f64)?;
+    obj.set("isDelta", info.is_delta)?;
+    obj.set("storedPages", info.stored_pages as f64)?;
+    obj.set("zeroedPages", info.zeroed_pages as f64)?;
+    obj.set("removedPages", info.removed_pages as f64)?;
+    obj.set("compressedBytes", info.compressed_bytes as f64)?;
+    obj.set("uncompressedBytes", info.uncompressed_bytes as f64)?;
+    let mods = Array::new(ctx.clone())?;
+    for (i, m) in info.modules.iter().enumerate() {
+        mods.set(i, m.as_str())?;
+    }
+    obj.set("modules", mods)?;
+    Ok(obj)
+}
+
+fn tape_summary_to_js<'js>(
+    ctx: &Ctx<'js>,
+    summary: &TapeSummary,
+) -> rquickjs::Result<Object<'js>> {
+    let obj = Object::new(ctx.clone())?;
+    obj.set("version", summary.version as f64)?;
+    obj.set("fileSize", summary.file_size as f64)?;
+    let arr = Array::new(ctx.clone())?;
+    for (i, cp) in summary.checkpoints.iter().enumerate() {
+        arr.set(i, tape_checkpoint_to_js(ctx, cp)?)?;
+    }
+    obj.set("checkpoints", arr)?;
+    Ok(obj)
 }
 
 fn js_val_to_jvalue(v: &Value<'_>) -> JValue {
@@ -296,7 +336,7 @@ fn js_val_to_u64(ctx: &Ctx<'_>, v: &Value<'_>) -> rquickjs::Result<u64> {
 struct EmuSharedHandles {
     jni_hooks: Rc<RefCell<JsHookTable>>,
     native_hooks: Rc<RefCell<JsNativeHookTable>>,
-    modules: Rc<RefCell<Vec<LoadedModule>>>,
+    modules: Rc<RefCell<Vec<Option<LoadedModule>>>>,
 }
 
 type SharedHandlesTable = Rc<RefCell<Vec<EmuSharedHandles>>>;
@@ -476,7 +516,7 @@ pub(super) fn register_native_bridge<'js>(
                     obj.set("name", module.name.as_str())?;
                     obj.set("base", module.base_addr as f64)?;
                     obj.set("size", module.image_size as f64)?;
-                    mods.push(module);
+                    mods.push(Some(module));
                     Ok(obj)
                 },
             )?,
@@ -506,8 +546,8 @@ pub(super) fn register_native_bridge<'js>(
                         .modules
                         .borrow()
                         .get(mod_id)
-                        .cloned()
-                        .ok_or_else(|| throw_err(&ctx, "无效的 modId"))?;
+                        .and_then(|m| m.clone())
+                        .ok_or_else(|| throw_err(&ctx, "无效或已随磁带倒带失效的 modId"))?;
                     entry
                         .emu
                         .run_module_init_array(&module)
@@ -545,8 +585,8 @@ pub(super) fn register_native_bridge<'js>(
                         .modules
                         .borrow()
                         .get(mod_id)
-                        .cloned()
-                        .ok_or_else(|| throw_err(&ctx, "无效的 modId"))?;
+                        .and_then(|m| m.clone())
+                        .ok_or_else(|| throw_err(&ctx, "无效或已随磁带倒带失效的 modId"))?;
                     let ver = entry
                         .emu
                         .call_jni_onload(&module)
@@ -573,7 +613,8 @@ pub(super) fn register_native_bridge<'js>(
                     let mods = handles.modules.borrow();
                     let module = mods
                         .get(mod_id)
-                        .ok_or_else(|| throw_err(&ctx, "无效的 modId"))?;
+                        .and_then(|m| m.as_ref())
+                        .ok_or_else(|| throw_err(&ctx, "无效或已随磁带倒带失效的 modId"))?;
                     Ok(module.find_symbol(&name).unwrap_or(0) as f64)
                 },
             )?,
@@ -592,7 +633,8 @@ pub(super) fn register_native_bridge<'js>(
                     let mods = handles.modules.borrow();
                     let module = mods
                         .get(mod_id)
-                        .ok_or_else(|| throw_err(&ctx, "无效的 modId"))?;
+                        .and_then(|m| m.as_ref())
+                        .ok_or_else(|| throw_err(&ctx, "无效或已随磁带倒带失效的 modId"))?;
                     let mut names: Vec<String> = module.symbols.keys().cloned().collect();
                     names.sort();
                     Ok(names)
@@ -629,8 +671,8 @@ pub(super) fn register_native_bridge<'js>(
                         .modules
                         .borrow()
                         .get(mod_id)
-                        .cloned()
-                        .ok_or_else(|| throw_err(&ctx, "无效的 modId"))?;
+                        .and_then(|m| m.clone())
+                        .ok_or_else(|| throw_err(&ctx, "无效或已随磁带倒带失效的 modId"))?;
                     let args_u64: Vec<u64> = raw_args.into_iter().map(|v| v as u64).collect();
                     let _ret = entry
                         .emu
@@ -3128,6 +3170,262 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
+    // ---- .rtape 持久化多检查点磁带 API ----
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "emuSaveTape",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      path: String,
+                      label: Option<String>|
+                      -> rquickjs::Result<Object<'js>> {
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+                        throw_err(&ctx, "当前处于原生/JNI 回调重入上下文，不可执行磁带录制")
+                    })?;
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let nh = Rc::clone(&entry.native_hooks);
+                    if let Some(uc) = entry.emu.try_uc_mut() {
+                        nh.borrow().temporarily_restore_replace_insns(uc);
+                    }
+                    let res = entry
+                        .emu
+                        .save_tape(&path, label.unwrap_or_else(|| "base".to_string()));
+                    if let Some(uc) = entry.emu.try_uc_mut() {
+                        nh.borrow().reapply_replace_ret_insns(uc);
+                    }
+                    let summary = res.map_err(|e| throw_err(&ctx, e))?;
+                    tape_summary_to_js(&ctx, &summary)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "emuCheckpointTape",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      path: String,
+                      label: Option<String>|
+                      -> rquickjs::Result<Object<'js>> {
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+                        throw_err(&ctx, "当前处于原生/JNI 回调重入上下文，不可追加磁带检查点")
+                    })?;
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let nh = Rc::clone(&entry.native_hooks);
+                    if let Some(uc) = entry.emu.try_uc_mut() {
+                        nh.borrow().temporarily_restore_replace_insns(uc);
+                    }
+                    let res = entry
+                        .emu
+                        .append_tape_checkpoint(&path, label.unwrap_or_default());
+                    if let Some(uc) = entry.emu.try_uc_mut() {
+                        nh.borrow().reapply_replace_ret_insns(uc);
+                    }
+                    let info = res.map_err(|e| throw_err(&ctx, e))?;
+                    tape_checkpoint_to_js(&ctx, &info)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        let handles_table = Rc::clone(&handles_table);
+        native.set(
+            "emuLoadTape",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      path: String,
+                      checkpoint: Option<String>,
+                      backend_name: Option<String>,
+                      search_paths: Option<Vec<String>>|
+                      -> rquickjs::Result<Object<'js>> {
+                    let backend_kind: BackendKind = match backend_name.as_deref() {
+                        Some(s) if !s.trim().is_empty() => {
+                            s.parse().map_err(|e| throw_err(&ctx, e))?
+                        }
+                        _ => BackendKind::Unicorn,
+                    };
+                    let selector = match checkpoint.as_deref() {
+                        Some(s) => TapeSelector::parse(s),
+                        None => TapeSelector::Latest,
+                    };
+                    let hooks = Rc::new(RefCell::new(JsHookTable::default()));
+                    let native_hooks = Rc::new(RefCell::new(JsNativeHookTable::default()));
+                    let mut builder = AndroidEmulator::builder()
+                        .backend(backend_kind)
+                        .jni_handler(Box::new(JsJniHandler::new(Rc::clone(&hooks))));
+                    if let Some(paths) = search_paths {
+                        for p in paths {
+                            builder = builder.add_search_path(p);
+                        }
+                    }
+                    let (emu, info) =
+                        AndroidEmulator::from_tape_with_builder(&path, &selector, builder)
+                            .map_err(|e| throw_err(&ctx, e))?;
+                    {
+                        let mut hb = hooks.borrow_mut();
+                        hb.diag = emu.diag().clone();
+                        hb.breadcrumbs = emu.breadcrumbs().clone();
+                    }
+                    let loaded_mods: Vec<Option<LoadedModule>> =
+                        emu.linker().all_modules().into_iter().map(Some).collect();
+                    let modules = Rc::new(RefCell::new(loaded_mods));
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+                        throw_err(&ctx, "当前处于重入回调上下文，不可创建新模拟器实例")
+                    })?;
+                    let id = h.emus.len();
+                    handles_table.borrow_mut().push(EmuSharedHandles {
+                        jni_hooks: Rc::clone(&hooks),
+                        native_hooks: Rc::clone(&native_hooks),
+                        modules: Rc::clone(&modules),
+                    });
+                    h.emus.push(EmuEntry {
+                        emu,
+                        hooks,
+                        native_hooks,
+                        modules,
+                        snapshots: Vec::new(),
+                    });
+                    let out = Object::new(ctx.clone())?;
+                    out.set("emuId", id)?;
+                    out.set("checkpoint", tape_checkpoint_to_js(&ctx, &info)?)?;
+                    Ok(out)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "emuSeekTape",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      path: String,
+                      checkpoint: Option<String>|
+                      -> rquickjs::Result<Object<'js>> {
+                    let selector = match checkpoint.as_deref() {
+                        Some(s) => TapeSelector::parse(s),
+                        None => TapeSelector::Latest,
+                    };
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+                        throw_err(&ctx, "当前处于重入回调上下文，不可执行磁带倒带/快进")
+                    })?;
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let info = entry
+                        .emu
+                        .seek_tape_file(&path, &selector)
+                        .map_err(|e| throw_err(&ctx, e))?;
+                    let nh = Rc::clone(&entry.native_hooks);
+                    if let Some(uc) = entry.emu.try_uc_mut() {
+                        nh.borrow().sync_after_tape_seek(uc);
+                    }
+                    // 就地同步已存在 mod._id 槽位（保留句柄稳定性），卸载的置 None，新增的追加到末尾
+                    let synced = entry.emu.linker().all_modules();
+                    let mut mods = entry.modules.borrow_mut();
+                    for slot in mods.iter_mut() {
+                        if let Some(existing) = slot.as_ref() {
+                            if let Some(fresh) = synced
+                                .iter()
+                                .find(|m| m.name == existing.name && m.base_addr == existing.base_addr)
+                            {
+                                *slot = Some(fresh.clone());
+                            } else {
+                                *slot = None;
+                            }
+                        }
+                    }
+                    for lm in synced {
+                        if !mods.iter().any(|slot| {
+                            slot.as_ref()
+                                .is_some_and(|m| m.name == lm.name && m.base_addr == lm.base_addr)
+                        }) {
+                            mods.push(Some(lm));
+                        }
+                    }
+                    tape_checkpoint_to_js(&ctx, &info)
+                },
+            )?,
+        )?;
+    }
+
+    native.set(
+        "emuInspectTape",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, path: String| -> rquickjs::Result<Object<'js>> {
+                let summary = Tape::inspect_file(&path).map_err(|e| throw_err(&ctx, e))?;
+                tape_summary_to_js(&ctx, &summary)
+            },
+        )?,
+    )?;
+
+    {
+        let host = Rc::clone(host);
+        let handles_table = Rc::clone(&handles_table);
+        native.set(
+            "emuModules",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize| -> rquickjs::Result<Array<'js>> {
+                    if let Ok(h) = host.try_borrow() {
+                        let entry = h
+                            .emus
+                            .get(emu_id)
+                            .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                        let mut mods = entry.modules.borrow_mut();
+                        let linker_mods = entry.emu.linker().all_modules();
+                        for lm in linker_mods {
+                            if !mods.iter().any(|slot| {
+                                slot.as_ref().is_some_and(|m| {
+                                    m.name == lm.name && m.base_addr == lm.base_addr
+                                })
+                            }) {
+                                mods.push(Some(lm));
+                            }
+                        }
+                    }
+                    let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
+                    let mods = handles.modules.borrow();
+                    let arr = Array::new(ctx.clone())?;
+                    let mut out_idx = 0usize;
+                    for (idx, slot) in mods.iter().enumerate() {
+                        if let Some(m) = slot.as_ref() {
+                            let obj = Object::new(ctx.clone())?;
+                            obj.set("id", idx)?;
+                            obj.set("name", m.name.as_str())?;
+                            obj.set("base", m.base_addr as f64)?;
+                            obj.set("size", m.image_size as f64)?;
+                            arr.set(out_idx, obj)?;
+                            out_idx += 1;
+                        }
+                    }
+                    Ok(arr)
+                },
+            )?,
+        )?;
+    }
+
     // ---- V2: CPU 寄存器 & 仿真控制 ----
     {
         let host = Rc::clone(host);
@@ -3538,7 +3836,7 @@ pub(super) fn register_native_bridge<'js>(
                         let name = module.name.clone();
                         let base = module.base_addr;
                         let size = module.image_size;
-                        mods.push(module);
+                        mods.push(Some(module));
                         let obj = Object::new(ctx.clone())?;
                         obj.set("id", mod_id)?;
                         obj.set("name", name)?;

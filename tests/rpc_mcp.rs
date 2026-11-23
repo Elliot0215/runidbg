@@ -435,9 +435,13 @@ fn test_mcp_server_protocol_and_tools() {
         .expect("tools/list response");
     let list: Value = serde_json::from_str(&list_raw).unwrap();
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 21);
+    assert_eq!(tools.len(), 25);
     assert!(tools.iter().any(|t| t["name"] == "trace_calltree"));
     assert!(tools.iter().any(|t| t["name"] == "trace_crypto_scan"));
+    assert!(tools.iter().any(|t| t["name"] == "emu_save_tape"));
+    assert!(tools.iter().any(|t| t["name"] == "emu_load_tape"));
+    assert!(tools.iter().any(|t| t["name"] == "emu_seek_tape"));
+    assert!(tools.iter().any(|t| t["name"] == "tape_info"));
 
     // 5. emu_create -> emu_load -> emu_exports -> emu_call -> emu_mem_read -> emu_mem_scan -> emu_regs -> emu_eval_js
     let created = mcp_call(&mut server, 10, "emu_create", json!({}));
@@ -602,6 +606,57 @@ fn test_mcp_server_protocol_and_tools() {
 
     let _ = std::fs::remove_file(&tmp_idx);
     let _ = std::fs::remove_file(tmp_idx.with_extension("ext"));
+
+    // 9.5 MCP Tape 工具链验证 (emu_save_tape -> tape_info -> emu_load_tape -> emu_exports/emu_call -> emu_seek_tape)
+    let tmp_tape = std::env::temp_dir().join(format!("runidbg_mcp_tape_{}.rtape", std::process::id()));
+    let tmp_tape_str = tmp_tape.to_string_lossy().to_string();
+    // 缺省 label 应回退为 "base"，而不是 "null"
+    let saved_tape = mcp_call(
+        &mut server,
+        27,
+        "emu_save_tape",
+        json!({ "emuId": emu_id, "path": tmp_tape_str }),
+    );
+    assert_eq!(saved_tape["checkpoints"].as_array().unwrap().len(), 1);
+    assert_eq!(saved_tape["checkpoints"][0]["label"], "base");
+    let cp1 = mcp_call(
+        &mut server,
+        28,
+        "emu_save_tape",
+        json!({ "emuId": emu_id, "path": tmp_tape_str, "label": "mcp_cp1", "append": true }),
+    );
+    assert_eq!(cp1["label"], "mcp_cp1");
+    assert_eq!(cp1["isDelta"], true);
+    let tape_info = mcp_call(&mut server, 29, "tape_info", json!({ "path": tmp_tape_str }));
+    assert_eq!(tape_info["checkpoints"].as_array().unwrap().len(), 2);
+    let loaded_tape = mcp_call(
+        &mut server,
+        30,
+        "emu_load_tape",
+        json!({ "path": tmp_tape_str, "checkpoint": 0, "backend": null }),
+    );
+    let tape_emu_id = loaded_tape["emuId"].as_u64().expect("tape emuId");
+    let loaded_mods = loaded_tape["modules"].as_array().expect("loaded modules");
+    assert_eq!(loaded_mods.len(), 1);
+    assert!(loaded_mods[0]["base"].as_u64().unwrap() > 0);
+    assert!(loaded_mods[0]["exportCount"].as_u64().unwrap() >= 1);
+    let restored_mod_id = loaded_mods[0]["modId"].as_u64().expect("restored modId");
+    let restored_exports = mcp_call(
+        &mut server,
+        301,
+        "emu_exports",
+        json!({ "modId": restored_mod_id, "filter": "WebPGetDecoderVersion" }),
+    );
+    assert!(restored_exports["total"].as_u64().unwrap() >= 1);
+    let sought = mcp_call(
+        &mut server,
+        31,
+        "emu_seek_tape",
+        json!({ "emuId": tape_emu_id, "path": tmp_tape_str, "checkpoint": "mcp_cp1" }),
+    );
+    assert_eq!(sought["label"], "mcp_cp1");
+    assert_eq!(sought["loadedModules"].as_array().unwrap().len(), 1);
+    let _ = std::fs::remove_file(&tmp_tape);
 
     // 10. Phase 3: Streamable HTTP MCP
     let http_mcp = runidbg_arm64_emu_tracer::script::mcp::start_mcp_http_server("127.0.0.1:0", &root, None)

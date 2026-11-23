@@ -591,4 +591,41 @@ impl ObjectTable {
             0
         }
     }
+
+    pub(crate) fn export_raw(&self) -> ObjectTableRaw {
+        ObjectTableRaw {
+            next_handle: self.next_handle,
+            objects: self.objects.iter().map(|(&k, v)| (k, v.clone())).collect(),
+            local_refs: self.local_refs.iter().copied().collect(),
+            global_refs: self.global_refs.iter().map(|(&k, &v)| (k, v)).collect(),
+            class_cache: self
+                .class_cache
+                .iter()
+                .map(|(k, &v)| (k.clone(), v))
+                .collect(),
+            local_frames: self.local_frames.clone(),
+        }
+    }
+
+    pub(crate) fn from_raw(raw: ObjectTableRaw) -> Self {
+        Self {
+            next_handle: raw.next_handle,
+            objects: raw.objects.into_iter().collect(),
+            local_refs: raw.local_refs.into_iter().collect(),
+            global_refs: raw.global_refs.into_iter().collect(),
+            class_cache: raw.class_cache.into_iter().collect(),
+            local_frames: raw.local_frames,
+        }
+    }
+}
+
+/// `ObjectTable` 原始可序列化表示（供 `.rtape` 磁带使用）
+#[derive(Debug, Clone)]
+pub(crate) struct ObjectTableRaw {
+    pub next_handle: u64,
+    pub objects: Vec<(u64, JObject)>,
+    pub local_refs: Vec<u64>,
+    pub global_refs: Vec<(u64, usize)>,
+    pub class_cache: Vec<(String, JObjectRef)>,
+    pub local_frames: Vec<u64>,
 }

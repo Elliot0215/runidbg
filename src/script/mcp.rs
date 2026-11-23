@@ -739,6 +739,91 @@ impl McpServer {
                 );
                 self.eval_js_value(&code)
             }
+            "emu_save_tape" => {
+                let emu_id = req_u64(args, "emuId")?;
+                let path_json = serde_json::to_string(req_str(args, "path")?)?;
+                let label_json = args
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .map(serde_json::to_string)
+                    .transpose()?
+                    .unwrap_or_else(|| "undefined".to_string());
+                let append = args.get("append").and_then(Value::as_bool).unwrap_or(false);
+                let code = if append {
+                    format!(
+                        "(() => {{ const e = __mcp.emus[{emu_id}]; if (!e) throw new Error('unknown emuId'); return e.checkpointTape({path_json}, {label_json}); }})()"
+                    )
+                } else {
+                    format!(
+                        "(() => {{ const e = __mcp.emus[{emu_id}]; if (!e) throw new Error('unknown emuId'); return e.saveTape({path_json}, {label_json}); }})()"
+                    )
+                };
+                self.eval_js_value(&code)
+            }
+            "emu_load_tape" => {
+                let path_json = serde_json::to_string(req_str(args, "path")?)?;
+                let opts_json = serde_json::to_string(args)?;
+                let code = format!(
+                    "(() => {{ \
+                        const id = __mcp.nextEmuId++; \
+                        const e = Emu.loadTape({path_json}, {opts_json}); \
+                        __mcp.emus[id] = e; \
+                        const mods = e.modules().map((m) => {{ \
+                            const mid = __mcp.nextModId++; \
+                            __mcp.mods[mid] = {{ emuId: id, mod: m }}; \
+                            return {{ modId: mid, name: m.name, base: m.base, baseHex: '0x' + m.base.toString(16), size: m.size, exportCount: m.exports().length }}; \
+                        }}); \
+                        return {{ emuId: id, backend: e.backend, checkpoint: e.tapeCheckpoint, modules: mods }}; \
+                    }})()"
+                );
+                self.eval_js_value(&code)
+            }
+            "emu_seek_tape" => {
+                let emu_id = req_u64(args, "emuId")?;
+                let path_json = serde_json::to_string(req_str(args, "path")?)?;
+                let cp_json = args
+                    .get("checkpoint")
+                    .map(serde_json::to_string)
+                    .transpose()?
+                    .unwrap_or_else(|| "undefined".to_string());
+                let code = format!(
+                    "(() => {{ \
+                        const e = __mcp.emus[{emu_id}]; \
+                        if (!e) throw new Error('unknown emuId'); \
+                        const info = e.seekTape({path_json}, {cp_json}); \
+                        const fresh = e.modules(); \
+                        const existingByKey = new Map(); \
+                        for (const [midStr, entry] of Object.entries(__mcp.mods)) {{ \
+                            if (entry && entry.emuId === {emu_id}) {{ \
+                                const key = entry.mod.name + '@' + entry.mod.base; \
+                                const hit = fresh.find((m) => (m.name + '@' + m.base) === key); \
+                                if (hit) {{ \
+                                    entry.mod = hit; \
+                                    existingByKey.set(key, Number(midStr)); \
+                                }} else {{ \
+                                    delete __mcp.mods[midStr]; \
+                                }} \
+                            }} \
+                        }} \
+                        const mods = fresh.map((m) => {{ \
+                            const key = m.name + '@' + m.base; \
+                            let mid = existingByKey.get(key); \
+                            if (mid === undefined) {{ \
+                                mid = __mcp.nextModId++; \
+                                __mcp.mods[mid] = {{ emuId: {emu_id}, mod: m }}; \
+                            }} \
+                            return {{ modId: mid, name: m.name, base: m.base, baseHex: '0x' + m.base.toString(16), size: m.size, exportCount: m.exports().length }}; \
+                        }}); \
+                        return Object.assign({{}}, info, {{ loadedModules: mods }}); \
+                    }})()"
+                );
+                self.eval_js_value(&code)
+            }
+            "tape_info" => {
+                let path_json = serde_json::to_string(req_str(args, "path")?)?;
+                let code = format!("Emu.inspectTape({path_json})");
+                self.eval_js_value(&code)
+            }
             _ => Err(anyhow!("未知的 MCP 工具: {name}")),
         }
     }
@@ -1084,6 +1169,73 @@ fn tool_definitions() -> Value {
                     "methodName": { "type": "string" },
                     "args": { "type": "array", "items": { "type": "integer" } },
                     "thisObj": { "type": "integer", "description": "Optional jobject handle passed as X1 (this) for instance methods" }
+                }
+            }
+        },
+        {
+            "name": "emu_save_tape",
+            "description": "Save full emulator runtime state to a persistent compressed .rtape file (returns TapeSummary {version, fileSize, checkpoints}), or append an incremental 4KB dirty-page checkpoint when append=true (returns TapeCheckpointInfo).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["emuId", "path"],
+                "properties": {
+                    "emuId": { "type": "integer" },
+                    "path": { "type": "string", "description": "Destination .rtape file path" },
+                    "label": { "type": "string", "description": "Checkpoint bookmark name (e.g. after_init, before_sign)" },
+                    "append": { "type": "boolean", "description": "If true, append an incremental 4KB dirty-page delta checkpoint to an existing tape" }
+                }
+            }
+        },
+        {
+            "name": "emu_load_tape",
+            "description": "Load a .rtape checkpoint into a new emulator instance (supports cross-backend relay, e.g. Dynarmic/Hyper/KVM tape -> Unicorn for tracing/hooks). Returns {emuId, backend, checkpoint, modules}.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string", "description": "Path to .rtape file" },
+                    "checkpoint": {
+                        "anyOf": [
+                            { "type": "integer", "minimum": 0 },
+                            { "type": "string" }
+                        ],
+                        "description": "Checkpoint index, bookmark label, or 'latest'"
+                    },
+                    "backend": { "type": "string", "description": "Target CPU backend (unicorn, dynarmic, kvm, hypervisor)" },
+                    "searchPaths": { "type": "array", "items": { "type": "string" }, "description": "Optional additional library search paths" },
+                    "device": { "type": "string", "description": "Optional device profile preset override" },
+                    "realClock": { "type": "boolean", "description": "Optional real-clock override" },
+                    "net": { "type": ["boolean", "object"], "description": "Optional network policy override" }
+                }
+            }
+        },
+        {
+            "name": "emu_seek_tape",
+            "description": "Rewind or fast-forward an existing emulator instance to any checkpoint on a .rtape file, refreshing __mcp.mods and returning checkpoint info plus loadedModules.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["emuId", "path"],
+                "properties": {
+                    "emuId": { "type": "integer" },
+                    "path": { "type": "string" },
+                    "checkpoint": {
+                        "anyOf": [
+                            { "type": "integer", "minimum": 0 },
+                            { "type": "string" }
+                        ],
+                        "description": "Checkpoint index, bookmark label, or 'latest'"
+                    }
+                }
+            }
+        },
+        {
+            "name": "tape_info",
+            "description": "Inspect a .rtape file and list all checkpoints, dirty-page counts, compressed sizes, source backends, and loaded modules.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string" }
                 }
             }
         }
