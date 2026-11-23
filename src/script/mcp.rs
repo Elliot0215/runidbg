@@ -13,8 +13,10 @@ const MCP_INIT_JS: &str = r#"
 globalThis.__mcp = {
   emus: {},
   mods: {},
+  tts: {},
   nextEmuId: 1,
   nextModId: 1,
+  nextTtId: 1,
 };
 "#;
 
@@ -824,6 +826,170 @@ impl McpServer {
                 let code = format!("Emu.inspectTape({path_json})");
                 self.eval_js_value(&code)
             }
+            "tt_record_start" => {
+                let emu_id = req_u64(args, "emuId")?;
+                let opts_json = serde_json::to_string(args)?;
+                let code = format!(
+                    "(() => {{ const e = __mcp.emus[{emu_id}]; if (!e) throw new Error('unknown emuId'); e.record.start({opts_json}); return {{ ok: true, emuId: {emu_id} }}; }})()"
+                );
+                self.eval_js_value(&code)
+            }
+            "tt_record_stop" => {
+                let emu_id = req_u64(args, "emuId")?;
+                let path_json = serde_json::to_string(req_str(args, "path")?)?;
+                let bm_code = if let Some(bm) = args.get("bookmark").and_then(Value::as_str) {
+                    let bm_json = serde_json::to_string(bm)?;
+                    format!("e.record.bookmark({bm_json}); ")
+                } else {
+                    String::new()
+                };
+                let code = format!(
+                    "(() => {{ const e = __mcp.emus[{emu_id}]; if (!e) throw new Error('unknown emuId'); {bm_code}return e.record.stop({path_json}); }})()"
+                );
+                self.eval_js_value(&code)
+            }
+            "tt_open" => {
+                let path_json = serde_json::to_string(req_str(args, "path")?)?;
+                let code = format!(
+                    "(() => {{ \
+                        const id = __mcp.nextTtId++; \
+                        const tt = Emu.openTimeTravel({path_json}); \
+                        __mcp.tts[id] = tt; \
+                        return {{ ttId: id, totalInsns: tt.totalInsns, keyframes: tt.keyframes, bookmarks: tt.bookmarks, modules: tt.modules }}; \
+                    }})()"
+                );
+                self.eval_js_value(&code)
+            }
+            "tt_seek" => {
+                let tt_id = req_u64(args, "ttId")?;
+                let has_bm = args.get("bookmark").is_some_and(|v| !v.is_null());
+                let has_delta = args.get("delta").is_some_and(|v| !v.is_null());
+                let has_insn = args.get("insn").is_some_and(|v| !v.is_null());
+                let selector_count = usize::from(has_bm) + usize::from(has_delta) + usize::from(has_insn);
+                if selector_count == 0 {
+                    return Err(anyhow!("tt_seek 需要提供 insn、bookmark 或 delta 参数之一"));
+                }
+                if selector_count > 1 {
+                    return Err(anyhow!(
+                        "tt_seek 的 insn、bookmark、delta 参数互斥，每次调用只能提供其中一个"
+                    ));
+                }
+                let action = if has_bm {
+                    let bm = args
+                        .get("bookmark")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| anyhow!("tt_seek 参数 bookmark 必须为字符串"))?;
+                    let bm_json = serde_json::to_string(bm)?;
+                    format!("tt.seekBookmark({bm_json})")
+                } else if has_delta {
+                    let delta = args
+                        .get("delta")
+                        .and_then(Value::as_i64)
+                        .ok_or_else(|| anyhow!("tt_seek 参数 delta 必须为整数"))?;
+                    if delta < 0 {
+                        format!("tt.stepBack({})", delta.unsigned_abs())
+                    } else {
+                        format!("tt.stepForward({delta})")
+                    }
+                } else {
+                    let insn = args
+                        .get("insn")
+                        .and_then(Value::as_u64)
+                        .ok_or_else(|| anyhow!("tt_seek 参数 insn 必须为非负整数"))?;
+                    format!("tt.seekInsn({insn})")
+                };
+                let code = format!(
+                    "(() => {{ \
+                        const tt = __mcp.tts[{tt_id}]; \
+                        if (!tt) throw new Error('unknown ttId'); \
+                        const stop = {action}; \
+                        return {{ stop, regs: tt.regs() }}; \
+                    }})()"
+                );
+                self.eval_js_value(&code)
+            }
+            "tt_reverse_watch" => {
+                let tt_id = req_u64(args, "ttId")?;
+                let addr = parse_addr_val(args.get("addr"))?;
+                let len = match args.get("len") {
+                    None | Some(Value::Null) => 1u64,
+                    Some(v) => {
+                        let l = v
+                            .as_u64()
+                            .ok_or_else(|| anyhow!("tt_reverse_watch 参数 len 必须为正整数"))?;
+                        if l == 0 {
+                            return Err(anyhow!("tt_reverse_watch 参数 len 必须 >= 1"));
+                        }
+                        l
+                    }
+                };
+                let kind = match args.get("kind") {
+                    None | Some(Value::Null) => "write".to_string(),
+                    Some(v) => v
+                        .as_str()
+                        .ok_or_else(|| anyhow!("tt_reverse_watch 参数 kind 必须为字符串"))?
+                        .to_ascii_lowercase(),
+                };
+                let method = match kind.as_str() {
+                    "write" | "w" => "findPrevWrite",
+                    "read" | "r" => "findPrevRead",
+                    "access" | "rw" | "a" => "findPrevAccess",
+                    other => {
+                        return Err(anyhow!(
+                            "无效的 tt_reverse_watch kind `{other}`（支持 write / read / access）"
+                        ))
+                    }
+                };
+                let preview_len = len.min(256);
+                let truncated = len > 256;
+                let code = format!(
+                    "(() => {{ \
+                        const tt = __mcp.tts[{tt_id}]; \
+                        if (!tt) throw new Error('unknown ttId'); \
+                        const hit = tt.{method}({addr}n, {len}); \
+                        if (!hit) return {{ hit: null, currentInsn: tt.currentInsn() }}; \
+                        let memHexBeforeInsn = null; \
+                        try {{ \
+                            memHexBeforeInsn = Array.from(tt.mem.readBytes({addr}n, {preview_len})).map((b) => b.toString(16).padStart(2, '0')).join(''); \
+                        }} catch (_) {{}} \
+                        return {{ hit, regs: tt.regs(), memHexBeforeInsn, memHexTruncated: {truncated} }}; \
+                    }})()"
+                );
+                self.eval_js_value(&code)
+            }
+            "tt_mem_read" => {
+                let tt_id = req_u64(args, "ttId")?;
+                let addr = parse_addr_val(args.get("addr"))?;
+                let len = args
+                    .get("len")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(64)
+                    .clamp(1, 65536);
+                let code = format!(
+                    "(() => {{ \
+                        const tt = __mcp.tts[{tt_id}]; \
+                        if (!tt) throw new Error('unknown ttId'); \
+                        const bytes = Array.from(tt.mem.readBytes({addr}n, {len})); \
+                        const hex = bytes.map((b) => b.toString(16).padStart(2, '0')).join(''); \
+                        const ascii = bytes.map((b) => (b >= 0x20 && b <= 0x7e) ? String.fromCharCode(b) : '.').join(''); \
+                        return {{ addrHex: '0x' + ({addr}n).toString(16), len: bytes.length, hex, ascii, currentInsn: tt.currentInsn() }}; \
+                    }})()"
+                );
+                self.eval_js_value(&code)
+            }
+            "tt_close" => {
+                let tt_id = req_u64(args, "ttId")?;
+                let code = format!(
+                    "(() => {{ \
+                        const tt = __mcp.tts[{tt_id}]; \
+                        if (!tt) return {{ closed: false, ttId: {tt_id} }}; \
+                        const closed = tt.close(); \
+                        delete __mcp.tts[{tt_id}]; \
+                        return {{ closed, ttId: {tt_id} }}; \
+                    }})()"
+                );
+                self.eval_js_value(&code)
+            }
             _ => Err(anyhow!("未知的 MCP 工具: {name}")),
         }
     }
@@ -990,7 +1156,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "emu_eval_js",
-            "description": "Evaluate arbitrary runidbg QuickJS code in the persistent session (access __mcp.emus[id], __mcp.mods[id], Emu, hooks, patches, trace, etc.).",
+            "description": "Evaluate arbitrary runidbg QuickJS code in the persistent session (access __mcp.emus[id], __mcp.mods[id], __mcp.tts[id], Emu, hooks, patches, trace, etc.).",
             "inputSchema": {
                 "type": "object",
                 "required": ["code"],
@@ -1174,7 +1340,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "emu_save_tape",
-            "description": "Save full emulator runtime state to a persistent compressed .rtape file (returns TapeSummary {version, fileSize, checkpoints}), or append an incremental 4KB dirty-page checkpoint when append=true (returns TapeCheckpointInfo).",
+            "description": "Save full emulator runtime state to a persistent compressed .rtape file (returns TapeSummary {version, fileSize, checkpoints, timeline}), or append an incremental 4KB dirty-page checkpoint when append=true (returns TapeCheckpointInfo).",
             "inputSchema": {
                 "type": "object",
                 "required": ["emuId", "path"],
@@ -1230,12 +1396,102 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "tape_info",
-            "description": "Inspect a .rtape file and list all checkpoints, dirty-page counts, compressed sizes, source backends, and loaded modules.",
+            "description": "Inspect a .rtape file and list all checkpoints, dirty-page counts, compressed sizes, source backends, loaded modules, and Phase 2 time-travel timeline summary if present.",
             "inputSchema": {
                 "type": "object",
                 "required": ["path"],
                 "properties": {
                     "path": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "tt_record_start",
+            "description": "Start Phase 2 deterministic Time-Travel recording on a Unicorn emulator (captures periodic delta keyframes, real-clock reads, host sysroot files, and external JNI callbacks).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["emuId"],
+                "properties": {
+                    "emuId": { "type": "integer" },
+                    "keyframeInterval": { "type": "integer", "minimum": 0, "description": "Auto-keyframe interval in instructions (default 100000)" },
+                    "maxInsns": { "type": "integer", "minimum": 0, "description": "Optional max instructions cap (0 = unlimited)" },
+                    "captureJni": { "type": "boolean", "description": "Capture external JNI callbacks for offline JS-free replay (default true)" }
+                }
+            }
+        },
+        {
+            "name": "tt_record_stop",
+            "description": "Stop Time-Travel recording and write the complete .rtape file (keyframes + CHUNK_EVENT_LOG) to disk.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["emuId", "path"],
+                "properties": {
+                    "emuId": { "type": "integer" },
+                    "path": { "type": "string", "description": "Destination .rtape file path" },
+                    "bookmark": { "type": "string", "description": "Optional final bookmark label before stopping" }
+                }
+            }
+        },
+        {
+            "name": "tt_open",
+            "description": "Open a recorded Time-Travel .rtape file for offline instruction-exact seeking, reverse stepping, and reverse memory watchpoint hunting.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string" }
+                }
+            }
+        },
+        {
+            "name": "tt_seek",
+            "description": "Seek a Time-Travel session to an exact instruction index, named bookmark, or relative step delta (negative = step back, positive = step forward), returning stop info and registers.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["ttId"],
+                "properties": {
+                    "ttId": { "type": "integer" },
+                    "insn": { "type": "integer", "minimum": 0 },
+                    "bookmark": { "type": "string" },
+                    "delta": { "type": "integer", "description": "Relative instruction step (e.g. -1 to reverse-stepi)" }
+                }
+            }
+        },
+        {
+            "name": "tt_reverse_watch",
+            "description": "Reverse-search backward from current instruction to the exact ARM64 instruction that last wrote/read [addr, addr+len), jump directly there, and return hit location + registers + pre-instruction memory hex preview (capped at 256B).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["ttId", "addr"],
+                "properties": {
+                    "ttId": { "type": "integer" },
+                    "addr": { "description": "Guest memory address (integer or '0x...' hex string)" },
+                    "len": { "type": "integer", "minimum": 1, "description": "Byte length to watch (default 1)" },
+                    "kind": { "type": "string", "enum": ["write", "read", "access"], "description": "Watchpoint kind (default write)" }
+                }
+            }
+        },
+        {
+            "name": "tt_mem_read",
+            "description": "Read guest memory at the current instruction position of an open Time-Travel session (returns hex & ASCII dump, max 65536 bytes).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["ttId", "addr"],
+                "properties": {
+                    "ttId": { "type": "integer" },
+                    "addr": { "description": "Guest memory address (integer or '0x...' hex string)" },
+                    "len": { "type": "integer", "minimum": 1, "maximum": 65536, "description": "Bytes to read (default 64)" }
+                }
+            }
+        },
+        {
+            "name": "tt_close",
+            "description": "Close an open Time-Travel player session and release its Unicorn instance, keyframe cache, and micro-snapshot ring.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["ttId"],
+                "properties": {
+                    "ttId": { "type": "integer" }
                 }
             }
         }

@@ -232,6 +232,7 @@ pub(crate) struct BumpAllocatorRaw {
 pub struct HeapSnapshot {
     pub heap: BumpAllocator,
     pub brk_cursor: u64,
+    pub mmap_cursor: u64,
 }
 
 /// 模拟器 MMU 内存管理器
@@ -247,6 +248,8 @@ pub struct MemoryManager {
     brk_cursor: u64,
     /// 匿名 `mmap` 下一个分配游标
     mmap_cursor: u64,
+    /// 虚拟内存布局变更代际（每次 map/mmap/munmap/mprotect/restore_from_tape 递增，供微快照校验）
+    layout_epoch: u64,
 }
 
 impl MemoryManager {
@@ -259,6 +262,7 @@ impl MemoryManager {
             heap: BumpAllocator::new(aligned_base, aligned_size),
             brk_cursor: aligned_base,
             mmap_cursor: MMAP_BASE,
+            layout_epoch: 0,
         }
     }
 
@@ -336,6 +340,7 @@ impl MemoryManager {
         for wp in widened_pages {
             self.widen_vma_page_perms(wp, Prot::ALL);
         }
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
 
         Ok((start, end - start))
     }
@@ -393,6 +398,7 @@ impl MemoryManager {
         }
 
         self.remove_vma_range(start, end);
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
         Ok(())
     }
 
@@ -454,6 +460,7 @@ impl MemoryManager {
                 );
             }
         }
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
 
         Ok(())
     }
@@ -573,6 +580,7 @@ impl MemoryManager {
                 );
             }
         }
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
     }
 
     /// 从模拟堆中分配一块内存（默认 16 字节对齐）
@@ -664,6 +672,7 @@ impl MemoryManager {
         HeapSnapshot {
             heap: self.heap.clone(),
             brk_cursor: self.brk_cursor,
+            mmap_cursor: self.mmap_cursor,
         }
     }
 
@@ -671,6 +680,12 @@ impl MemoryManager {
     pub fn restore_heap_snapshot(&mut self, snap: &HeapSnapshot) {
         self.heap = snap.heap.clone();
         self.brk_cursor = snap.brk_cursor;
+        self.mmap_cursor = snap.mmap_cursor;
+    }
+
+    #[inline]
+    pub(crate) fn layout_epoch(&self) -> u64 {
+        self.layout_epoch
     }
 
     #[inline]
@@ -839,6 +854,7 @@ impl MemoryManager {
         self.heap = target_heap;
         self.brk_cursor = brk_cursor;
         self.mmap_cursor = mmap_cursor;
+        self.layout_epoch = self.layout_epoch.wrapping_add(1);
         Ok(())
     }
 

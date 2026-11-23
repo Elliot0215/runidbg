@@ -49,8 +49,8 @@ fn print_usage() {
                      [--allow-reload] [--allow-eval] [-- <args...>]\n\
            runidbg-cli mcp [--script <init.js>] [--cwd <dir>] [--http 127.0.0.1:8090]         启动 MCP 服务端 (stdio / HTTP)\n\
            runidbg-cli debug <lib.so> <symbol|0xaddr> [--listen 127.0.0.1:1234] [--pkg PKG]   启动 GDB RSP 远程调试服务端（仅 Unicorn）\n\
-           runidbg-cli debug --tape <file.rtape> [--checkpoint <idx|label>] [sym|0xaddr]      从 .rtape 磁带接力启动 GDB RSP（支持跨后端）\n\
-           runidbg-cli tape info <file.rtape>                                                 查看 .rtape 磁带检查点时间线与压缩统计\n\
+           runidbg-cli debug --tape <file.rtape> [--checkpoint <idx|label>] [sym|0xaddr]      从 .rtape 磁带启动 GDB RSP（含二期 EVENT_LOG 时自动开启 rs/rc/watch 时间旅行调试）\n\
+           runidbg-cli tape info <file.rtape>                                                 查看 .rtape 磁带检查点、时间轴事件与压缩统计\n\
            runidbg-cli init-types [dir]                                                       生成 runidbg.d.ts 类型声明\n\
            runidbg-cli dump <trace.idx> [--ext <trace.ext>] [--base <hex>] [--skip N] [--limit N]\n\
            runidbg-cli search <trace.idx> [--ext <trace.ext>] [--base <hex>] [--val <hex>] [--addr <hex>] [--pc <hex>]\n\
@@ -58,7 +58,7 @@ fn print_usage() {
            runidbg-cli stats <trace.idx> [--base <hex>] [--top N]\n\
            runidbg-cli calltree <trace.idx> [--base <hex>] [--max-depth N] [--min-insns N]\n\
            runidbg-cli crypto-scan <trace.idx> [--ext <trace.ext>] [--base <hex>]\n\
-           runidbg-cli ui <trace.idx> [--ext <trace.ext>] [--base <hex>] [--listen 127.0.0.1:8088] [--open]\n\
+           runidbg-cli ui <trace.idx|file.rtape> [--ext <trace.ext>] [--base <hex>] [--listen 127.0.0.1:8088] [--open]\n\
            runidbg-cli export-ida <trace.idx> --base <hex> [--out <script.py>]\n\
            runidbg-cli export-bn  <trace.idx> --base <hex> [--out <script.py>]"
     );
@@ -239,9 +239,9 @@ fn init_types_command(_args: &[String]) -> Result<()> {
 #[cfg(feature = "ui")]
 fn ui_command(args: &[String]) -> Result<()> {
     if args.is_empty() {
-        bail!("用法: runidbg-cli ui <trace.idx> [--ext <trace.ext>] [--base <hex>] [--listen 127.0.0.1:8088] [--open]");
+        bail!("用法: runidbg-cli ui <trace.idx|file.rtape> [--ext <trace.ext>] [--base <hex>] [--listen 127.0.0.1:8088] [--open]");
     }
-    let idx_path = PathBuf::from(&args[0]);
+    let input_path = PathBuf::from(&args[0]);
     let mut ext_path: Option<PathBuf> = None;
     let mut base_addr: u64 = 0;
     let mut listen_addr = "127.0.0.1:8088".to_string();
@@ -270,15 +270,36 @@ fn ui_command(args: &[String]) -> Result<()> {
         }
     }
 
+    let is_rtape = input_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("rtape"))
+        || fs::read(&input_path)
+            .ok()
+            .is_some_and(|b| b.starts_with(runidbg_arm64_emu_tracer::tape::TAPE_MAGIC));
+
+    if is_rtape {
+        let handle =
+            runidbg_arm64_emu_tracer::ui::start_timetravel_ui_server(&input_path, &listen_addr)?;
+        let url = format!("http://{}/", handle.local_addr());
+        println!("[runidbg-ui] Time-Travel Web UI 已启动: {url}");
+        println!("[runidbg-ui] 按 Ctrl+C 退出");
+        if auto_open {
+            runidbg_arm64_emu_tracer::ui::open_in_browser(&url);
+        }
+        handle.wait();
+        return Ok(());
+    }
+
     if ext_path.is_none() {
-        let sibling = idx_path.with_extension("ext");
-        if sibling != idx_path && sibling.is_file() {
+        let sibling = input_path.with_extension("ext");
+        if sibling != input_path && sibling.is_file() {
             ext_path = Some(sibling);
         }
     }
 
     let handle = runidbg_arm64_emu_tracer::ui::start_trace_ui_server(
-        &idx_path,
+        &input_path,
         ext_path.as_deref(),
         base_addr,
         &listen_addr,
@@ -313,23 +334,43 @@ fn tape_command(args: &[String]) -> Result<()> {
         summary.checkpoints.len()
     );
     println!(
-        "{:<4} {:<20} {:<6} {:<11} {:>7} {:>6} {:>7} {:>10} {:>10}  MODULES",
-        "IDX", "LABEL", "TYPE", "BACKEND", "PAGES", "ZERO", "UNMAP", "COMP(KB)", "RAW(KB)"
+        "{:<4} {:<20} {:<6} {:<11} {:>9} {:>7} {:>6} {:>7} {:>10} {:>10}  MODULES",
+        "IDX", "LABEL", "TYPE", "BACKEND", "INSN", "PAGES", "ZERO", "UNMAP", "COMP(KB)", "RAW(KB)"
     );
     for cp in &summary.checkpoints {
         let kind = if cp.is_delta { "DELTA" } else { "BASE" };
         println!(
-            "{:<4} {:<20} {:<6} {:<11} {:>7} {:>6} {:>7} {:>10.1} {:>10.1}  {}",
+            "{:<4} {:<20} {:<6} {:<11} {:>9} {:>7} {:>6} {:>7} {:>10.1} {:>10.1}  {}",
             cp.index,
             cp.label,
             kind,
             cp.source_backend,
+            cp.insn_count,
             cp.stored_pages,
             cp.zeroed_pages,
             cp.removed_pages,
             cp.compressed_bytes as f64 / 1024.0,
             cp.uncompressed_bytes as f64 / 1024.0,
             cp.modules.join(", ")
+        );
+    }
+    if let Some(tl) = &summary.timeline {
+        let bms: Vec<String> = tl
+            .bookmarks
+            .iter()
+            .map(|(ins, l)| format!("{l}@{ins}"))
+            .collect();
+        println!(
+            "TIMELINE | 指令区间: {}..{} | 关键帧间隔: {} | 事件数: {} (clock={}, jni={}, hook={}, host_files={}) | 书签: [{}]",
+            tl.start_insn,
+            tl.end_insn,
+            tl.keyframe_interval,
+            tl.event_count,
+            tl.clock_events,
+            tl.jni_events,
+            tl.hook_events,
+            tl.host_file_count,
+            bms.join(", ")
         );
     }
     Ok(())
@@ -398,13 +439,57 @@ fn debug_gdb_command(args: &[String]) -> Result<()> {
         if pkg.is_some() {
             eprintln!("[runidbg-gdb] 警告: --tape 模式沿用磁带内保存的包名，--pkg 参数将被忽略");
         }
+        let loaded_tape = runidbg_arm64_emu_tracer::Tape::load_file(&tape)?;
+        // 若未显式指定新的目标符号，且该磁带包含二期时间旅行 EVENT_LOG，保持进入时间旅行 GDB 会话（同时支持 --checkpoint / 书签起始定位）
+        if positional.is_empty() && loaded_tape.has_time_travel() {
+            let checkpoints = loaded_tape.checkpoints();
+            let mut player = runidbg_arm64_emu_tracer::TimeTravelPlayer::from_tape(loaded_tape)?;
+            if let Some(sel) = checkpoint_sel {
+                match sel {
+                    runidbg_arm64_emu_tracer::TapeSelector::Latest => {
+                        let end = player.total_insns();
+                        player.seek_insn(end)?;
+                    }
+                    runidbg_arm64_emu_tracer::TapeSelector::Index(i) => {
+                        let cp = checkpoints.get(i).ok_or_else(|| {
+                            anyhow::anyhow!("时间旅行磁带中不存在检查点序号 #{i}")
+                        })?;
+                        player.seek_insn(cp.insn_count)?;
+                    }
+                    runidbg_arm64_emu_tracer::TapeSelector::Label(ref lbl) => {
+                        if player.seek_bookmark(lbl).is_err() {
+                            let cp = checkpoints.iter().rev().find(|c| c.label == *lbl).ok_or_else(
+                                || {
+                                    anyhow::anyhow!(
+                                        "时间旅行磁带中未找到书签或检查点标签 `{lbl}`"
+                                    )
+                                },
+                            )?;
+                            player.seek_insn(cp.insn_count)?;
+                        }
+                    }
+                }
+            }
+            eprintln!(
+                "[runidbg-gdb] 已打开二期时间旅行磁带 {} (insn={}/{}, {} 关键帧) -> Unicorn GDB Time-Travel (支持 rs/rc/watch/monitor seek)",
+                tape.display(),
+                player.current_insn(),
+                player.total_insns(),
+                player.tape().len()
+            );
+            return runidbg_arm64_emu_tracer::debug::GdbServer::serve_time_travel(
+                &mut player,
+                &listen_addr,
+            );
+        }
         let sel = checkpoint_sel.unwrap_or(runidbg_arm64_emu_tracer::TapeSelector::Latest);
-        let (mut emu, info) = runidbg_arm64_emu_tracer::AndroidEmulator::from_tape_with_builder(
-            &tape,
-            &sel,
-            runidbg_arm64_emu_tracer::AndroidEmulator::builder()
-                .backend(runidbg_arm64_emu_tracer::BackendKind::Unicorn),
-        )?;
+        let (mut emu, info) =
+            runidbg_arm64_emu_tracer::AndroidEmulator::from_loaded_tape_with_builder(
+                &loaded_tape,
+                &sel,
+                runidbg_arm64_emu_tracer::AndroidEmulator::builder()
+                    .backend(runidbg_arm64_emu_tracer::BackendKind::Unicorn),
+            )?;
         if let Some(target) = positional.first() {
             let start_pc = if target.starts_with("0x") || target.starts_with("0X") {
                 parse_u64_hex_or_dec(target)?

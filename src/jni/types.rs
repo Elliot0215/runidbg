@@ -76,10 +76,27 @@ impl JValue {
             _ => None,
         }
     }
+
+    /// 按位精确比较两个 `JValue`（避免 `-0.0 == +0.0` 丢失符号位与 `NaN != NaN` 引起伪差异）
+    pub fn bitwise_eq(&self, other: &Self) -> bool {
+        match (*self, *other) {
+            (Self::Void, Self::Void) => true,
+            (Self::Boolean(a), Self::Boolean(b)) => a == b,
+            (Self::Byte(a), Self::Byte(b)) => a == b,
+            (Self::Char(a), Self::Char(b)) => a == b,
+            (Self::Short(a), Self::Short(b)) => a == b,
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Long(a), Self::Long(b)) => a == b,
+            (Self::Float(a), Self::Float(b)) => a.to_bits() == b.to_bits(),
+            (Self::Double(a), Self::Double(b)) => a.to_bits() == b.to_bits(),
+            (Self::Object(a), Self::Object(b)) => a == b,
+            _ => false,
+        }
+    }
 }
 
 /// 内置 Android/Java 常见对象模型
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum JObject {
     /// `java/lang/String`
     String(String),
@@ -314,6 +331,37 @@ pub struct ObjectTable {
     class_cache: HashMap<String, JObjectRef>,
     /// `PushLocalFrame` / `PopLocalFrame` 帧水位栈（记录进入帧时的 `next_handle`）
     local_frames: Vec<u64>,
+}
+
+impl JObject {
+    /// 按位精确比较两个 `JObject`（用于时间旅行增量 diff，避免 NaN 膨胀与 -0.0 漏检）
+    pub fn bitwise_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::FloatArray(a), Self::FloatArray(b)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+            }
+            (Self::DoubleArray(a), Self::DoubleArray(b)) => {
+                a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
+            }
+            (
+                Self::Custom {
+                    class_name: ca,
+                    fields: fa,
+                },
+                Self::Custom {
+                    class_name: cb,
+                    fields: fb,
+                },
+            ) => {
+                ca == cb
+                    && fa.len() == fb.len()
+                    && fa
+                        .iter()
+                        .all(|(k, va)| fb.get(k).is_some_and(|vb| va.bitwise_eq(vb)))
+            }
+            _ => self == other,
+        }
+    }
 }
 
 impl Default for ObjectTable {
@@ -617,6 +665,110 @@ impl ObjectTable {
             local_frames: raw.local_frames,
         }
     }
+
+    /// 计算从 `before` 到当前 `self` 的紧凑增量（用于二期时间旅行 JNI 回调录制）
+    pub(crate) fn diff_since(&self, before: &ObjectTable) -> ObjectTableDelta {
+        let mut upserted_objects = Vec::new();
+        for (&id, obj) in &self.objects {
+            if !before
+                .objects
+                .get(&id)
+                .is_some_and(|prev| prev.bitwise_eq(obj))
+            {
+                upserted_objects.push((id, obj.clone()));
+            }
+        }
+        let mut removed_objects = Vec::new();
+        for &id in before.objects.keys() {
+            if !self.objects.contains_key(&id) {
+                removed_objects.push(id);
+            }
+        }
+        let mut added_local_refs = Vec::new();
+        for &id in &self.local_refs {
+            if !before.local_refs.contains(&id) {
+                added_local_refs.push(id);
+            }
+        }
+        let mut removed_local_refs = Vec::new();
+        for &id in &before.local_refs {
+            if !self.local_refs.contains(&id) {
+                removed_local_refs.push(id);
+            }
+        }
+        let mut updated_global_refs = Vec::new();
+        for (&id, &cnt) in &self.global_refs {
+            if before.global_refs.get(&id).copied() != Some(cnt) {
+                updated_global_refs.push((id, cnt));
+            }
+        }
+        for &id in before.global_refs.keys() {
+            if !self.global_refs.contains_key(&id) {
+                updated_global_refs.push((id, 0));
+            }
+        }
+        let mut added_class_cache = Vec::new();
+        for (name, &r) in &self.class_cache {
+            if before.class_cache.get(name).copied() != Some(r) {
+                added_class_cache.push((name.clone(), r));
+            }
+        }
+        let local_frames = (self.local_frames != before.local_frames)
+            .then(|| self.local_frames.clone());
+        ObjectTableDelta {
+            next_handle: self.next_handle,
+            upserted_objects,
+            removed_objects,
+            added_local_refs,
+            removed_local_refs,
+            updated_global_refs,
+            added_class_cache,
+            local_frames,
+        }
+    }
+
+    /// 将录制到的 `ObjectTableDelta` 确定性地应用到当前对象表（保持所有句柄 ID 与录制时完全一致）
+    pub(crate) fn apply_delta(&mut self, delta: &ObjectTableDelta) {
+        self.next_handle = delta.next_handle;
+        for &id in &delta.removed_objects {
+            self.objects.remove(&id);
+        }
+        for (id, obj) in &delta.upserted_objects {
+            self.objects.insert(*id, obj.clone());
+        }
+        for &id in &delta.removed_local_refs {
+            self.local_refs.remove(&id);
+        }
+        for &id in &delta.added_local_refs {
+            self.local_refs.insert(id);
+        }
+        for &(id, cnt) in &delta.updated_global_refs {
+            if cnt == 0 {
+                self.global_refs.remove(&id);
+            } else {
+                self.global_refs.insert(id, cnt);
+            }
+        }
+        for (name, r) in &delta.added_class_cache {
+            self.class_cache.insert(name.clone(), *r);
+        }
+        if let Some(ref frames) = delta.local_frames {
+            self.local_frames = frames.clone();
+        }
+    }
+}
+
+/// 单次 JNI 外部回调产生的 `ObjectTable` 紧凑增量（供二期时间旅行事件日志使用）
+#[derive(Debug, Clone, Default)]
+pub struct ObjectTableDelta {
+    pub next_handle: u64,
+    pub upserted_objects: Vec<(u64, JObject)>,
+    pub removed_objects: Vec<u64>,
+    pub added_local_refs: Vec<u64>,
+    pub removed_local_refs: Vec<u64>,
+    pub updated_global_refs: Vec<(u64, usize)>,
+    pub added_class_cache: Vec<(String, JObjectRef)>,
+    pub local_frames: Option<Vec<u64>>,
 }
 
 /// `ObjectTable` 原始可序列化表示（供 `.rtape` 磁带使用）

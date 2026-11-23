@@ -1,8 +1,14 @@
+#[cfg(any(
+    all(feature = "js", feature = "rpc"),
+    feature = "dynarmic",
+    feature = "hypervisor"
+))]
 use std::path::Path;
 
 use runidbg_arm64_emu_tracer::backend::{BackendKind, BackendWithData, CpuBackend};
 use runidbg_arm64_emu_tracer::jni::JValue;
 use runidbg_arm64_emu_tracer::tape::{Tape, TapeSelector};
+#[cfg(any(feature = "dynarmic", feature = "hypervisor"))]
 use runidbg_arm64_emu_tracer::tracer::TraceLevel;
 use runidbg_arm64_emu_tracer::AndroidEmulator;
 

@@ -513,10 +513,100 @@ interface TapeCheckpointInfo {
   readonly modules: string[];
 }
 
+interface TapeTimelineInfo {
+  readonly startInsn: number;
+  readonly endInsn: number;
+  readonly keyframeInterval: number;
+  readonly eventCount: number;
+  readonly clockEvents: number;
+  readonly jniEvents: number;
+  readonly hookEvents: number;
+  readonly hostFileCount: number;
+  readonly bookmarks: Array<{ insn: number; label: string }>;
+}
+
 interface TapeSummary {
   readonly version: number;
   readonly fileSize: number;
   readonly checkpoints: TapeCheckpointInfo[];
+  readonly timeline: TapeTimelineInfo | null;
+}
+
+interface RecordOptions {
+  /** 自动插入增量关键帧的指令间隔（默认 100000） */
+  keyframeInterval?: number;
+  /** 最大录制指令数（0 表示不限） */
+  maxInsns?: number;
+  /** 是否捕获外部 JNI 回调实现离线脱离 JS 重放（默认 true） */
+  captureJni?: boolean;
+}
+
+interface RecordNamespace {
+  start(opts?: RecordOptions): void;
+  bookmark(label: string): number;
+  insns(): number;
+  isRecording(): boolean;
+  stop(path: string): TapeSummary;
+}
+
+interface TimeTravelStopInfo {
+  readonly reason: "step" | "breakpoint" | "watchpoint" | "log_begin" | "log_end";
+  readonly insn: number;
+  readonly pc: number;
+  readonly pcHex: string;
+  readonly location: string;
+  readonly watchAddr?: number;
+  readonly watchAddrHex?: string;
+  readonly watchAccessAddr?: number;
+  readonly watchAccessAddrHex?: string;
+  readonly watchSize?: number;
+  readonly watchKind?: "write" | "read" | "access";
+  readonly watchActualKind?: "write" | "read";
+  readonly watchValue?: number;
+  readonly watchValueHex?: string;
+}
+
+interface WatchHitInfo {
+  readonly insn: number;
+  readonly pc: number;
+  readonly pcHex: string;
+  readonly location: string;
+  readonly addr: number;
+  readonly addrHex: string;
+  readonly size: number;
+  readonly kind: "write" | "read" | "access";
+  readonly actualKind: "write" | "read";
+  readonly value: number;
+  readonly valueHex: string;
+}
+
+interface TimeTravelHandle {
+  readonly startInsn: number;
+  readonly totalInsns: number;
+  readonly keyframes: number;
+  readonly bookmarks: Array<{ insn: number; label: string }>;
+  readonly modules: Array<{ name: string; base: number; baseHex: string; size: number }>;
+  currentInsn(): number;
+  isLiveForked(): boolean;
+  close(): boolean;
+  seekInsn(insn: number): TimeTravelStopInfo;
+  seekBookmark(label: string): TimeTravelStopInfo;
+  stepForward(n?: number): TimeTravelStopInfo;
+  stepBack(n?: number): TimeTravelStopInfo;
+  findPrevWrite(addr: number | bigint | string, len?: number): WatchHitInfo | null;
+  findPrevRead(addr: number | bigint | string, len?: number): WatchHitInfo | null;
+  findPrevAccess(addr: number | bigint | string, len?: number): WatchHitInfo | null;
+  findNextWrite(addr: number | bigint | string, len?: number): WatchHitInfo | null;
+  findNextRead(addr: number | bigint | string, len?: number): WatchHitInfo | null;
+  findNextAccess(addr: number | bigint | string, len?: number): WatchHitInfo | null;
+  regs(): Record<string, number>;
+  readonly mem: {
+    readBytes(addr: number | bigint | string, len: number): Uint8Array;
+    readU32(addr: number | bigint | string): number;
+    readU64(addr: number | bigint | string): bigint;
+    readCString(addr: number | bigint | string, maxLen?: number): string;
+  };
+  verifyDeterminism(): { verifiedKeyframes: number };
 }
 
 interface LoadTapeOptions {
@@ -575,6 +665,8 @@ interface EmuHandle {
   checkpointTape(path: string, label?: string): TapeCheckpointInfo;
   /** 将当前实例快进或倒带至 `.rtape` 磁带中的指定检查点（序号 / 书签名 / `"latest"`） */
   seekTape(path: string, checkpoint?: number | string): TapeCheckpointInfo;
+  /** 二期指令级时间旅行录制控制器（仅 Unicorn 后端可用） */
+  readonly record: RecordNamespace;
 }
 
 declare namespace Emu {
@@ -585,4 +677,6 @@ declare namespace Emu {
   function loadTape(path: string, options?: LoadTapeOptions): EmuHandle;
   /** 读取 `.rtape` 磁带文件摘要与全部检查点时间线 */
   function inspectTape(path: string): TapeSummary;
+  /** 打开含二期时间旅行事件日志的 `.rtape` 磁带，进行指令级 seek / 单步回退 / 反向内存观察点追踪 */
+  function openTimeTravel(path: string): TimeTravelHandle;
 }

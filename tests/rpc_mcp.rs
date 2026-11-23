@@ -435,13 +435,18 @@ fn test_mcp_server_protocol_and_tools() {
         .expect("tools/list response");
     let list: Value = serde_json::from_str(&list_raw).unwrap();
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 25);
+    assert_eq!(tools.len(), 32);
     assert!(tools.iter().any(|t| t["name"] == "trace_calltree"));
     assert!(tools.iter().any(|t| t["name"] == "trace_crypto_scan"));
     assert!(tools.iter().any(|t| t["name"] == "emu_save_tape"));
     assert!(tools.iter().any(|t| t["name"] == "emu_load_tape"));
     assert!(tools.iter().any(|t| t["name"] == "emu_seek_tape"));
     assert!(tools.iter().any(|t| t["name"] == "tape_info"));
+    assert!(tools.iter().any(|t| t["name"] == "tt_record_start"));
+    assert!(tools.iter().any(|t| t["name"] == "tt_record_stop"));
+    assert!(tools.iter().any(|t| t["name"] == "tt_open"));
+    assert!(tools.iter().any(|t| t["name"] == "tt_seek"));
+    assert!(tools.iter().any(|t| t["name"] == "tt_reverse_watch"));
 
     // 5. emu_create -> emu_load -> emu_exports -> emu_call -> emu_mem_read -> emu_mem_scan -> emu_regs -> emu_eval_js
     let created = mcp_call(&mut server, 10, "emu_create", json!({}));
@@ -657,6 +662,79 @@ fn test_mcp_server_protocol_and_tools() {
     assert_eq!(sought["label"], "mcp_cp1");
     assert_eq!(sought["loadedModules"].as_array().unwrap().len(), 1);
     let _ = std::fs::remove_file(&tmp_tape);
+
+    // 9.6 MCP Phase 2 Time-Travel 工具链验证 (tt_record_start -> emu_call -> tt_record_stop -> tt_open -> tt_seek -> tt_reverse_watch -> tt_mem_read -> tt_close)
+    let tmp_tt = std::env::temp_dir().join(format!("runidbg_mcp_tt_{}.rtape", std::process::id()));
+    let tmp_tt_str = tmp_tt.to_string_lossy().to_string();
+    let rec_start = mcp_call(
+        &mut server,
+        32,
+        "tt_record_start",
+        json!({ "emuId": emu_id, "keyframeInterval": null, "captureJni": null }),
+    );
+    assert_eq!(rec_start["ok"], true);
+    let _ = mcp_call(
+        &mut server,
+        33,
+        "emu_call",
+        json!({ "emuId": emu_id, "target": fn_addr, "args": [] }),
+    );
+    let rec_stop = mcp_call(
+        &mut server,
+        34,
+        "tt_record_stop",
+        json!({ "emuId": emu_id, "path": tmp_tt_str, "bookmark": "webp_end" }),
+    );
+    assert!(rec_stop["timeline"]["endInsn"].as_u64().unwrap() >= 1);
+    assert_eq!(rec_stop["timeline"]["keyframeInterval"].as_u64(), Some(100_000));
+    let tt_opened = mcp_call(&mut server, 35, "tt_open", json!({ "path": tmp_tt_str }));
+    let tt_id = tt_opened["ttId"].as_u64().expect("ttId");
+    let total_insns = tt_opened["totalInsns"].as_u64().unwrap();
+    assert!(total_insns >= 1);
+    let tt_at_end = mcp_call(
+        &mut server,
+        36,
+        "tt_seek",
+        json!({ "ttId": tt_id, "bookmark": "webp_end" }),
+    );
+    assert_eq!(tt_at_end["stop"]["insn"].as_u64(), Some(total_insns));
+    let tt_noop = mcp_call(
+        &mut server,
+        361,
+        "tt_seek",
+        json!({ "ttId": tt_id, "delta": 0 }),
+    );
+    assert_eq!(tt_noop["stop"]["insn"].as_u64(), Some(total_insns));
+    let tt_back = mcp_call(
+        &mut server,
+        37,
+        "tt_seek",
+        json!({ "ttId": tt_id, "delta": -1 }),
+    );
+    assert_eq!(tt_back["stop"]["insn"].as_u64(), Some(total_insns - 1));
+    // tt_reverse_watch 支持 0x 十六进制地址字符串且未命中时保持当前 insn 不变
+    let fn_hex = format!("0x{fn_addr:x}");
+    let rw_miss = mcp_call(
+        &mut server,
+        38,
+        "tt_reverse_watch",
+        json!({ "ttId": tt_id, "addr": fn_hex, "len": 4, "kind": "write" }),
+    );
+    assert!(rw_miss["hit"].is_null());
+    assert_eq!(rw_miss["currentInsn"].as_u64(), Some(total_insns - 1));
+    // tt_mem_read 读取当前指令点内存
+    let mem_res = mcp_call(
+        &mut server,
+        39,
+        "tt_mem_read",
+        json!({ "ttId": tt_id, "addr": fn_hex, "len": 16 }),
+    );
+    assert_eq!(mem_res["len"].as_u64(), Some(16));
+    assert_eq!(mem_res["hex"].as_str().unwrap().len(), 32);
+    // tt_close 释放时间旅行会话
+    let closed = mcp_call(&mut server, 40, "tt_close", json!({ "ttId": tt_id }));
+    assert_eq!(closed["closed"], true);
+    let _ = std::fs::remove_file(&tmp_tt);
 
     // 10. Phase 3: Streamable HTTP MCP
     let http_mcp = runidbg_arm64_emu_tracer::script::mcp::start_mcp_http_server("127.0.0.1:0", &root, None)

@@ -38,6 +38,7 @@ pub(super) struct EmuEntry {
 #[derive(Default)]
 pub(super) struct ScriptHost {
     pub(super) emus: Vec<EmuEntry>,
+    pub(super) time_travels: Vec<Option<crate::timetravel::TimeTravelPlayer>>,
     pub(super) script_dir_stack: Vec<PathBuf>,
     pub(super) module_cache: HashMap<PathBuf, Persistent<Value<'static>>>,
 }
@@ -66,6 +67,7 @@ impl JsSession {
         let ctx = Context::full(&rt).context("初始化 QuickJS Context 失败")?;
         let host: SharedHost = Rc::new(RefCell::new(ScriptHost {
             emus: Vec::new(),
+            time_travels: Vec::new(),
             script_dir_stack: vec![base_dir.to_path_buf()],
             module_cache: HashMap::new(),
         }));

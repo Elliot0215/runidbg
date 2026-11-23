@@ -14,10 +14,12 @@ pub mod os;
 pub mod script;
 pub mod snapshot;
 pub mod tape;
+pub mod timetravel;
 pub mod tracer;
 #[cfg(feature = "ui")]
 pub mod ui;
 
 pub use backend::{BackendKind, BackendWithData, CpuBackend};
 pub use emulator::{AndroidEmulator, AndroidEmulatorBuilder};
-pub use tape::{Tape, TapeCheckpointInfo, TapeSelector, TapeSummary};
+pub use tape::{Tape, TapeCheckpointInfo, TapeSelector, TapeSummary, TapeTimelineInfo};
+pub use timetravel::{RecordConfig, TimeTravelPlayer, TimeTravelStop, WatchHit, WatchKind, Watchpoint};

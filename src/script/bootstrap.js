@@ -866,7 +866,132 @@
           currentTapeCheckpoint = info;
           return info;
         },
+        record: {
+          start(opts = {}) {
+            const o = opts || {};
+            const kfInterval =
+              o.keyframeInterval != null ? Number(o.keyframeInterval) : 100000;
+            const maxInsns = o.maxInsns != null ? Number(o.maxInsns) : 0;
+            const captureJni = o.captureJni != null ? Boolean(o.captureJni) : true;
+            __native.emuRecordStart(emuId, kfInterval, maxInsns, captureJni);
+          },
+          bookmark(label) {
+            return __native.emuRecordBookmark(emuId, String(label));
+          },
+          insns() {
+            return __native.emuRecordInsns(emuId);
+          },
+          isRecording() {
+            return __native.emuRecordIsRecording(emuId);
+          },
+          stop(path) {
+            return __native.emuRecordStop(emuId, String(path));
+          },
+        },
       };
+  }
+
+  function validateStepCount(n, fnName) {
+    const num = Number(n);
+    if (!Number.isInteger(num) || num < 0) {
+      throw new RangeError(fnName + ": step count must be a non-negative integer, got " + n);
+    }
+    return num;
+  }
+
+  function buildTimeTravelHandle(openInfo) {
+    const ttId = openInfo.ttId;
+    const mem = {
+      readBytes(addr, len) {
+        return __native.ttMemReadBytes(ttId, addr, Number(len));
+      },
+      readU32(addr) {
+        const b = __native.ttMemReadBytes(ttId, addr, 4);
+        return (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0;
+      },
+      readU64(addr) {
+        const b = __native.ttMemReadBytes(ttId, addr, 8);
+        let lo = (b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24)) >>> 0;
+        let hi = (b[4] | (b[5] << 8) | (b[6] << 16) | (b[7] << 24)) >>> 0;
+        return (BigInt(hi) << 32n) | BigInt(lo);
+      },
+      readCString(addr, maxLen = 4096) {
+        const cap = Math.max(1, Number(maxLen) || 4096);
+        let base = typeof addr === "bigint" ? addr : BigInt(addr);
+        const bytes = [];
+        const chunk = 64;
+        while (bytes.length < cap) {
+          const toRead = Math.min(chunk, cap - bytes.length);
+          let slice;
+          try {
+            slice = __native.ttMemReadBytes(ttId, base + BigInt(bytes.length), toRead);
+          } catch (_) {
+            if (bytes.length === 0) throw _;
+            break;
+          }
+          for (let i = 0; i < slice.length; i++) {
+            if (slice[i] === 0) {
+              return __native.utf8Decode(new Uint8Array(bytes));
+            }
+            bytes.push(slice[i]);
+          }
+        }
+        return __native.utf8Decode(new Uint8Array(bytes));
+      },
+    };
+    return {
+      startInsn: openInfo.startInsn,
+      totalInsns: openInfo.totalInsns,
+      keyframes: openInfo.keyframes,
+      bookmarks: openInfo.bookmarks,
+      modules: openInfo.modules,
+      currentInsn() {
+        return __native.ttCurrentInsn(ttId);
+      },
+      isLiveForked() {
+        return __native.ttIsLiveForked(ttId);
+      },
+      close() {
+        return __native.ttClose(ttId);
+      },
+      seekInsn(insn) {
+        return __native.ttSeekInsn(ttId, Number(insn));
+      },
+      seekBookmark(label) {
+        return __native.ttSeekBookmark(ttId, String(label));
+      },
+      stepForward(n = 1) {
+        return __native.ttStep(ttId, validateStepCount(n, "stepForward"));
+      },
+      stepBack(n = 1) {
+        return __native.ttStep(ttId, -validateStepCount(n, "stepBack"));
+      },
+      findPrevWrite(addr, len = 1) {
+        return __native.ttFindMemAccess(ttId, addr, Number(len), "write", true);
+      },
+      findPrevRead(addr, len = 1) {
+        return __native.ttFindMemAccess(ttId, addr, Number(len), "read", true);
+      },
+      findPrevAccess(addr, len = 1) {
+        return __native.ttFindMemAccess(ttId, addr, Number(len), "access", true);
+      },
+      findNextWrite(addr, len = 1) {
+        return __native.ttFindMemAccess(ttId, addr, Number(len), "write", false);
+      },
+      findNextRead(addr, len = 1) {
+        return __native.ttFindMemAccess(ttId, addr, Number(len), "read", false);
+      },
+      findNextAccess(addr, len = 1) {
+        return __native.ttFindMemAccess(ttId, addr, Number(len), "access", false);
+      },
+      regs() {
+        return __native.ttRegs(ttId);
+      },
+      mem,
+      verifyDeterminism() {
+        return __native.ttVerifyDeterminism(ttId);
+      },
+    };
   }
 
   global.Emu = {
@@ -898,6 +1023,10 @@
     },
     inspectTape(path) {
       return __native.emuInspectTape(String(path));
+    },
+    openTimeTravel(path) {
+      const info = __native.ttOpen(String(path));
+      return buildTimeTravelHandle(info);
     },
   };
 })(globalThis);

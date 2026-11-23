@@ -59,6 +59,7 @@
   }
   .badge.live { color: var(--green); border-color: rgba(74,222,128,.3); background: var(--green-soft); }
   .badge.trace { color: var(--accent); border-color: rgba(249,115,22,.3); background: var(--accent-soft); }
+  .badge.tt { color: var(--purple); border-color: rgba(192,132,252,.35); background: var(--purple-soft); }
   #metaSummary {
     font-family: var(--mono); font-size: 11.5px; color: var(--text-3);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0;
@@ -229,6 +230,45 @@
   .bar-fill { height: 100%; background: linear-gradient(90deg, #ea580c, #f97316); border-radius: 999px; }
   .muted { color: var(--text-3); font-size: 12px; }
   .empty { padding: 36px 16px; text-align: center; color: var(--text-3); font-size: 12.5px; }
+
+  /* Time-Travel Cockpit (M2.4) */
+  .tt-scrubber-row { display: flex; align-items: center; gap: 10px; }
+  .tt-range { flex: 1; accent-color: var(--accent); cursor: pointer; height: 6px; padding: 0; border: none; background: transparent; }
+  .tt-grid { flex: 1; display: grid; grid-template-columns: 1.15fr 1fr; grid-template-rows: 1fr 1fr; gap: 12px; padding: 12px 14px; overflow: hidden; }
+  .tt-pane {
+    background: var(--surface); border: 1px solid var(--border); border-radius: 10px;
+    display: flex; flex-direction: column; overflow: hidden; min-height: 0;
+  }
+  .tt-pane.tall { grid-row: span 2; }
+  .tt-pane-head {
+    padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--surface-2);
+    display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; font-weight: 600;
+  }
+  .tt-pane-body { flex: 1; overflow: auto; padding: 8px 10px; font-family: var(--mono); font-size: 11.5px; line-height: 1.55; }
+  .reg-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 10px; }
+  .reg-item {
+    display: flex; align-items: center; justify-content: space-between; gap: 6px;
+    padding: 3px 7px; border-radius: 5px; border: 1px solid transparent; cursor: pointer;
+    transition: background .12s, border-color .12s;
+  }
+  .reg-item:hover { background: var(--surface-hover); border-color: var(--border-strong); }
+  .reg-item.changed { background: var(--accent-soft); border-color: rgba(249,115,22,.45); }
+  .reg-name { color: var(--text-3); font-weight: 600; text-transform: uppercase; width: 62px; flex-shrink: 0; }
+  .reg-item.changed .reg-name { color: var(--accent); }
+  .reg-val { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .reg-item.changed .reg-val { color: #fff; font-weight: 600; }
+  .hex-row { display: flex; gap: 12px; white-space: pre; padding: 1px 4px; border-radius: 3px; }
+  .hex-row:hover { background: rgba(255,255,255,.03); }
+  .hex-addr { color: var(--purple); flex-shrink: 0; }
+  .hex-bytes { color: var(--blue); flex: 1; }
+  .hex-ascii { color: var(--amber); flex-shrink: 0; }
+  .tt-tick-kf { position: absolute; top: 0; bottom: 0; width: 2px; background: rgba(96,165,250,.55); pointer-events: none; }
+  .tt-tick-bm { position: absolute; top: 1px; bottom: 1px; width: 4px; border-radius: 2px; background: var(--green); cursor: pointer; z-index: 2; }
+  .tt-hit-banner {
+    font-family: var(--mono); font-size: 11.5px; padding: 3px 9px; border-radius: 5px;
+    background: var(--purple-soft); color: var(--purple); border: 1px solid rgba(192,132,252,.35);
+    max-width: 420px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
 </style>
 </head>
 <body>
@@ -240,6 +280,7 @@
   </div>
   <div class="nav-pills">
     <button class="tab active" data-tab="trace">Trace 分析</button>
+    <button class="tab" data-tab="tt">时间旅行</button>
     <button class="tab" data-tab="rpc">RPC 看板</button>
     <button class="tab" data-tab="diag">EnvDiag 诊断</button>
   </div>
@@ -292,6 +333,97 @@
 
       <div class="trace-list" id="traceList">
         <div class="empty">未加载离线 Trace（请使用 <code>runidbg-cli ui &lt;trace.idx&gt; --base 0x40000000</code> 启动）</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- Tab 1.5: Time-Travel Debugger (M2.4) -->
+  <section id="view-tt" class="view">
+    <aside class="sidebar">
+      <div class="side-header">
+        <button class="side-tab active" data-tt-side="keyframes">关键帧</button>
+        <button class="side-tab" data-tt-side="bookmarks">书签</button>
+        <button class="side-tab" data-tt-side="modules">模块</button>
+      </div>
+      <div class="side-body" id="ttSideBody"><div class="empty">请使用 <code>runidbg-cli ui &lt;file.rtape&gt;</code> 打开二期时间旅行磁带</div></div>
+      <div style="padding:10px;border-top:1px solid var(--border);display:flex;flex-direction:column;gap:6px">
+        <button class="btn primary" id="btnTtVerify" style="width:100%">确定性逐帧自检 (Verify)</button>
+        <div id="ttVerifyStatus" class="muted" style="font-family:var(--mono);font-size:11px;text-align:center"></div>
+      </div>
+    </aside>
+
+    <div class="workspace">
+      <div class="timeline-wrap">
+        <div class="timeline-meta">
+          <span id="ttLocLabel">时间旅行时间轴（拖动滑块或点击蓝线关键帧/绿点书签毫秒级跳转）</span>
+          <span id="ttPosLabel">#0 / 0 (0.0%)</span>
+        </div>
+        <div class="timeline-bar" id="ttTimelineBar">
+          <div class="tl-cursor" id="ttTlCursor" style="left:0%"></div>
+        </div>
+        <div class="tt-scrubber-row">
+          <input class="tt-range" id="ttRange" type="range" min="0" max="0" value="0" />
+          <input id="ttInsnInp" type="number" value="0" min="0" style="width:108px" />
+          <button class="btn" id="btnTtSeek">Seek</button>
+        </div>
+      </div>
+
+      <div class="toolbar">
+        <div class="tool-group">
+          <button class="btn" id="btnTtStart" title="跳至起点">⏮ 0</button>
+          <button class="btn" id="btnTtBack10" title="回退 10 条">⏪ -10</button>
+          <button class="btn" id="btnTtBack1" title="单步回退 (bs)">◀ -1</button>
+          <button class="btn" id="btnTtFwd1" title="单步前进 (s)">▶ +1</button>
+          <button class="btn" id="btnTtFwd10" title="前进 10 条">⏩ +10</button>
+          <button class="btn" id="btnTtEnd" title="跳至终点">⏭ End</button>
+        </div>
+        <div class="tool-group">
+          <select id="ttWatchKind">
+            <option value="write">Write 写观察点</option>
+            <option value="read">Read 读观察点</option>
+            <option value="access">Access 读写</option>
+          </select>
+          <input id="ttWatchAddr" placeholder="0x 地址（点击寄存器自动填入）" style="width:188px" />
+          <input id="ttWatchLen" type="number" value="4" min="1" style="width:54px" title="观察字节长度" />
+          <button class="btn primary" id="btnTtWatchPrev">◀ 反向溯源</button>
+          <button class="btn" id="btnTtWatchNext">▶ 前向追踪</button>
+          <span id="ttWatchStatus" class="tt-hit-banner" style="display:none"></span>
+        </div>
+      </div>
+
+      <div class="tt-grid">
+        <div class="tt-pane">
+          <div class="tt-pane-head">
+            <span>当前指令上下文 (ARM64 反汇编)</span>
+            <span id="ttPcBadge" class="pill pill-sm3">0x0</span>
+          </div>
+          <div class="tt-pane-body" id="ttDisasmBox"><div class="empty">等待加载时间旅行状态...</div></div>
+        </div>
+
+        <div class="tt-pane tall">
+          <div class="tt-pane-head">
+            <span>ARM64 寄存器（橙色高亮变更项 · 点击地址快速填充观察点）</span>
+            <span id="ttChangedCount" class="muted"></span>
+          </div>
+          <div class="tt-pane-body" id="ttRegsBox"><div class="empty">等待加载寄存器...</div></div>
+        </div>
+
+        <div class="tt-pane">
+          <div class="tt-pane-head">
+            <span>内存十六进制检查器</span>
+            <div class="tool-group">
+              <input id="ttMemAddr" placeholder="0x 地址" style="width:155px;padding:3px 7px;font-size:11.5px" />
+              <select id="ttMemLen" style="padding:3px 6px;font-size:11.5px">
+                <option value="64">64B</option>
+                <option value="128" selected>128B</option>
+                <option value="256">256B</option>
+                <option value="512">512B</option>
+              </select>
+              <button class="btn" id="btnTtMemRead" style="padding:3px 8px;font-size:11.5px">读取</button>
+            </div>
+          </div>
+          <div class="tt-pane-body" id="ttMemBox"><div class="empty">输入地址或点击寄存器芯片查看当前时刻内存镜像</div></div>
+        </div>
       </div>
     </div>
   </section>
@@ -440,6 +572,20 @@ async function init() {
         $("timelineWrap").style.display = "flex";
         loadDump(0);
         renderSide();
+        return;
+      }
+      if (info.mode === "timetravel") {
+        appMode = "timetravel";
+        ttInfo = info;
+        const shortName = String(info.tapePath || "").split(/[\\/]/).pop();
+        $("modeBadge").textContent = "TIME-TRAVEL";
+        $("modeBadge").classList.add("tt");
+        const ev = info.events || {};
+        $("metaSummary").textContent =
+          `${shortName} · ${(info.totalInsns || 0).toLocaleString()} insns · ${(info.keyframes || []).length} keyframes · ${ev.total || 0} events (clk=${ev.clock || 0}, jni=${ev.jni || 0}, fs=${ev.hostFiles || 0})`;
+        $("metaSummary").title = info.tapePath || "";
+        document.querySelector('.tab[data-tab="tt"]').click();
+        initTimeTravelUi(info);
         return;
       }
     }
@@ -735,6 +881,267 @@ $("btnParseDiag").onclick = () => {
 };
 $("btnCopyPatch").onclick = () => {
   navigator.clipboard?.writeText($("diagPatchOut").textContent);
+};
+
+// ---- M2.4 Time-Travel Cockpit Logic ----
+let ttInfo = null;
+let ttSideTab = "keyframes";
+let ttPrevRegs = {};
+let ttBusy = false;
+
+document.querySelectorAll("[data-tt-side]").forEach((btn) => {
+  btn.onclick = () => {
+    document.querySelectorAll("[data-tt-side]").forEach((b) => b.classList.remove("active"));
+    btn.classList.add("active");
+    ttSideTab = btn.dataset.ttSide;
+    renderTtSide();
+  };
+});
+
+async function initTimeTravelUi(info) {
+  const minInsn = info.startInsn || 0;
+  const maxInsn = info.totalInsns || 0;
+  $("ttRange").min = minInsn;
+  $("ttRange").max = maxInsn;
+  $("ttRange").value = info.currentInsn || minInsn;
+  $("ttInsnInp").min = minInsn;
+  $("ttInsnInp").max = maxInsn;
+  $("ttInsnInp").value = info.currentInsn || minInsn;
+  renderTtTimelineTicks();
+  renderTtSide();
+  const r = await fetch("/api/tt/state");
+  if (r.ok) {
+    renderTtState(await r.json(), true);
+  }
+}
+
+function renderTtTimelineTicks() {
+  const bar = $("ttTimelineBar");
+  bar.querySelectorAll(".tt-tick-kf,.tt-tick-bm").forEach((el) => el.remove());
+  if (!ttInfo || !ttInfo.totalInsns) return;
+  const total = ttInfo.totalInsns;
+  for (const kf of ttInfo.keyframes || []) {
+    const el = document.createElement("div");
+    el.className = "tt-tick-kf";
+    el.style.left = ((kf.insn / total) * 100).toFixed(3) + "%";
+    el.title = `Keyframe #${kf.index} ${kf.label} @ insn #${kf.insn}`;
+    bar.appendChild(el);
+  }
+  for (const bm of ttInfo.bookmarks || []) {
+    const el = document.createElement("div");
+    el.className = "tt-tick-bm";
+    el.style.left = ((bm.insn / total) * 100).toFixed(3) + "%";
+    el.title = `Bookmark ${bm.label} @ insn #${bm.insn}`;
+    el.onclick = (ev) => { ev.stopPropagation(); ttSeek({ bookmark: bm.label }); };
+    bar.appendChild(el);
+  }
+}
+
+function renderTtSide() {
+  if (!ttInfo) return;
+  const body = $("ttSideBody");
+  if (ttSideTab === "keyframes") {
+    const kfs = ttInfo.keyframes || [];
+    body.innerHTML = kfs.map((kf) =>
+      `<div class="side-card" onclick="ttSeek({insn:${kf.insn}})">
+        <div class="side-card-top">
+          <span style="color:var(--blue)">#${kf.index} ${esc(kf.label)}</span>
+          <span class="pill ${kf.isDelta ? 'pill-dim' : 'pill-ok'}">${kf.isDelta ? 'DELTA' : 'BASE'}</span>
+        </div>
+        <div class="side-card-sub"><span>insn #${kf.insn.toLocaleString()}</span><span>${kf.storedPages} pages</span></div>
+      </div>`
+    ).join("") || '<div class="empty">无关键帧</div>';
+  } else if (ttSideTab === "bookmarks") {
+    const bms = ttInfo.bookmarks || [];
+    body.innerHTML = bms.map((bm) =>
+      `<div class="side-card" onclick="ttSeek({bookmark:${JSON.stringify(bm.label)}})">
+        <div class="side-card-top">
+          <span style="color:var(--green)">★ ${esc(bm.label)}</span>
+          <span class="pill pill-sm3">#${bm.insn.toLocaleString()}</span>
+        </div>
+      </div>`
+    ).join("") || '<div class="empty">录制期间未添加书签</div>';
+  } else {
+    const mods = ttInfo.modules || [];
+    body.innerHTML = mods.map((m) =>
+      `<div class="side-card" onclick="ttFillAddr('${esc(m.baseHex)}')">
+        <div class="side-card-top">
+          <span style="color:var(--text)">${esc(m.name)}</span>
+          <span class="pill pill-sha">${(m.size / 1024).toFixed(0)} KB</span>
+        </div>
+        <div class="side-card-sub"><span>${esc(m.baseHex)}</span></div>
+      </div>`
+    ).join("") || '<div class="empty">无 ELF 模块（裸代码页录制）</div>';
+  }
+}
+
+function renderTtState(st, isInitial = false) {
+  const cur = st.currentInsn || 0;
+  const total = st.totalInsns || 0;
+  const pct = total > 0 ? Math.max(0, Math.min(100, (cur / total) * 100)) : 0;
+  $("ttTlCursor").style.left = pct.toFixed(3) + "%";
+  $("ttPosLabel").textContent = `#${cur.toLocaleString()} / ${total.toLocaleString()} (${pct.toFixed(2)}%)`;
+  $("ttLocLabel").textContent = `当前停驻: ${st.location} (${st.pcHex})`;
+  $("ttRange").value = cur;
+  $("ttInsnInp").value = cur;
+  $("ttPcBadge").textContent = st.location || st.pcHex;
+
+  const dis = st.disasm || [];
+  $("ttDisasmBox").innerHTML = dis.length
+    ? dis.map((d) =>
+        `<div class="insn-row${d.isCurrent ? ' target' : ''}" style="padding:2px 6px">
+          <span style="width:18px;color:var(--accent);flex-shrink:0">${d.isCurrent ? '▶' : ''}</span>
+          <span style="width:142px;color:var(--text-3);flex-shrink:0">${esc(d.pcHex)}</span>
+          <span style="width:94px;color:var(--purple);flex-shrink:0">${esc(d.opcodeHex)}</span>
+          <span>${highlightAsm(d.asm)}</span>
+        </div>`
+      ).join("")
+    : `<div class="empty">PC=${esc(st.pcHex)}（函数返回态 RET_MAGIC_ADDR 或未映射区）</div>`;
+
+  const nextPrev = {};
+  let changedCnt = 0;
+  const regsHtml = (st.regs || []).map((rg) => {
+    const changed = !isInitial && ttPrevRegs[rg.name] !== undefined && ttPrevRegs[rg.name] !== rg.valHex;
+    if (changed) changedCnt++;
+    nextPrev[rg.name] = rg.valHex;
+    return `<div class="reg-item${changed ? ' changed' : ''}" title="点击填入地址框: ${esc(rg.valHex)}" onclick="ttFillAddr('${esc(rg.valHex)}')">
+      <span class="reg-name">${esc(rg.name)}</span>
+      <span class="reg-val">${esc(rg.valHex)}</span>
+    </div>`;
+  }).join("");
+  ttPrevRegs = nextPrev;
+  $("ttRegsBox").innerHTML = `<div class="reg-grid">${regsHtml}</div>`;
+  $("ttChangedCount").textContent = isInitial ? "" : (changedCnt ? `${changedCnt} 个寄存器变更` : "无变更");
+
+  if ($("ttMemAddr").value.trim()) {
+    ttReadMem();
+  }
+}
+
+window.ttFillAddr = function(hex) {
+  $("ttWatchAddr").value = hex;
+  $("ttMemAddr").value = hex;
+  ttReadMem();
+};
+
+window.ttSeek = async function(payload) {
+  if (ttBusy || appMode !== "timetravel") return;
+  ttBusy = true;
+  try {
+    const r = await fetch("/api/tt/seek", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    if (r.ok && d.state) renderTtState(d.state);
+    else if (d.error) alert("Seek 失败: " + d.error);
+  } finally {
+    ttBusy = false;
+  }
+};
+
+async function ttStep(delta) {
+  if (ttBusy || appMode !== "timetravel") return;
+  ttBusy = true;
+  try {
+    const r = await fetch("/api/tt/step", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ delta }),
+    });
+    const d = await r.json();
+    if (r.ok && d.state) renderTtState(d.state);
+  } finally {
+    ttBusy = false;
+  }
+}
+
+async function ttRunWatch(direction) {
+  if (ttBusy || appMode !== "timetravel") return;
+  const addr = $("ttWatchAddr").value.trim();
+  if (!addr) { alert("请先输入 0x 观察点地址（或点击右侧任意寄存器自动填入）"); return; }
+  const len = Math.max(1, Number($("ttWatchLen").value) || 4);
+  const kind = $("ttWatchKind").value;
+  ttBusy = true;
+  const pill = $("ttWatchStatus");
+  pill.style.display = "inline-block";
+  pill.textContent = direction === "prev" ? "反向扫描中..." : "前向追踪中...";
+  try {
+    const r = await fetch("/api/tt/watch", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ addr, len, kind, direction }),
+    });
+    const d = await r.json();
+    if (!r.ok) {
+      pill.textContent = "错误: " + (d.error || r.status);
+      return;
+    }
+    if (d.state) renderTtState(d.state);
+    if (d.hit) {
+      pill.textContent = `命中 #${d.hit.insn} (${d.hit.actualKind.toUpperCase()} ${d.hit.size}B val=${d.hit.valueHex}) @ ${d.hit.location}`;
+      pill.title = pill.textContent;
+    } else {
+      pill.textContent = direction === "prev" ? "此前无匹配访存（已保持原位）" : "此后无匹配访存（已保持原位）";
+    }
+  } finally {
+    ttBusy = false;
+  }
+}
+
+async function ttReadMem() {
+  if (appMode !== "timetravel") return;
+  const addr = $("ttMemAddr").value.trim();
+  if (!addr) return;
+  const len = Number($("ttMemLen").value) || 128;
+  const r = await fetch(`/api/tt/mem?addr=${encodeURIComponent(addr)}&len=${len}`);
+  const d = await r.json();
+  if (!r.ok) {
+    $("ttMemBox").innerHTML = `<div class="empty">${esc(d.error || "内存不可读")}</div>`;
+    return;
+  }
+  $("ttMemBox").innerHTML = (d.lines || []).map((ln) =>
+    `<div class="hex-row"><span class="hex-addr">${esc(ln.addrHex)}</span><span class="hex-bytes">${esc(ln.hex)}</span><span class="hex-ascii">${esc(ln.ascii)}</span></div>`
+  ).join("") || '<div class="empty">空数据</div>';
+}
+
+$("ttTimelineBar").onclick = (ev) => {
+  if (!ttInfo || !ttInfo.totalInsns) return;
+  const rect = $("ttTimelineBar").getBoundingClientRect();
+  const ratio = Math.max(0, Math.min(1, (ev.clientX - rect.left) / rect.width));
+  ttSeek({ insn: Math.round(ratio * ttInfo.totalInsns) });
+};
+$("ttRange").onchange = () => ttSeek({ insn: Number($("ttRange").value) || 0 });
+$("btnTtSeek").onclick = () => ttSeek({ insn: Number($("ttInsnInp").value) || 0 });
+$("ttInsnInp").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btnTtSeek").click(); });
+$("btnTtStart").onclick = () => ttSeek({ insn: ttInfo ? ttInfo.startInsn : 0 });
+$("btnTtEnd").onclick = () => ttSeek({ insn: ttInfo ? ttInfo.totalInsns : 0 });
+$("btnTtBack10").onclick = () => ttStep(-10);
+$("btnTtBack1").onclick = () => ttStep(-1);
+$("btnTtFwd1").onclick = () => ttStep(1);
+$("btnTtFwd10").onclick = () => ttStep(10);
+$("btnTtWatchPrev").onclick = () => ttRunWatch("prev");
+$("btnTtWatchNext").onclick = () => ttRunWatch("next");
+$("btnTtMemRead").onclick = ttReadMem;
+$("ttMemAddr").addEventListener("keydown", (e) => { if (e.key === "Enter") ttReadMem(); });
+$("btnTtVerify").onclick = async () => {
+  if (ttBusy || appMode !== "timetravel") return;
+  ttBusy = true;
+  $("ttVerifyStatus").textContent = "正在逐关键帧校验 bit-exact 确定性...";
+  try {
+    const r = await fetch("/api/tt/verify", { method: "POST" });
+    const d = await r.json();
+    if (r.ok && d.ok) {
+      $("ttVerifyStatus").style.color = "var(--green)";
+      $("ttVerifyStatus").textContent = `✓ ${d.verifiedKeyframes}/${d.verifiedKeyframes} 关键帧 100% Bit-Exact 一致`;
+    } else {
+      $("ttVerifyStatus").style.color = "var(--rose)";
+      $("ttVerifyStatus").textContent = "✗ " + (d.error || "校验失败");
+    }
+  } finally {
+    ttBusy = false;
+  }
 };
 
 init();

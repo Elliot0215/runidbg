@@ -286,7 +286,7 @@ pub(crate) struct JniTapeState {
     pub array_buffers: Vec<(u64, JObjectRef, usize)>,
 }
 
-/// JNI 运行时可变状态快照（供 `EmuSnapshot` 完整回滚对象表与临时缓冲映射）
+/// JNI 运行时可变状态快照（供 `EmuSnapshot` 完整回滚对象表、注册表、方法/字段表与临时缓冲映射）
 #[derive(Debug, Clone)]
 pub struct JniSnapshot {
     pub objects: ObjectTable,
@@ -294,6 +294,13 @@ pub struct JniSnapshot {
     pub utf_buffers: HashMap<u64, JObjectRef>,
     pub array_buffers: HashMap<u64, (JObjectRef, usize)>,
     pub static_fields: HashMap<(String, String), JValue>,
+    pub registered_natives: Vec<RegisteredNative>,
+    pub methods: HashMap<u64, MethodDesc>,
+    pub method_lookup: HashMap<(String, String, String, bool), u64>,
+    pub next_method_id: u64,
+    pub fields: HashMap<u64, FieldDesc>,
+    pub field_lookup: HashMap<(String, String, String, bool), u64>,
+    pub next_field_id: u64,
 }
 
 /// 纯 Rust 伪造的 Dalvik/ART JNI 虚拟机桥接层
@@ -449,7 +456,7 @@ impl JniVm {
         Some((obj.class_name().to_string(), kind))
     }
 
-    /// 捕获 JNI 对象引用表与临时缓冲区映射快照
+    /// 捕获 JNI 对象引用表、方法/字段注册表与临时缓冲区映射快照
     pub fn snapshot_state(&self) -> JniSnapshot {
         JniSnapshot {
             objects: self.objects.clone(),
@@ -457,16 +464,30 @@ impl JniVm {
             utf_buffers: self.utf_buffers.clone(),
             array_buffers: self.array_buffers.clone(),
             static_fields: self.static_fields.clone(),
+            registered_natives: self.registered_natives.clone(),
+            methods: self.methods.clone(),
+            method_lookup: self.method_lookup.clone(),
+            next_method_id: self.next_method_id,
+            fields: self.fields.clone(),
+            field_lookup: self.field_lookup.clone(),
+            next_field_id: self.next_field_id,
         }
     }
 
-    /// 恢复 JNI 对象引用表与临时缓冲区映射快照
+    /// 恢复 JNI 对象引用表、方法/字段注册表与临时缓冲区映射快照
     pub fn restore_state(&mut self, snap: &JniSnapshot) {
         self.objects = snap.objects.clone();
         self.pending_exception = snap.pending_exception;
         self.utf_buffers = snap.utf_buffers.clone();
         self.array_buffers = snap.array_buffers.clone();
         self.static_fields = snap.static_fields.clone();
+        self.registered_natives = snap.registered_natives.clone();
+        self.methods = snap.methods.clone();
+        self.method_lookup = snap.method_lookup.clone();
+        self.next_method_id = snap.next_method_id;
+        self.fields = snap.fields.clone();
+        self.field_lookup = snap.field_lookup.clone();
+        self.next_field_id = snap.next_field_id;
     }
 
     /// 弹出 JNI 局部引用帧，并顺带回收帧内已销毁 `jstring`/`jarray` 遗留的未释放 guest 缓冲区
@@ -694,6 +715,11 @@ impl JniVm {
     #[inline]
     pub const fn jni_env_ptr(&self) -> u64 {
         JNI_ENV_BASE
+    }
+
+    /// 替换并返回旧的 `JniHandler`（供二期时间旅行录制/回放包装或还原原业务回调）
+    pub fn swap_handler(&mut self, handler: Box<dyn JniHandler>) -> Box<dyn JniHandler> {
+        std::mem::replace(&mut self.handler, handler)
     }
 
     /// 查询通过 `RegisterNatives` 动态注册的本地方法

@@ -16,6 +16,7 @@ use crate::jni::{JObject, JObjectRef, JValue};
 use crate::loader::LoadedModule;
 use crate::memory::read_guest_cstr;
 use crate::tape::{Tape, TapeCheckpointInfo, TapeSelector, TapeSummary};
+use crate::timetravel::{RecordConfig, TimeTravelPlayer, TimeTravelStop, WatchHit, WatchKind};
 use crate::tracer::{BinaryTracer, TraceLevel};
 use crate::AndroidEmulator;
 
@@ -125,7 +126,192 @@ fn tape_summary_to_js<'js>(
         arr.set(i, tape_checkpoint_to_js(ctx, cp)?)?;
     }
     obj.set("checkpoints", arr)?;
+    if let Some(tl) = &summary.timeline {
+        let t = Object::new(ctx.clone())?;
+        t.set("startInsn", tl.start_insn as f64)?;
+        t.set("endInsn", tl.end_insn as f64)?;
+        t.set("keyframeInterval", tl.keyframe_interval as f64)?;
+        t.set("eventCount", tl.event_count as f64)?;
+        t.set("clockEvents", tl.clock_events as f64)?;
+        t.set("jniEvents", tl.jni_events as f64)?;
+        t.set("hookEvents", tl.hook_events as f64)?;
+        t.set("hostFileCount", tl.host_file_count as f64)?;
+        let bms = Array::new(ctx.clone())?;
+        for (i, (ins, lbl)) in tl.bookmarks.iter().enumerate() {
+            let b = Object::new(ctx.clone())?;
+            b.set("insn", *ins as f64)?;
+            b.set("label", lbl.as_str())?;
+            bms.set(i, b)?;
+        }
+        t.set("bookmarks", bms)?;
+        obj.set("timeline", t)?;
+    } else {
+        obj.set("timeline", rquickjs::Null)?;
+    }
     Ok(obj)
+}
+
+fn tt_stop_to_js<'js>(
+    ctx: &Ctx<'js>,
+    player: &TimeTravelPlayer,
+    stop: &TimeTravelStop,
+) -> rquickjs::Result<Object<'js>> {
+    let obj = Object::new(ctx.clone())?;
+    let (reason, insn, pc) = match stop {
+        TimeTravelStop::Step { insn, pc } => ("step", *insn, *pc),
+        TimeTravelStop::Breakpoint { insn, pc } => ("breakpoint", *insn, *pc),
+        TimeTravelStop::Watchpoint {
+            insn,
+            pc,
+            addr,
+            access_addr,
+            size,
+            kind,
+            is_write,
+            value,
+        } => {
+            obj.set("watchAddr", *addr as f64)?;
+            obj.set("watchAddrHex", format!("0x{addr:x}"))?;
+            obj.set("watchAccessAddr", *access_addr as f64)?;
+            obj.set("watchAccessAddrHex", format!("0x{access_addr:x}"))?;
+            obj.set("watchSize", *size as f64)?;
+            obj.set(
+                "watchKind",
+                match kind {
+                    WatchKind::Write => "write",
+                    WatchKind::Read => "read",
+                    WatchKind::Access => "access",
+                },
+            )?;
+            obj.set("watchActualKind", if *is_write { "write" } else { "read" })?;
+            let val_u64 = *value as u64;
+            obj.set("watchValue", val_u64 as f64)?;
+            obj.set("watchValueHex", format!("0x{val_u64:x}"))?;
+            ("watchpoint", *insn, *pc)
+        }
+        TimeTravelStop::LogBegin { insn, pc } => ("log_begin", *insn, *pc),
+        TimeTravelStop::LogEnd { insn, pc } => ("log_end", *insn, *pc),
+    };
+    obj.set("reason", reason)?;
+    obj.set("insn", insn as f64)?;
+    obj.set("pc", pc as f64)?;
+    obj.set("pcHex", format!("0x{pc:016x}"))?;
+    obj.set("location", player.describe_location(pc))?;
+    Ok(obj)
+}
+
+fn tt_watch_hit_to_js<'js>(
+    ctx: &Ctx<'js>,
+    player: &TimeTravelPlayer,
+    hit: &WatchHit,
+) -> rquickjs::Result<Object<'js>> {
+    let obj = Object::new(ctx.clone())?;
+    obj.set("insn", hit.insn as f64)?;
+    obj.set("pc", hit.pc as f64)?;
+    obj.set("pcHex", format!("0x{:016x}", hit.pc))?;
+    obj.set("location", player.describe_location(hit.pc))?;
+    obj.set("addr", hit.addr as f64)?;
+    obj.set("addrHex", format!("0x{:x}", hit.addr))?;
+    obj.set("size", hit.size as f64)?;
+    obj.set(
+        "kind",
+        match hit.kind {
+            WatchKind::Write => "write",
+            WatchKind::Read => "read",
+            WatchKind::Access => "access",
+        },
+    )?;
+    obj.set("actualKind", if hit.is_write { "write" } else { "read" })?;
+    let val_u64 = hit.value as u64;
+    obj.set("value", val_u64 as f64)?;
+    obj.set("valueHex", format!("0x{val_u64:x}"))?;
+    Ok(obj)
+}
+
+fn parse_watch_kind(ctx: &Ctx<'_>, s: &str) -> rquickjs::Result<WatchKind> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "write" | "w" => Ok(WatchKind::Write),
+        "read" | "r" => Ok(WatchKind::Read),
+        "access" | "rw" | "a" => Ok(WatchKind::Access),
+        other => Err(throw_err(
+            ctx,
+            format!("无效的观察点类型 `{other}`（支持 write / read / access）"),
+        )),
+    }
+}
+
+fn js_addr_to_u64_strict<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> rquickjs::Result<u64> {
+    if let Some(bi) = v.as_big_int() {
+        if let Ok(i) = bi.clone().to_i64() {
+            if i < 0 {
+                return Err(throw_err(ctx, "地址不能为负数"));
+            }
+            return Ok(i as u64);
+        }
+        // 处理 (i64::MAX, u64::MAX] 范围无符号 64 位 BigInt
+        if let Ok(str_fn) = ctx.globals().get::<_, Function>("String") {
+            if let Ok(s) = str_fn.call::<_, String>((v.clone(),)) {
+                if let Ok(u) = s.parse::<u64>() {
+                    return Ok(u);
+                }
+            }
+        }
+        return Err(throw_err(ctx, "BigInt 地址超出 u64 范围"));
+    }
+    if let Some(i) = v.as_int() {
+        if i < 0 {
+            return Err(throw_err(ctx, "地址不能为负数"));
+        }
+        return Ok(i as u64);
+    }
+    if let Some(n) = v.as_number() {
+        if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
+            return Err(throw_err(ctx, "地址必须为非负整数"));
+        }
+        return Ok(n as u64);
+    }
+    if let Some(s) = v.as_string().and_then(|js| js.to_string().ok()) {
+        let t = s.trim();
+        let parsed = if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+            u64::from_str_radix(hex, 16).ok()
+        } else {
+            t.parse::<u64>().ok()
+        };
+        if let Some(addr) = parsed {
+            return Ok(addr);
+        }
+        return Err(throw_err(ctx, format!("无效的地址字符串: {s}")));
+    }
+    Err(throw_err(ctx, "地址必须为非负整数、BigInt 或 0x 十六进制字符串"))
+}
+
+fn require_nonneg_int(ctx: &Ctx<'_>, v: f64, name: &str) -> rquickjs::Result<u64> {
+    if !v.is_finite() || v < 0.0 || v.fract() != 0.0 {
+        return Err(throw_err(ctx, format!("{name} 必须为非负整数")));
+    }
+    Ok(v as u64)
+}
+
+fn get_tt<'a>(
+    ctx: &Ctx<'_>,
+    host: &'a super::ScriptHost,
+    tt_id: usize,
+) -> rquickjs::Result<&'a TimeTravelPlayer> {
+    host.time_travels
+        .get(tt_id)
+        .and_then(Option::as_ref)
+        .ok_or_else(|| throw_err(ctx, "无效或已关闭的 ttId"))
+}
+
+fn get_tt_mut<'a>(
+    ctx: &Ctx<'_>,
+    host: &'a mut super::ScriptHost,
+    tt_id: usize,
+) -> rquickjs::Result<&'a mut TimeTravelPlayer> {
+    host.time_travels
+        .get_mut(tt_id)
+        .and_then(Option::as_mut)
+        .ok_or_else(|| throw_err(ctx, "无效或已关闭的 ttId"))
 }
 
 fn js_val_to_jvalue(v: &Value<'_>) -> JValue {
@@ -3421,6 +3607,394 @@ pub(super) fn register_native_bridge<'js>(
                         }
                     }
                     Ok(arr)
+                },
+            )?,
+        )?;
+    }
+
+    // ---- 二期 .rtape 确定性时间旅行录制与回放 API ----
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "emuRecordStart",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>,
+                      emu_id: usize,
+                      kf_interval: f64,
+                      max_insns: f64,
+                      capture_jni: bool|
+                      -> rquickjs::Result<()> {
+                    let keyframe_interval = require_nonneg_int(&ctx, kf_interval, "keyframeInterval")?;
+                    let max_insns = require_nonneg_int(&ctx, max_insns, "maxInsns")?;
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+                        throw_err(&ctx, "当前处于重入回调上下文，不可启动时间旅行录制")
+                    })?;
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    if entry.native_hooks.borrow().has_mutating_hooks() {
+                        return Err(throw_err(
+                            &ctx,
+                            "当前存在活跃的 JS Native Hook（replace/attach/code/syscall），离线回放无法复现其副作用且 replace 补丁会写入代码页；请先移除相关 Hook 再开启时间旅行录制",
+                        ));
+                    }
+                    let cfg = RecordConfig {
+                        keyframe_interval,
+                        max_insns,
+                        capture_jni,
+                    };
+                    entry
+                        .emu
+                        .start_time_travel_record(cfg)
+                        .map_err(|e| throw_err(&ctx, e))
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "emuRecordBookmark",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, label: String| -> rquickjs::Result<f64> {
+                    let h = host.try_borrow().map_err(|_| {
+                        throw_err(&ctx, "当前处于重入回调上下文，不可打时间旅行书签")
+                    })?;
+                    let entry = h
+                        .emus
+                        .get(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let insn = entry
+                        .emu
+                        .record_bookmark(label)
+                        .map_err(|e| throw_err(&ctx, e))?;
+                    Ok(insn as f64)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "emuRecordInsns",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize| -> rquickjs::Result<f64> {
+                    let h = host.try_borrow().map_err(|_| {
+                        throw_err(&ctx, "当前处于重入回调上下文，不可查询录制指令数")
+                    })?;
+                    let entry = h
+                        .emus
+                        .get(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    Ok(entry.emu.recorded_insns() as f64)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "emuRecordIsRecording",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize| -> rquickjs::Result<bool> {
+                    let h = host.try_borrow().map_err(|_| {
+                        throw_err(&ctx, "当前处于重入回调上下文，不可查询录制状态")
+                    })?;
+                    let entry = h
+                        .emus
+                        .get(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    Ok(entry.emu.is_time_travel_recording())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "emuRecordStop",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize, path: String| -> rquickjs::Result<Object<'js>> {
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+                        throw_err(&ctx, "当前处于重入回调上下文，不可停止时间旅行录制")
+                    })?;
+                    let entry = h
+                        .emus
+                        .get_mut(emu_id)
+                        .ok_or_else(|| throw_err(&ctx, "无效的 emuId"))?;
+                    let summary = entry
+                        .emu
+                        .stop_time_travel_record(&path)
+                        .map_err(|e| throw_err(&ctx, e))?;
+                    tape_summary_to_js(&ctx, &summary)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "ttOpen",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, path: String| -> rquickjs::Result<Object<'js>> {
+                    let player =
+                        TimeTravelPlayer::open(&path).map_err(|e| throw_err(&ctx, e))?;
+                    let start_insn = player.start_insn();
+                    let total_insns = player.total_insns();
+                    let keyframes = player.tape().len();
+                    let bms_vec = player.bookmarks().to_vec();
+                    let mods_vec = player.emu().linker().all_modules();
+                    let mut h = host.try_borrow_mut().map_err(|_| {
+                        throw_err(&ctx, "当前处于重入回调上下文，不可打开时间旅行会话")
+                    })?;
+                    let tt_id = h.time_travels.len();
+                    h.time_travels.push(Some(player));
+
+                    let out = Object::new(ctx.clone())?;
+                    out.set("ttId", tt_id)?;
+                    out.set("startInsn", start_insn as f64)?;
+                    out.set("totalInsns", total_insns as f64)?;
+                    out.set("keyframes", keyframes as f64)?;
+                    let bms = Array::new(ctx.clone())?;
+                    for (i, (ins, lbl)) in bms_vec.iter().enumerate() {
+                        let b = Object::new(ctx.clone())?;
+                        b.set("insn", *ins as f64)?;
+                        b.set("label", lbl.as_str())?;
+                        bms.set(i, b)?;
+                    }
+                    out.set("bookmarks", bms)?;
+                    let mods = Array::new(ctx.clone())?;
+                    for (i, m) in mods_vec.iter().enumerate() {
+                        let mo = Object::new(ctx.clone())?;
+                        mo.set("name", m.name.as_str())?;
+                        mo.set("base", m.base_addr as f64)?;
+                        mo.set("baseHex", format!("0x{:x}", m.base_addr))?;
+                        mo.set("size", m.image_size as f64)?;
+                        mods.set(i, mo)?;
+                    }
+                    out.set("modules", mods)?;
+                    Ok(out)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "ttClose",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, tt_id: usize| -> rquickjs::Result<bool> {
+                    let mut h = host.try_borrow_mut().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    if let Some(slot) = h.time_travels.get_mut(tt_id) {
+                        Ok(slot.take().is_some())
+                    } else {
+                        Ok(false)
+                    }
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "ttCurrentInsn",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, tt_id: usize| -> rquickjs::Result<f64> {
+                    let h = host.try_borrow().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let p = get_tt(&ctx, &h, tt_id)?;
+                    Ok(p.current_insn() as f64)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "ttIsLiveForked",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, tt_id: usize| -> rquickjs::Result<bool> {
+                    let h = host.try_borrow().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let p = get_tt(&ctx, &h, tt_id)?;
+                    Ok(p.is_live_forked())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "ttSeekInsn",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, tt_id: usize, insn: f64| -> rquickjs::Result<Object<'js>> {
+                    let target = require_nonneg_int(&ctx, insn, "target insn")?;
+                    let mut h = host.try_borrow_mut().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let p = get_tt_mut(&ctx, &mut h, tt_id)?;
+                    let stop = p.seek_insn(target).map_err(|e| throw_err(&ctx, e))?;
+                    tt_stop_to_js(&ctx, p, &stop)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "ttSeekBookmark",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, tt_id: usize, label: String| -> rquickjs::Result<Object<'js>> {
+                    let mut h = host.try_borrow_mut().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let p = get_tt_mut(&ctx, &mut h, tt_id)?;
+                    let stop = p.seek_bookmark(&label).map_err(|e| throw_err(&ctx, e))?;
+                    tt_stop_to_js(&ctx, p, &stop)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "ttStep",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, tt_id: usize, delta: f64| -> rquickjs::Result<Object<'js>> {
+                    if !delta.is_finite() || delta.fract() != 0.0 {
+                        return Err(throw_err(&ctx, "delta 必须为有限整数"));
+                    }
+                    let mut h = host.try_borrow_mut().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let p = get_tt_mut(&ctx, &mut h, tt_id)?;
+                    let stop = if delta == 0.0 {
+                        p.seek_insn(p.current_insn())
+                    } else if delta < 0.0 {
+                        p.step_backward((-delta) as u64)
+                    } else {
+                        p.step_forward(delta as u64)
+                    }
+                    .map_err(|e| throw_err(&ctx, e))?;
+                    tt_stop_to_js(&ctx, p, &stop)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "ttFindMemAccess",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      tt_id: usize,
+                      addr_val: Value<'js>,
+                      len: f64,
+                      kind: String,
+                      backward: bool|
+                      -> rquickjs::Result<Value<'js>> {
+                    let addr = js_addr_to_u64_strict(&ctx, &addr_val)?;
+                    let len_u64 = require_nonneg_int(&ctx, len, "len")?;
+                    if len_u64 == 0 {
+                        return Err(throw_err(&ctx, "len 必须为正整数 (>= 1)"));
+                    }
+                    let wk = parse_watch_kind(&ctx, &kind)?;
+                    let mut h = host.try_borrow_mut().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let p = get_tt_mut(&ctx, &mut h, tt_id)?;
+                    let res = if backward {
+                        p.find_prev_mem_access(addr, len_u64, wk)
+                    } else {
+                        p.find_next_mem_access(addr, len_u64, wk)
+                    }
+                    .map_err(|e| throw_err(&ctx, e))?;
+                    match res {
+                        Some(hit) => Ok(tt_watch_hit_to_js(&ctx, p, &hit)?.into_value()),
+                        None => Ok(Value::new_null(ctx.clone())),
+                    }
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "ttRegs",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, tt_id: usize| -> rquickjs::Result<Object<'js>> {
+                    let h = host.try_borrow().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let p = get_tt(&ctx, &h, tt_id)?;
+                    let ordered = p.snapshot_regs_ordered().map_err(|e| throw_err(&ctx, e))?;
+                    let obj = Object::new(ctx.clone())?;
+                    for (k, v) in ordered {
+                        obj.set(k.as_str(), v as f64)?;
+                    }
+                    Ok(obj)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "ttMemReadBytes",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      tt_id: usize,
+                      addr_val: Value<'js>,
+                      len_f: f64|
+                      -> rquickjs::Result<TypedArray<'js, u8>> {
+                    let addr = js_addr_to_u64_strict(&ctx, &addr_val)?;
+                    let len_u64 = require_nonneg_int(&ctx, len_f, "len")?;
+                    let len = usize::try_from(len_u64)
+                        .map_err(|_| throw_err(&ctx, "len 超出平台范围"))?;
+                    let h = host.try_borrow().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let p = get_tt(&ctx, &h, tt_id)?;
+                    let bytes = p
+                        .emu()
+                        .cpu()
+                        .mem_read_as_vec(addr, len)
+                        .map_err(|e| throw_err(&ctx, e))?;
+                    TypedArray::new(ctx.clone(), bytes)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "ttVerifyDeterminism",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, tt_id: usize| -> rquickjs::Result<Object<'js>> {
+                    let mut h = host.try_borrow_mut().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let p = get_tt_mut(&ctx, &mut h, tt_id)?;
+                    let verified = p.verify_determinism().map_err(|e| throw_err(&ctx, e))?;
+                    let out = Object::new(ctx.clone())?;
+                    out.set("verifiedKeyframes", verified as f64)?;
+                    Ok(out)
                 },
             )?,
         )?;

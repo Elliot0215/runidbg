@@ -14,7 +14,7 @@ use crate::memory::{HeapSnapshot, MemoryManager};
 /// 3. 循环 `emu.restore_snapshot(&snap)`，毫秒级将寄存器、可写内存、堆分配器与 JNI 引用表全部复位
 pub struct EmuSnapshot {
     cpu: CpuSnapshot,
-    writable_regions: Vec<(u64, Vec<u8>)>,
+    writable_regions: Vec<(u64, Vec<u8>, bool)>,
     heap: HeapSnapshot,
     jni: Option<JniSnapshot>,
 }
@@ -47,7 +47,8 @@ impl EmuSnapshot {
                 let len = (region.end - region.start) as usize;
                 let mut buf = vec![0u8; len];
                 if uc.mem_read(region.start, &mut buf).is_ok() {
-                    writable_regions.push((region.start, buf));
+                    let is_exec = (region.perms.0 & Prot::EXEC.0) != 0;
+                    writable_regions.push((region.start, buf, is_exec));
                 }
             }
         }
@@ -62,8 +63,11 @@ impl EmuSnapshot {
 
     /// 极速回滚 CPU 寄存器与全部可写内存页到快照时刻（底层兼容接口）
     pub fn restore<B: CpuBackend + ?Sized>(&self, uc: &mut B) -> EmuResult<()> {
-        for (start, bytes) in &self.writable_regions {
+        for (start, bytes, is_exec) in &self.writable_regions {
             uc.mem_write(*start, bytes)?;
+            if *is_exec {
+                let _ = uc.flush_cache(*start, start.saturating_add(bytes.len() as u64));
+            }
         }
         self.cpu.restore(uc)?;
         Ok(())
@@ -89,7 +93,7 @@ impl EmuSnapshot {
 
     /// 返回快照捕获的可写内存区域数量与总字节数
     pub fn stats(&self) -> (usize, usize) {
-        let total_bytes: usize = self.writable_regions.iter().map(|(_, b)| b.len()).sum();
+        let total_bytes: usize = self.writable_regions.iter().map(|(_, b, _)| b.len()).sum();
         (self.writable_regions.len(), total_bytes)
     }
 }

@@ -26,14 +26,12 @@ use crate::cpu::{CpuContext, RET_MAGIC_ADDR};
 use crate::crash::{BreadcrumbRing, CrashReport};
 use crate::diag::EnvDiag;
 use crate::error::{EmuError, EmuResult};
-use crate::jni::{
-    attach_jni_hook, dispatch_jni_slot, DefaultJniHandler, JObjectRef, JniHandler, JniVm,
-};
+use crate::jni::env::{JNI_TRAMPOLINE_BASE, JNI_TRAMPOLINE_SIZE};
+use crate::jni::{dispatch_jni_slot, DefaultJniHandler, JObjectRef, JniHandler, JniVm};
 #[cfg(feature = "apk")]
 use crate::loader::ApkPackage;
-use crate::loader::{
-    attach_trampoline_hook, dispatch_trampoline_slot, DynamicLinker, LoadedModule, TrampolineTable,
-};
+use crate::loader::trampoline::{TRAMPOLINE_BASE, TRAMPOLINE_SIZE};
+use crate::loader::{dispatch_trampoline_slot, DynamicLinker, LoadedModule, TrampolineTable};
 use crate::memory::MemoryManager;
 use crate::os::{
     attach_syscall_hook_with_interceptor, dispatch_syscall, DeviceProfile, VirtualFs,
@@ -61,6 +59,32 @@ pub struct EmuState {
     pub tracer: BinaryTracer,
     pub syscall_interceptor: Option<SyscallInterceptor>,
     pub manual_stop: bool,
+    /// 二期时间旅行 Hook 触发 `emu_stop()` 时置位，防止同一 PC 后续的 HLE/JNI Code Hook 二次执行
+    pub(crate) tt_stopped_at_pc: bool,
+}
+
+fn attach_builtin_code_hooks(uc: &mut Unicorn<'static, EmuState>) -> EmuResult<(UcHookId, UcHookId)> {
+    let tramp_id = uc.add_code_hook(
+        TRAMPOLINE_BASE,
+        TRAMPOLINE_BASE + TRAMPOLINE_SIZE,
+        |uc, addr, _size| {
+            if uc.get_data().tt_stopped_at_pc {
+                return;
+            }
+            dispatch_trampoline_slot(uc, addr, &mut |s| (&mut s.trampolines, &mut s.mem, &mut s.vfs));
+        },
+    )?;
+    let jni_id = uc.add_code_hook(
+        JNI_TRAMPOLINE_BASE,
+        JNI_TRAMPOLINE_BASE + JNI_TRAMPOLINE_SIZE,
+        |uc, addr, _size| {
+            if uc.get_data().tt_stopped_at_pc {
+                return;
+            }
+            dispatch_jni_slot(uc, addr, &mut |s| (&mut s.jni, &mut s.mem));
+        },
+    )?;
+    Ok((tramp_id, jni_id))
 }
 
 /// 开箱即用的 Android ARM64 模拟器构建器
@@ -184,6 +208,7 @@ impl AndroidEmulatorBuilder {
             tracer: BinaryTracer::new_in_memory(0),
             syscall_interceptor: None,
             manual_stop: false,
+            tt_stopped_at_pc: false,
         };
         let mut engine: CpuEngine<EmuState> = match self.backend {
             BackendKind::Unicorn => CpuEngine::Unicorn(Unicorn::new_with_data(
@@ -261,9 +286,10 @@ impl AndroidEmulatorBuilder {
         state.tracer = tracer;
         state.syscall_interceptor = None;
         state.manual_stop = false;
+        state.tt_stopped_at_pc = false;
 
         // 3. Unicorn 后端挂载 Syscall / HLE / JNI Hook；非 Unicorn 后端通过 SVC #imm16 统一外部循环分派
-        if let Some(uc) = engine.as_unicorn_mut() {
+        let (trampoline_hook_id, jni_hook_id) = if let Some(uc) = engine.as_unicorn_mut() {
             attach_syscall_hook_with_interceptor(
                 uc,
                 |s| (&mut s.mem, &mut s.vfs),
@@ -276,9 +302,11 @@ impl AndroidEmulatorBuilder {
                     res
                 },
             )?;
-            attach_trampoline_hook(uc, |s| (&mut s.trampolines, &mut s.mem, &mut s.vfs))?;
-            attach_jni_hook(uc, |s| (&mut s.jni, &mut s.mem))?;
-        }
+            let (t_id, j_id) = attach_builtin_code_hooks(uc)?;
+            (Some(t_id), Some(j_id))
+        } else {
+            (None, None)
+        };
 
         let mut linker = DynamicLinker::new(self.enable_hle_accel);
         for dir in &self.sysroot_dirs {
@@ -289,8 +317,11 @@ impl AndroidEmulatorBuilder {
             engine,
             cpu,
             linker,
+            trampoline_hook_id,
+            jni_hook_id,
             trace_code_hook: None,
             trace_mem_hook: None,
+            tt_recorder: None,
             exec_timeout_us: 0,
             max_instructions: 0,
             last_crash: None,
@@ -312,14 +343,34 @@ pub struct AndroidEmulator {
     engine: CpuEngine<EmuState>,
     cpu: CpuContext,
     linker: DynamicLinker,
+    trampoline_hook_id: Option<UcHookId>,
+    jni_hook_id: Option<UcHookId>,
     trace_code_hook: Option<UcHookId>,
     trace_mem_hook: Option<UcHookId>,
+    tt_recorder: Option<crate::timetravel::ActiveTimeTravelRecorder>,
     exec_timeout_us: u64,
     max_instructions: usize,
     last_crash: Option<CrashReport>,
 }
 
 impl AndroidEmulator {
+    /// 将内建 HLE/JNI 跳板 `UC_HOOK_CODE` 移至 Unicorn FIFO 链表尾部，确保时间旅行 Hook 严格先于跳板分派执行
+    pub(crate) fn move_builtin_code_hooks_to_tail(&mut self) -> EmuResult<()> {
+        let old_tramp = self.trampoline_hook_id.take();
+        let old_jni = self.jni_hook_id.take();
+        if let Some(uc) = self.engine.as_unicorn_mut() {
+            if let Some(id) = old_tramp {
+                let _ = uc.remove_hook(id);
+            }
+            if let Some(id) = old_jni {
+                let _ = uc.remove_hook(id);
+            }
+            let (t_id, j_id) = attach_builtin_code_hooks(uc)?;
+            self.trampoline_hook_id = Some(t_id);
+            self.jni_hook_id = Some(j_id);
+        }
+        Ok(())
+    }
     pub fn builder() -> AndroidEmulatorBuilder {
         AndroidEmulatorBuilder::new()
     }
@@ -361,6 +412,11 @@ impl AndroidEmulator {
         bytes: &[u8],
         run_init_array: bool,
     ) -> EmuResult<LoadedModule> {
+        if self.tt_recorder.is_some() {
+            return Err(EmuError::Backend(
+                "时间旅行录制进行中禁止调用 load_library（请在开始录制前完成 .so 加载）".to_string(),
+            ));
+        }
         let prev_loaded = self.linker.load_order().len();
 
         // 暂移 mem 与 trampolines 进行静态映射与重定位（避免同时借用 &mut engine 与 UserData）
@@ -527,11 +583,23 @@ impl AndroidEmulator {
     /// 调用任意指定地址的函数（重置 `LR = RET_MAGIC_ADDR`），返回 `X0`
     pub fn call_address(&mut self, pc: u64, args: &[u64]) -> EmuResult<u64> {
         self.cpu.prepare_call(&mut self.engine, args)?;
-        self.engine.get_data_mut().manual_stop = false;
+        {
+            let st = self.engine.get_data_mut();
+            st.manual_stop = false;
+            st.tt_stopped_at_pc = false;
+        }
         self.last_crash = None;
 
         if self.engine.uses_svc_trampolines() {
             return self.run_external_trap_loop(pc);
+        }
+
+        // 若处于时间旅行录制且已执行过先前调用，为本次新调用入口打边界关键帧（无缝支持多调用录制回放）
+        if let Some(ref rec) = self.tt_recorder {
+            if rec.recorded_insns() > 0 {
+                self.engine.reg_write(RegisterARM64::PC, pc)?;
+                rec.record_call_boundary(&self.engine, &self.cpu, &self.linker)?;
+            }
         }
 
         let exec_res = {
@@ -544,6 +612,9 @@ impl AndroidEmulator {
             )
         };
         if let Err(uc_err) = exec_res {
+            if let Some(ref rec) = self.tt_recorder {
+                rec.on_guest_crash();
+            }
             let report = CrashReport::capture(
                 &self.engine,
                 &self.linker,
@@ -806,6 +877,11 @@ impl AndroidEmulator {
 
     /// 完整回滚至指定快照状态（同步恢复 CPU、可写内存、堆指针/空闲链表与 JNI 引用表）
     pub fn restore_snapshot(&mut self, snapshot: &EmuSnapshot) -> EmuResult<()> {
+        if self.tt_recorder.is_some() {
+            return Err(EmuError::Backend(
+                "时间旅行录制进行中禁止调用 restore_snapshot".to_string(),
+            ));
+        }
         snapshot.restore_full(&mut self.engine, |d| (&mut d.mem, &mut d.jni))
     }
 
@@ -976,6 +1052,11 @@ impl AndroidEmulator {
         tape: &Tape,
         selector: &TapeSelector,
     ) -> EmuResult<TapeCheckpointInfo> {
+        if self.tt_recorder.is_some() {
+            return Err(EmuError::Backend(
+                "时间旅行录制进行中禁止调用 seek_tape".to_string(),
+            ));
+        }
         let (info, state) = tape.materialize(selector)?;
         self.apply_tape_state(state)?;
         Ok(info)
@@ -987,6 +1068,11 @@ impl AndroidEmulator {
         path: impl AsRef<Path>,
         selector: &TapeSelector,
     ) -> EmuResult<TapeCheckpointInfo> {
+        if self.tt_recorder.is_some() {
+            return Err(EmuError::Backend(
+                "时间旅行录制进行中禁止调用 seek_tape_file".to_string(),
+            ));
+        }
         let tape = Tape::load_file(path)?;
         self.seek_tape(&tape, selector)
     }
@@ -1010,10 +1096,68 @@ impl AndroidEmulator {
         builder: AndroidEmulatorBuilder,
     ) -> EmuResult<(Self, TapeCheckpointInfo)> {
         let tape = Tape::load_file(path)?;
+        Self::from_loaded_tape_with_builder(&tape, selector, builder)
+    }
+
+    /// 从已加载到内存的 `Tape` 指定检查点拉起新实例（避免重复磁盘解析）
+    pub fn from_loaded_tape_with_builder(
+        tape: &Tape,
+        selector: &TapeSelector,
+        builder: AndroidEmulatorBuilder,
+    ) -> EmuResult<(Self, TapeCheckpointInfo)> {
         let (info, state) = tape.materialize(selector)?;
         let mut emu = builder.build()?;
         emu.apply_tape_state(state)?;
         Ok((emu, info))
+    }
+
+    pub(crate) fn cpu_layout(&self) -> &CpuContext {
+        &self.cpu
+    }
+
+    /// 开启二期时间旅行确定性录制（仅 Unicorn 后端支持；自动在首条指令捕获 BASE、周期打增量关键帧并记录外部时钟/JNI/宿主文件事件）
+    pub fn start_time_travel_record(
+        &mut self,
+        config: crate::timetravel::RecordConfig,
+    ) -> EmuResult<()> {
+        if self.tt_recorder.is_some() {
+            return Err(EmuError::Backend(
+                "当前模拟器已在时间旅行录制中，请先调用 stop_time_travel_record 完成落盘".to_string(),
+            ));
+        }
+        let rec = crate::timetravel::ActiveTimeTravelRecorder::start(self, config)?;
+        self.tt_recorder = Some(rec);
+        Ok(())
+    }
+
+    /// 在活跃时间旅行录制会话中打一个命名书签，返回当前指令计数
+    pub fn record_bookmark(&self, label: impl Into<String>) -> EmuResult<u64> {
+        let rec = self.tt_recorder.as_ref().ok_or_else(|| {
+            EmuError::Backend("当前未处于时间旅行录制状态".to_string())
+        })?;
+        Ok(rec.bookmark(label))
+    }
+
+    /// 查询当前是否处于时间旅行录制中
+    pub fn is_time_travel_recording(&self) -> bool {
+        self.tt_recorder.is_some()
+    }
+
+    /// 查询当前时间旅行录制已累计记录的指令数
+    pub fn recorded_insns(&self) -> u64 {
+        self.tt_recorder
+            .as_ref()
+            .map(crate::timetravel::ActiveTimeTravelRecorder::recorded_insns)
+            .unwrap_or(0)
+    }
+
+    /// 结束时间旅行录制并将完整 `.rtape`（含周期增量关键帧与 `CHUNK_EVENT_LOG`）写入磁盘
+    pub fn stop_time_travel_record(&mut self, path: impl AsRef<Path>) -> EmuResult<TapeSummary> {
+        let rec = self.tt_recorder.take().ok_or_else(|| {
+            EmuError::Backend("当前未处于时间旅行录制状态".to_string())
+        })?;
+        rec.refresh_linker(&self.linker.export_tape_state());
+        rec.finish(self, path)
     }
 
     /// 便捷创建 `jstring`

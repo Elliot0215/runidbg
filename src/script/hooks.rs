@@ -790,6 +790,14 @@ impl JsNativeHookTable {
         }
         self.reapply_replace_ret_insns(uc);
     }
+
+    /// 是否存在会修改寄存器/内存/指令流且离线回放无法复现的活跃 JS Native Hook
+    pub fn has_mutating_hooks(&self) -> bool {
+        !self.replace_hooks.is_empty()
+            || !self.attach_hooks.is_empty()
+            || !self.code_hooks.is_empty()
+            || !self.syscall_hooks.borrow().is_empty()
+    }
 }
 
 /// 解析通配符十六进制特征码（如 `"fd 7b ?? a9 ?? ?? 00 94"`）

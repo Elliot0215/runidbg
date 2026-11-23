@@ -11,9 +11,10 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use flate2::read::ZlibDecoder;
@@ -26,7 +27,8 @@ use crate::cpu::CpuContext;
 use crate::error::{EmuError, EmuResult};
 use crate::jni::env::JniTapeState;
 use crate::jni::types::{
-    FieldDesc, JObject, JObjectRef, JValue, MethodDesc, ObjectTableRaw, RegisteredNative,
+    FieldDesc, JObject, JObjectRef, JValue, MethodDesc, ObjectTableDelta, ObjectTableRaw,
+    RegisteredNative,
 };
 use crate::loader::dex::{DexClassInfo, DexFieldInfo, DexMethodInfo, DexValue};
 use crate::loader::elf::LoadedModule;
@@ -47,11 +49,17 @@ const TAPE_FLAG_ZLIB: u32 = 1 << 0;
 
 const CHUNK_BASE_CHECKPOINT: u32 = 1;
 const CHUNK_DELTA_CHECKPOINT: u32 = 2;
-/// 预留二期时间旅行确定性事件流 Chunk Tag（v1 读取器自动跳过）
-const CHUNK_EVENT_LOG_RESERVED: u32 = 3;
+/// 二期时间旅行确定性事件流 Chunk Tag（完全向后兼容 v1 读取器）
+const CHUNK_EVENT_LOG: u32 = 3;
+const EVENT_LOG_VERSION: u32 = 1;
 
 /// 解码安全边界常量（防御畸形/恶意 .rtape 触发 OOM、Zip Bomb 或整数溢出）
-const MAX_CHUNK_UNCOMPRESSED: usize = 512 * 1024 * 1024; // 512 MiB
+const MAX_TAPE_FILE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB 磁盘单文件上限
+const MAX_CHUNK_UNCOMPRESSED: usize = 512 * 1024 * 1024; // 512 MiB 单块上限
+const MAX_TOTAL_UNCOMPRESSED: usize = 2 * 1024 * 1024 * 1024; // 2 GiB 跨块累计解压上限
+const MAX_CHUNKS: usize = 65_536;
+const MAX_EVENTS: usize = 4_000_000;
+const EVENT_RECORD_FLAGS_MASK: u32 = 0x7; // CLOCK(1) | JNI(2) | HOST_FS(4)
 const MAX_TOTAL_MAPPED_PAGES: usize = 1_048_576; // 4 GiB
 const MIN_GUEST_VA: u64 = 0x1_0000;
 const MAX_GUEST_VA: u64 = 0x0001_0000_0000_0000;
@@ -106,12 +114,92 @@ pub struct TapeCheckpointInfo {
     pub modules: Vec<String>,
 }
 
+/// 二期时间旅行确定性回放事件（按 `(insn, seq)` 单调有序）
+#[derive(Debug, Clone)]
+pub enum ReplayEvent {
+    /// 宿主机实时时钟读取（`use_real_clock == true`）
+    ClockRead { insn: u64, seq: u64, ns: u64 },
+    /// 外部 JNI Handler 回调结果与 `ObjectTable` 紧凑增量（离线回放无需原 JS/Rust Handler）
+    JniCallback {
+        insn: u64,
+        seq: u64,
+        ret: JValue,
+        delta: ObjectTableDelta,
+    },
+    /// 外部 Hook / Syscall 产生的 Guest 内存写副作用
+    ExternalMemWrite {
+        insn: u64,
+        seq: u64,
+        pc: u64,
+        writes: Vec<(u64, Vec<u8>)>,
+    },
+}
+
+/// 二期时间旅行确定性事件日志段（持久化在 `CHUNK_EVENT_LOG = 3`）
+#[derive(Debug, Clone, Default)]
+pub struct TapeEventLog {
+    pub timeline_version: u32,
+    pub start_insn: u64,
+    pub end_insn: u64,
+    pub keyframe_interval: u64,
+    pub record_flags: u32,
+    /// 时间轴命名书签：`(insn_count, label)`
+    pub bookmarks: Vec<(u64, String)>,
+    /// 每个关键帧捕获时刻对应的精确事件游标：`(keyframe_insn, event_index)`
+    pub keyframe_event_offsets: Vec<(u64, u32)>,
+    /// 录制期间从只读宿主机 `sysroot_mounts` 命中的文件缓存（保证脱离宿主机可完全离线重放）
+    pub host_files: Vec<(String, Vec<u8>)>,
+    /// 非确定性边界事件序列
+    pub events: Vec<ReplayEvent>,
+}
+
+impl TapeEventLog {
+    pub fn to_timeline_info(&self) -> TapeTimelineInfo {
+        let mut clock_events = 0usize;
+        let mut jni_events = 0usize;
+        let mut hook_events = 0usize;
+        for ev in &self.events {
+            match ev {
+                ReplayEvent::ClockRead { .. } => clock_events += 1,
+                ReplayEvent::JniCallback { .. } => jni_events += 1,
+                ReplayEvent::ExternalMemWrite { .. } => hook_events += 1,
+            }
+        }
+        TapeTimelineInfo {
+            start_insn: self.start_insn,
+            end_insn: self.end_insn,
+            keyframe_interval: self.keyframe_interval,
+            event_count: self.events.len(),
+            clock_events,
+            jni_events,
+            hook_events,
+            host_file_count: self.host_files.len(),
+            bookmarks: self.bookmarks.clone(),
+        }
+    }
+}
+
+/// 时间旅行时间轴公开摘要（供 CLI `tape info` / JS / MCP 展示）
+#[derive(Debug, Clone)]
+pub struct TapeTimelineInfo {
+    pub start_insn: u64,
+    pub end_insn: u64,
+    pub keyframe_interval: u64,
+    pub event_count: usize,
+    pub clock_events: usize,
+    pub jni_events: usize,
+    pub hook_events: usize,
+    pub host_file_count: usize,
+    pub bookmarks: Vec<(u64, String)>,
+}
+
 /// 整卷 `.rtape` 磁带文件摘要
 #[derive(Debug, Clone)]
 pub struct TapeSummary {
     pub version: u32,
     pub file_size: u64,
     pub checkpoints: Vec<TapeCheckpointInfo>,
+    pub timeline: Option<TapeTimelineInfo>,
 }
 
 /// 检查点元数据记录（内部存储）
@@ -201,10 +289,11 @@ impl TapeCheckpointChunk {
     }
 }
 
-/// 内存中的多检查点磁带容器（支持顺序追加书签、持久化落盘、任意检查点物化与倒带/快进）
+/// 内存中的多检查点磁带容器（支持顺序追加书签、持久化落盘、任意检查点物化、倒带/快进与二期时间旅行事件流）
 #[derive(Debug, Clone)]
 pub struct Tape {
     chunks: Vec<TapeCheckpointChunk>,
+    event_log: Option<Arc<TapeEventLog>>,
 }
 
 impl Tape {
@@ -232,7 +321,73 @@ impl Tape {
         };
         Self {
             chunks: vec![chunk],
+            event_log: None,
         }
+    }
+
+    pub fn event_log(&self) -> Option<&TapeEventLog> {
+        self.event_log.as_deref()
+    }
+
+    pub(crate) fn event_log_arc(&self) -> Option<Arc<TapeEventLog>> {
+        self.event_log.as_ref().map(Arc::clone)
+    }
+
+    pub fn set_event_log(&mut self, log: Option<TapeEventLog>) {
+        self.event_log = log.map(Arc::new);
+    }
+
+    pub fn has_time_travel(&self) -> bool {
+        self.event_log.is_some()
+    }
+
+    pub fn timeline_info(&self) -> Option<TapeTimelineInfo> {
+        self.event_log.as_deref().map(TapeEventLog::to_timeline_info)
+    }
+
+    /// 查找 `meta.insn_count <= target_insn` 的最近关键帧索引（二分定位，供二期时间旅行快速 seek）
+    pub(crate) fn nearest_keyframe_index(&self, target_insn: u64) -> usize {
+        let pos = self
+            .chunks
+            .partition_point(|c| c.meta.insn_count <= target_insn);
+        pos.saturating_sub(1)
+    }
+
+    /// 查找恰好位于 `target_insn` 且保存的 `PC != RET_MAGIC_ADDR` 的多调用边界关键帧（用于无缝跨越连续 `call_address`）
+    pub(crate) fn call_boundary_keyframe_at(&self, target_insn: u64) -> Option<usize> {
+        let end = self
+            .chunks
+            .partition_point(|c| c.meta.insn_count <= target_insn);
+        let mut idx = end;
+        while idx > 0 {
+            idx -= 1;
+            let c = &self.chunks[idx];
+            if c.meta.insn_count != target_insn {
+                break;
+            }
+            if c.regs.pc != crate::cpu::RET_MAGIC_ADDR {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    /// 直接按索引物化检查点状态
+    pub(crate) fn materialize_index(
+        &self,
+        idx: usize,
+    ) -> EmuResult<(TapeCheckpointInfo, TapeFullState)> {
+        self.materialize(&TapeSelector::Index(idx))
+    }
+
+    /// 获取指定索引关键帧的指令计数
+    pub(crate) fn keyframe_insn(&self, idx: usize) -> Option<u64> {
+        self.chunks.get(idx).map(|c| c.meta.insn_count)
+    }
+
+    /// 获取指定索引关键帧的标签
+    pub(crate) fn keyframe_label(&self, idx: usize) -> Option<&str> {
+        self.chunks.get(idx).map(|c| c.meta.label.as_str())
     }
 
     /// 检查点总数
@@ -451,6 +606,29 @@ impl Tape {
                 file.write_all(&comp_len_u32.to_le_bytes())?;
                 file.write_all(&compressed)?;
             }
+
+            if let Some(ev_log) = &self.event_log {
+                let ev_offset = file.stream_position()?;
+                let mut raw = Vec::new();
+                encode_event_log(&mut raw, ev_log)?;
+                let raw_len_u32 = u32::try_from(raw.len()).map_err(|_| {
+                    EmuError::Backend("时间旅行事件日志原始大小超出 4 GiB 上限".to_string())
+                })?;
+                let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+                enc.write_all(&raw)?;
+                let compressed = enc.finish()?;
+                let comp_len_u32 = u32::try_from(compressed.len()).map_err(|_| {
+                    EmuError::Backend("时间旅行事件日志压缩大小超出 4 GiB 上限".to_string())
+                })?;
+                file.write_all(&CHUNK_EVENT_LOG.to_le_bytes())?;
+                file.write_all(&raw_len_u32.to_le_bytes())?;
+                file.write_all(&comp_len_u32.to_le_bytes())?;
+                file.write_all(&compressed)?;
+                // 回填 Header [24..32] event_log_offset
+                file.seek(SeekFrom::Start(24))?;
+                file.write_all(&ev_offset.to_le_bytes())?;
+            }
+
             file.sync_all()?;
             drop(file);
             fs::rename(&tmp_path, path)?;
@@ -467,12 +645,20 @@ impl Tape {
             version: TAPE_VERSION,
             file_size,
             checkpoints: self.checkpoints(),
+            timeline: self.timeline_info(),
         })
     }
 
-    /// 从磁盘加载完整 `.rtape` 磁带文件（严格校验头字段、压缩上限、解压长度、尾部残留与首帧 BASE 约束）
+    /// 从磁盘加载完整 `.rtape` 磁带文件（严格校验头字段、压缩上限、累计解压上限、offset、尾部残留与单调性约束）
     pub fn load_file(path: impl AsRef<Path>) -> EmuResult<Self> {
         let path = path.as_ref();
+        let file_len = fs::metadata(path)?.len();
+        if file_len > MAX_TAPE_FILE_BYTES {
+            return Err(EmuError::Backend(format!(
+                ".rtape 文件大小超出安全上限 ({file_len} > {MAX_TAPE_FILE_BYTES}): {}",
+                path.display()
+            )));
+        }
         let data = fs::read(path)?;
         if data.len() < 32 {
             return Err(EmuError::Backend(format!(
@@ -501,10 +687,19 @@ impl Tape {
         }
         let compressed_flag = (flags & TAPE_FLAG_ZLIB) != 0;
         let expected_chunks = u32::from_le_bytes(data[20..24].try_into().unwrap()) as usize;
+        if expected_chunks == 0 || expected_chunks > MAX_CHUNKS {
+            return Err(EmuError::Backend(format!(
+                "非法的 .rtape 检查点声明数量: {expected_chunks}"
+            )));
+        }
+        let event_log_offset = u64::from_le_bytes(data[24..32].try_into().unwrap());
 
         let mut pos = 32usize;
         let mut chunks = Vec::new();
+        let mut event_log: Option<Arc<TapeEventLog>> = None;
+        let mut total_uncompressed: usize = 0;
         while pos < data.len() {
+            let chunk_start = pos as u64;
             let hdr_end = pos
                 .checked_add(12)
                 .ok_or_else(|| EmuError::Backend(".rtape Chunk 偏移溢出".to_string()))?;
@@ -524,45 +719,65 @@ impl Tape {
             let slice = &data[pos..payload_end];
             pos = payload_end;
 
-            if tag == CHUNK_EVENT_LOG_RESERVED {
-                continue; // 预留二期时间旅行段，v1 安全跳过
+            if tag == CHUNK_EVENT_LOG {
+                if event_log_offset == 0 {
+                    // 无 header event_log_offset 声明的未知未来扩展段：安全前向跳过
+                    continue;
+                }
+                if event_log.is_some() {
+                    return Err(EmuError::Backend(
+                        "损坏的 .rtape 文件：包含重复的 CHUNK_EVENT_LOG 段".to_string(),
+                    ));
+                }
+                if chunk_start != event_log_offset {
+                    return Err(EmuError::Backend(format!(
+                        "损坏的 .rtape 文件：EventLog 偏移不匹配 header={event_log_offset} actual={chunk_start}"
+                    )));
+                }
+                if uncomp_len > MAX_CHUNK_UNCOMPRESSED {
+                    return Err(EmuError::Backend(format!(
+                        ".rtape EventLog 解压声明长度超出安全上限: {uncomp_len} bytes"
+                    )));
+                }
+                total_uncompressed = total_uncompressed.saturating_add(uncomp_len);
+                if total_uncompressed > MAX_TOTAL_UNCOMPRESSED {
+                    return Err(EmuError::Backend(
+                        ".rtape 累计解压大小超出安全上限（疑似跨块压缩炸弹）".to_string(),
+                    ));
+                }
+                let raw = decompress_chunk_slice(slice, uncomp_len, compressed_flag)?;
+                let mut reader = BinReader::new(&raw);
+                let parsed = decode_event_log(&mut reader)?;
+                if reader.remaining() != 0 {
+                    return Err(EmuError::Backend(format!(
+                        ".rtape EventLog 尾部存在 {} 字节未解析残留数据",
+                        reader.remaining()
+                    )));
+                }
+                event_log = Some(Arc::new(parsed));
+                continue;
             }
             if tag != CHUNK_BASE_CHECKPOINT && tag != CHUNK_DELTA_CHECKPOINT {
                 return Err(EmuError::Backend(format!("未知的 .rtape Chunk Tag: {tag}")));
+            }
+            if chunks.len() >= MAX_CHUNKS {
+                return Err(EmuError::Backend(format!(
+                    ".rtape 检查点数量超出安全上限: {MAX_CHUNKS}"
+                )));
             }
             if uncomp_len > MAX_CHUNK_UNCOMPRESSED {
                 return Err(EmuError::Backend(format!(
                     ".rtape Chunk 解压声明长度超出安全上限: {uncomp_len} bytes"
                 )));
             }
+            total_uncompressed = total_uncompressed.saturating_add(uncomp_len);
+            if total_uncompressed > MAX_TOTAL_UNCOMPRESSED {
+                return Err(EmuError::Backend(
+                    ".rtape 累计解压大小超出安全上限（疑似跨块压缩炸弹）".to_string(),
+                ));
+            }
 
-            let raw = if compressed_flag {
-                let dec = ZlibDecoder::new(slice);
-                let mut out = Vec::with_capacity(uncomp_len.min(64 * 1024));
-                dec.take((MAX_CHUNK_UNCOMPRESSED as u64) + 1)
-                    .read_to_end(&mut out)
-                    .map_err(|e| EmuError::Backend(format!(".rtape Zlib 解压失败: {e}")))?;
-                if out.len() > MAX_CHUNK_UNCOMPRESSED {
-                    return Err(EmuError::Backend(
-                        ".rtape Zlib 解压结果超出安全上限（疑似压缩炸弹）".to_string(),
-                    ));
-                }
-                if out.len() != uncomp_len {
-                    return Err(EmuError::Backend(format!(
-                        ".rtape Chunk 解压长度不匹配: expected={uncomp_len}, actual={}",
-                        out.len()
-                    )));
-                }
-                out
-            } else {
-                if slice.len() != uncomp_len {
-                    return Err(EmuError::Backend(format!(
-                        ".rtape 非压缩 Chunk 长度不匹配: expected={uncomp_len}, actual={}",
-                        slice.len()
-                    )));
-                }
-                slice.to_vec()
-            };
+            let raw = decompress_chunk_slice(slice, uncomp_len, compressed_flag)?;
 
             let mut reader = BinReader::new(&raw);
             let mut chunk = decode_chunk_payload(&mut reader, tag == CHUNK_DELTA_CHECKPOINT)?;
@@ -585,16 +800,39 @@ impl Tape {
                 "损坏的 .rtape 文件：首个检查点必须为 BASE 帧而非 DELTA 帧".to_string(),
             ));
         }
-        if expected_chunks != 0 && chunks.len() != expected_chunks {
+        if chunks.len() != expected_chunks {
             return Err(EmuError::Backend(format!(
                 "损坏或截断的 .rtape 文件：文件头声明 {expected_chunks} 个检查点，实际读取到 {} 个",
                 chunks.len()
             )));
         }
-        Ok(Self { chunks })
+        if event_log_offset != 0 && event_log.is_none() {
+            return Err(EmuError::Backend(format!(
+                "损坏或截断的 .rtape 文件：文件头声明 EventLog 偏移 {event_log_offset} 但未读取到 CHUNK_EVENT_LOG"
+            )));
+        }
+        if let Some(ref log) = event_log {
+            if chunks[0].meta.insn_count != log.start_insn {
+                return Err(EmuError::Backend(format!(
+                    "损坏的 .rtape 时间轴：首帧 insn={} 与 EventLog start_insn={} 不一致",
+                    chunks[0].meta.insn_count, log.start_insn
+                )));
+            }
+            let mut prev_insn = chunks[0].meta.insn_count;
+            for (idx, c) in chunks.iter().enumerate() {
+                if c.meta.insn_count < prev_insn || c.meta.insn_count > log.end_insn {
+                    return Err(EmuError::Backend(format!(
+                        "损坏的 .rtape 时间轴：检查点 #{idx} insn={} 违反单调/范围约束 [{prev_insn}, {}]",
+                        c.meta.insn_count, log.end_insn
+                    )));
+                }
+                prev_insn = c.meta.insn_count;
+            }
+        }
+        Ok(Self { chunks, event_log })
     }
 
-    /// 读取磁盘 `.rtape` 摘要信息（列出全部检查点、页数、体积与模块）
+    /// 读取磁盘 `.rtape` 摘要信息（列出全部检查点、页数、体积、模块与可选时间旅行时间轴）
     pub fn inspect_file(path: impl AsRef<Path>) -> EmuResult<TapeSummary> {
         let path = path.as_ref();
         let file_size = fs::metadata(path)?.len();
@@ -603,7 +841,42 @@ impl Tape {
             version: TAPE_VERSION,
             file_size,
             checkpoints: tape.checkpoints(),
+            timeline: tape.timeline_info(),
         })
+    }
+}
+
+fn decompress_chunk_slice(
+    slice: &[u8],
+    uncomp_len: usize,
+    compressed_flag: bool,
+) -> EmuResult<Vec<u8>> {
+    if compressed_flag {
+        let dec = ZlibDecoder::new(slice);
+        let mut out = Vec::with_capacity(uncomp_len.min(64 * 1024));
+        dec.take((MAX_CHUNK_UNCOMPRESSED as u64) + 1)
+            .read_to_end(&mut out)
+            .map_err(|e| EmuError::Backend(format!(".rtape Zlib 解压失败: {e}")))?;
+        if out.len() > MAX_CHUNK_UNCOMPRESSED {
+            return Err(EmuError::Backend(
+                ".rtape Zlib 解压结果超出安全上限（疑似压缩炸弹）".to_string(),
+            ));
+        }
+        if out.len() != uncomp_len {
+            return Err(EmuError::Backend(format!(
+                ".rtape Chunk 解压长度不匹配: expected={uncomp_len}, actual={}",
+                out.len()
+            )));
+        }
+        Ok(out)
+    } else {
+        if slice.len() != uncomp_len {
+            return Err(EmuError::Backend(format!(
+                ".rtape 非压缩 Chunk 长度不匹配: expected={uncomp_len}, actual={}",
+                slice.len()
+            )));
+        }
+        Ok(slice.to_vec())
     }
 }
 
@@ -2481,5 +2754,293 @@ fn decode_net_state(r: &mut BinReader<'_>) -> EmuResult<NetTapeState> {
         virtual_fds,
         pipes,
         next_pipe_id,
+    })
+}
+
+fn encode_event_log(out: &mut Vec<u8>, log: &TapeEventLog) -> EmuResult<()> {
+    let mut w = BinWriter::new(out);
+    w.u32(if log.timeline_version == 0 {
+        EVENT_LOG_VERSION
+    } else {
+        log.timeline_version
+    });
+    w.u64(log.start_insn);
+    w.u64(log.end_insn);
+    w.u64(log.keyframe_interval);
+    w.u32(log.record_flags);
+
+    w.len_u32(log.bookmarks.len())?;
+    for (insn, label) in &log.bookmarks {
+        w.u64(*insn);
+        w.str(label)?;
+    }
+
+    w.len_u32(log.keyframe_event_offsets.len())?;
+    for &(kf_insn, ev_idx) in &log.keyframe_event_offsets {
+        w.u64(kf_insn);
+        w.u32(ev_idx);
+    }
+
+    w.len_u32(log.host_files.len())?;
+    for (path, data) in &log.host_files {
+        w.str(path)?;
+        w.bytes(data)?;
+    }
+
+    w.len_u32(log.events.len())?;
+    for ev in &log.events {
+        match ev {
+            ReplayEvent::ClockRead { insn, seq, ns } => {
+                w.u8(1);
+                w.u64(*insn);
+                w.u64(*seq);
+                w.u64(*ns);
+            }
+            ReplayEvent::JniCallback {
+                insn,
+                seq,
+                ret,
+                delta,
+            } => {
+                w.u8(2);
+                w.u64(*insn);
+                w.u64(*seq);
+                encode_jvalue(&mut w, *ret);
+                w.u64(delta.next_handle);
+                w.len_u32(delta.upserted_objects.len())?;
+                for (id, obj) in &delta.upserted_objects {
+                    w.u64(*id);
+                    encode_jobject(&mut w, obj)?;
+                }
+                w.len_u32(delta.removed_objects.len())?;
+                for &id in &delta.removed_objects {
+                    w.u64(id);
+                }
+                w.len_u32(delta.added_local_refs.len())?;
+                for &id in &delta.added_local_refs {
+                    w.u64(id);
+                }
+                w.len_u32(delta.removed_local_refs.len())?;
+                for &id in &delta.removed_local_refs {
+                    w.u64(id);
+                }
+                w.len_u32(delta.updated_global_refs.len())?;
+                for &(id, cnt) in &delta.updated_global_refs {
+                    w.u64(id);
+                    w.len_u32(cnt)?;
+                }
+                w.len_u32(delta.added_class_cache.len())?;
+                for (name, r) in &delta.added_class_cache {
+                    w.str(name)?;
+                    w.u64(r.0);
+                }
+                match &delta.local_frames {
+                    Some(frames) => {
+                        w.u8(1);
+                        w.len_u32(frames.len())?;
+                        for &f in frames {
+                            w.u64(f);
+                        }
+                    }
+                    None => w.u8(0),
+                }
+            }
+            ReplayEvent::ExternalMemWrite { .. } => {
+                return Err(EmuError::Backend(
+                    "暂不支持编码 ExternalMemWrite 事件 (tag=3)".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_event_log(r: &mut BinReader<'_>) -> EmuResult<TapeEventLog> {
+    let timeline_version = r.u32()?;
+    if timeline_version != EVENT_LOG_VERSION {
+        return Err(EmuError::Backend(format!(
+            "不支持的 .rtape EventLog 版本 v{timeline_version}（当前支持 v{EVENT_LOG_VERSION}）"
+        )));
+    }
+    let start_insn = r.u64()?;
+    let end_insn = r.u64()?;
+    if end_insn < start_insn {
+        return Err(EmuError::Backend(format!(
+            "非法的 .rtape EventLog 指令区间: [{start_insn}, {end_insn}]"
+        )));
+    }
+    let keyframe_interval = r.u64()?;
+    let record_flags = r.u32()?;
+    if (record_flags & !EVENT_RECORD_FLAGS_MASK) != 0 {
+        return Err(EmuError::Backend(format!(
+            "不支持的 .rtape EventLog record_flags: 0x{record_flags:08x}"
+        )));
+    }
+
+    let (bm_len, bm_cap) = r.read_count(12)?;
+    let mut bookmarks = Vec::with_capacity(bm_cap);
+    for _ in 0..bm_len {
+        bookmarks.push((r.u64()?, r.str()?));
+    }
+
+    let (kf_len, kf_cap) = r.read_count(12)?;
+    let mut keyframe_event_offsets = Vec::with_capacity(kf_cap);
+    for _ in 0..kf_len {
+        keyframe_event_offsets.push((r.u64()?, r.u32()?));
+    }
+
+    let (hf_len, hf_cap) = r.read_count(8)?;
+    let mut host_files = Vec::with_capacity(hf_cap);
+    for _ in 0..hf_len {
+        host_files.push((r.str()?, r.bytes()?));
+    }
+
+    let (ev_len, ev_cap) = r.read_count(17)?;
+    if ev_len > MAX_EVENTS {
+        return Err(EmuError::Backend(format!(
+            ".rtape EventLog 事件数量超出安全上限: {ev_len} > {MAX_EVENTS}"
+        )));
+    }
+    let mut events = Vec::with_capacity(ev_cap);
+    let mut prev_ev_key: Option<(u64, u64)> = None;
+    for _ in 0..ev_len {
+        let ev = match r.u8()? {
+            1 => ReplayEvent::ClockRead {
+                insn: r.u64()?,
+                seq: r.u64()?,
+                ns: r.u64()?,
+            },
+            2 => {
+                let insn = r.u64()?;
+                let seq = r.u64()?;
+                let ret = decode_jvalue(r)?;
+                let next_handle = r.u64()?;
+                let (up_len, up_cap) = r.read_count(9)?;
+                let mut upserted_objects = Vec::with_capacity(up_cap);
+                for _ in 0..up_len {
+                    upserted_objects.push((r.u64()?, decode_jobject(r)?));
+                }
+                let (rm_len, rm_cap) = r.read_count(8)?;
+                let mut removed_objects = Vec::with_capacity(rm_cap);
+                for _ in 0..rm_len {
+                    removed_objects.push(r.u64()?);
+                }
+                let (al_len, al_cap) = r.read_count(8)?;
+                let mut added_local_refs = Vec::with_capacity(al_cap);
+                for _ in 0..al_len {
+                    added_local_refs.push(r.u64()?);
+                }
+                let (rl_len, rl_cap) = r.read_count(8)?;
+                let mut removed_local_refs = Vec::with_capacity(rl_cap);
+                for _ in 0..rl_len {
+                    removed_local_refs.push(r.u64()?);
+                }
+                let (ug_len, ug_cap) = r.read_count(12)?;
+                let mut updated_global_refs = Vec::with_capacity(ug_cap);
+                for _ in 0..ug_len {
+                    updated_global_refs.push((r.u64()?, r.u32()? as usize));
+                }
+                let (cc_len, cc_cap) = r.read_count(12)?;
+                let mut added_class_cache = Vec::with_capacity(cc_cap);
+                for _ in 0..cc_len {
+                    added_class_cache.push((r.str()?, JObjectRef(r.u64()?)));
+                }
+                let local_frames = match r.u8()? {
+                    0 => None,
+                    1 => {
+                        let (lf_len, lf_cap) = r.read_count(8)?;
+                        let mut frames = Vec::with_capacity(lf_cap);
+                        for _ in 0..lf_len {
+                            frames.push(r.u64()?);
+                        }
+                        Some(frames)
+                    }
+                    other => {
+                        return Err(EmuError::Backend(format!(
+                            "非法的 ObjectTableDelta local_frames 标记: {other}"
+                        )))
+                    }
+                };
+                ReplayEvent::JniCallback {
+                    insn,
+                    seq,
+                    ret,
+                    delta: ObjectTableDelta {
+                        next_handle,
+                        upserted_objects,
+                        removed_objects,
+                        added_local_refs,
+                        removed_local_refs,
+                        updated_global_refs,
+                        added_class_cache,
+                        local_frames,
+                    },
+                }
+            }
+            3 => {
+                return Err(EmuError::Backend(
+                    "暂不支持回放 ExternalMemWrite 事件 (tag=3)".to_string(),
+                ));
+            }
+            other => {
+                return Err(EmuError::Backend(format!(
+                    "未知的 .rtape ReplayEvent tag: {other}"
+                )))
+            }
+        };
+        let (ev_insn, ev_seq) = match &ev {
+            ReplayEvent::ClockRead { insn, seq, .. }
+            | ReplayEvent::JniCallback { insn, seq, .. }
+            | ReplayEvent::ExternalMemWrite { insn, seq, .. } => (*insn, *seq),
+        };
+        if ev_insn < start_insn || ev_insn > end_insn {
+            return Err(EmuError::Backend(format!(
+                "非法的 .rtape EventLog 事件指令号 {ev_insn}（超出 [{start_insn}, {end_insn}]）"
+            )));
+        }
+        if let Some((prev_i, prev_s)) = prev_ev_key {
+            if ev_insn < prev_i || ev_seq < prev_s {
+                return Err(EmuError::Backend(format!(
+                    "非法的 .rtape EventLog 事件非单调: ({ev_insn}, {ev_seq}) < ({prev_i}, {prev_s})"
+                )));
+            }
+        }
+        prev_ev_key = Some((ev_insn, ev_seq));
+        events.push(ev);
+    }
+
+    let mut prev_kf: Option<(u64, u32)> = None;
+    for &(kf_insn, ev_idx) in &keyframe_event_offsets {
+        if kf_insn < start_insn || kf_insn > end_insn {
+            return Err(EmuError::Backend(format!(
+                "非法的 .rtape keyframe_event_offsets insn={kf_insn}（超出 [{start_insn}, {end_insn}]）"
+            )));
+        }
+        if (ev_idx as usize) > events.len() {
+            return Err(EmuError::Backend(format!(
+                "非法的 .rtape keyframe_event_offsets ev_idx={ev_idx} > events.len()={}",
+                events.len()
+            )));
+        }
+        if let Some((pk, pe)) = prev_kf {
+            if kf_insn < pk || ev_idx < pe {
+                return Err(EmuError::Backend(format!(
+                    "非法的 .rtape keyframe_event_offsets 非单调: ({kf_insn}, {ev_idx}) < ({pk}, {pe})"
+                )));
+            }
+        }
+        prev_kf = Some((kf_insn, ev_idx));
+    }
+
+    Ok(TapeEventLog {
+        timeline_version,
+        start_insn,
+        end_insn,
+        keyframe_interval,
+        record_flags,
+        bookmarks,
+        keyframe_event_offsets,
+        host_files,
+        events,
     })
 }

@@ -102,6 +102,10 @@ pub struct VirtualFs {
     breadcrumbs: BreadcrumbRing,
     /// 宿主机 Socket 透传 + Epoll/EventFD/Pipe + 虚拟网卡子系统
     pub net: NetManager,
+    /// 可选二期时间旅行确定性事件总线（关闭时为 `None`，零开销）
+    tt_bus: Option<std::sync::Arc<crate::timetravel::EventLogBus>>,
+    /// 二期时间旅行离线回放专用只读宿主机文件映射（与 `overlay_files` 隔离，保持只读语义）
+    replay_host_files: HashMap<String, Vec<u8>>,
 }
 
 impl Default for VirtualFs {
@@ -182,7 +186,22 @@ impl VirtualFs {
             diag: EnvDiag::new(),
             breadcrumbs: BreadcrumbRing::new(),
             net: NetManager::new(),
+            tt_bus: None,
+            replay_host_files: HashMap::new(),
         }
+    }
+
+    pub(crate) fn set_tt_bus(&mut self, bus: Option<std::sync::Arc<crate::timetravel::EventLogBus>>) {
+        self.tt_bus = bus;
+    }
+
+    pub(crate) fn set_replay_host_files(&mut self, files: HashMap<String, Vec<u8>>) {
+        self.replay_host_files = files;
+    }
+
+    #[inline]
+    fn is_tt_replaying(&self) -> bool {
+        self.tt_bus.as_ref().is_some_and(|b| b.is_replaying())
     }
 
     /// 分配一个未占用的 Guest FD 号（供 Socket / Epoll / EventFD / Pipe 与文件共享 FD 空间）
@@ -241,16 +260,22 @@ impl VirtualFs {
         self.tid = state.tid;
         self.properties = state.properties.into_iter().collect();
         self.device = state.device;
-        // 保留调用方显式挂载的 sysroot，同时补充磁带记录且在当前宿主机存在的挂载点
-        for (prefix, host_str) in state.sysroot_mounts {
-            let pb = PathBuf::from(host_str);
-            if pb.exists()
-                && !self
-                    .sysroot_mounts
-                    .iter()
-                    .any(|(p, h)| p == &prefix && h == &pb)
-            {
-                self.sysroot_mounts.push((prefix, pb));
+        // 离线时间旅行回放模式不接触宿主机 sysroot_mounts（统一走 replay_host_files）；
+        // 普通磁带恢复则清零旧挂载后按磁带记录重建存在目录，防止重复 seek 累积重复项。
+        if self.is_tt_replaying() {
+            self.sysroot_mounts.clear();
+        } else {
+            self.sysroot_mounts.clear();
+            for (prefix, host_str) in state.sysroot_mounts {
+                let pb = PathBuf::from(host_str);
+                if pb.exists()
+                    && !self
+                        .sysroot_mounts
+                        .iter()
+                        .any(|(p, h)| p == &prefix && h == &pb)
+                {
+                    self.sysroot_mounts.push((prefix, pb));
+                }
             }
         }
         self.overlay_files = state.overlay_files.into_iter().collect();
@@ -291,14 +316,28 @@ impl VirtualFs {
         self.mono_clock_ns = unix_secs.saturating_mul(1_000_000_000);
     }
 
-    /// 获取当前仿真时钟（纳秒）：开启 `use_real_clock` 时返回宿主机实时时间，否则确定性递增 1ms
+    /// 获取当前仿真时钟（纳秒）：时间旅行回放时严格按 `use_real_clock` 返回录制时间戳且绝不回退宿主机实时时钟；否则按 `use_real_clock` 读取实时或确定性递增 1ms
     pub fn current_clock_ns(&mut self) -> u64 {
         if self.use_real_clock {
+            if let Some(bus) = &self.tt_bus {
+                if bus.is_replaying() {
+                    if let Some(replayed) = bus.replay_clock_read() {
+                        self.mono_clock_ns = replayed;
+                        return replayed;
+                    }
+                    // 确定性回放模式下若事件流缺失，绝不读取宿主机 SystemTime::now()
+                    self.mono_clock_ns = self.mono_clock_ns.saturating_add(1_000_000);
+                    return self.mono_clock_ns;
+                }
+            }
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos() as u64)
                 .unwrap_or(self.mono_clock_ns);
             self.mono_clock_ns = now;
+            if let Some(bus) = &self.tt_bus {
+                bus.record_clock_read(now);
+            }
             now
         } else {
             self.mono_clock_ns = self.mono_clock_ns.saturating_add(1_000_000);
@@ -522,13 +561,28 @@ impl VirtualFs {
             return self.alloc_fd(path, OpenFileKind::Overlay { cursor: 0 });
         }
 
-        // 4. 只读 Sysroot 宿主机映射
-        for (prefix, host_root) in &self.sysroot_mounts {
-            if let Some(rel) = path.strip_prefix(prefix) {
-                let rel_trimmed = rel.trim_start_matches('/');
-                let host_path = host_root.join(rel_trimmed);
-                if let Ok(data) = fs::read(&host_path) {
-                    return self.alloc_fd(path, OpenFileKind::Buffer { data, cursor: 0 });
+        // 4. 只读 Sysroot 宿主机映射（离线时间旅行回放时只查 replay_host_files，保持只读 Buffer 语义且不触盘）
+        if self.is_tt_replaying() {
+            if let Some(data) = self.replay_host_files.get(&path) {
+                return self.alloc_fd(
+                    path,
+                    OpenFileKind::Buffer {
+                        data: data.clone(),
+                        cursor: 0,
+                    },
+                );
+            }
+        } else {
+            for (prefix, host_root) in &self.sysroot_mounts {
+                if let Some(rel) = path.strip_prefix(prefix) {
+                    let rel_trimmed = rel.trim_start_matches('/');
+                    let host_path = host_root.join(rel_trimmed);
+                    if let Ok(data) = fs::read(&host_path) {
+                        if let Some(bus) = &self.tt_bus {
+                            bus.record_host_file(&path, &data);
+                        }
+                        return self.alloc_fd(path, OpenFileKind::Buffer { data, cursor: 0 });
+                    }
                 }
             }
         }
@@ -791,11 +845,36 @@ impl VirtualFs {
         {
             return Ok((0o100444, 0));
         }
+        if self.is_tt_replaying() {
+            if let Some(data) = self.replay_host_files.get(&path) {
+                return Ok((0o100644, data.len() as u64));
+            }
+            let dir_prefix = if path == "/" {
+                "/".to_string()
+            } else {
+                format!("{path}/")
+            };
+            if self
+                .replay_host_files
+                .keys()
+                .any(|k| k.starts_with(&dir_prefix))
+            {
+                return Ok((0o040755, 4096));
+            }
+            return Err(ENOENT);
+        }
         for (prefix, host_root) in &self.sysroot_mounts {
             if let Some(rel) = path.strip_prefix(prefix) {
                 let host_path = host_root.join(rel.trim_start_matches('/'));
                 if let Ok(meta) = fs::metadata(&host_path) {
                     let mode = if meta.is_dir() { 0o040755 } else { 0o100644 };
+                    if !meta.is_dir() {
+                        if let Some(bus) = &self.tt_bus {
+                            if let Ok(data) = fs::read(&host_path) {
+                                bus.record_host_file(&path, &data);
+                            }
+                        }
+                    }
                     return Ok((mode, meta.len()));
                 }
             }
@@ -998,35 +1077,50 @@ impl VirtualFs {
             map.insert("fd".to_string(), 4);
         }
 
-        // 只读宿主机挂载目录
-        for (mount_prefix, host_root) in &self.sysroot_mounts {
-            let norm_mount = mount_prefix.trim_end_matches('/');
-            if dir == norm_mount || dir.starts_with(&format!("{norm_mount}/")) {
-                let rel = dir
-                    .strip_prefix(norm_mount)
-                    .unwrap_or("")
-                    .trim_start_matches('/');
-                let host_dir = if rel.is_empty() {
-                    host_root.clone()
-                } else {
-                    host_root.join(rel)
-                };
-                if host_dir.is_dir() {
-                    exists = true;
-                    if let Ok(rd) = fs::read_dir(&host_dir) {
-                        for ent in rd.flatten() {
-                            if let Some(name) = ent.file_name().to_str() {
-                                let dtype = if ent.path().is_dir() { 4 } else { 8 };
-                                map.entry(name.to_string()).or_insert(dtype);
-                            }
+        // 只读宿主机挂载目录（离线回放时仅从 replay_host_files 枚举，不访问宿主机磁盘）
+        if self.is_tt_replaying() {
+            for k in self.replay_host_files.keys() {
+                if let Some(rest) = k.strip_prefix(&prefix) {
+                    if !rest.is_empty() {
+                        exists = true;
+                        if let Some((child, _)) = rest.split_once('/') {
+                            map.entry(child.to_string()).or_insert(4);
+                        } else {
+                            map.entry(rest.to_string()).or_insert(8);
                         }
                     }
                 }
-            } else if let Some(rest) = norm_mount.strip_prefix(&prefix) {
-                if !rest.is_empty() {
-                    exists = true;
-                    let child = rest.split('/').next().unwrap_or(rest);
-                    map.insert(child.to_string(), 4);
+            }
+        } else {
+            for (mount_prefix, host_root) in &self.sysroot_mounts {
+                let norm_mount = mount_prefix.trim_end_matches('/');
+                if dir == norm_mount || dir.starts_with(&format!("{norm_mount}/")) {
+                    let rel = dir
+                        .strip_prefix(norm_mount)
+                        .unwrap_or("")
+                        .trim_start_matches('/');
+                    let host_dir = if rel.is_empty() {
+                        host_root.clone()
+                    } else {
+                        host_root.join(rel)
+                    };
+                    if host_dir.is_dir() {
+                        exists = true;
+                        if let Ok(rd) = fs::read_dir(&host_dir) {
+                            for ent in rd.flatten() {
+                                if let Some(name) = ent.file_name().to_str() {
+                                    let dtype = if ent.path().is_dir() { 4 } else { 8 };
+                                    map.entry(name.to_string()).or_insert(dtype);
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(rest) = norm_mount.strip_prefix(&prefix) {
+                    if !rest.is_empty() {
+                        exists = true;
+                        let child = rest.split('/').next().unwrap_or(rest);
+                        map.insert(child.to_string(), 4);
+                    }
                 }
             }
         }
