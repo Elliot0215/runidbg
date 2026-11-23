@@ -5,8 +5,8 @@
 
 # ⚡ runidbg (`runidbg-arm64-emu-tracer`)
 
-**`Rust + unidbg = runidbg` · Multi-Backend High-Performance Android ARM64 `.so` Emulator, Zero-Copy Binary Tracer & QuickJS Engine in Pure Rust**  
-Unicorn / Dynarmic JIT / Linux KVM / macOS Hypervisor.framework · Async Multi-Core RPC · MCP AI Loop · GDB RSP · Unified Device Profile
+**`Rust + unidbg = runidbg` · Multi-Backend High-Performance Android ARM64 `.so` Emulator, `.rtape` Time-Travel Debugger, Zero-Copy Binary Tracer & QuickJS Engine in Pure Rust**  
+Unicorn / Dynarmic JIT / Linux KVM / macOS Hypervisor.framework · `.rtape` Cross-Backend Relay & Reverse Debugging · Async Multi-Core RPC · MCP AI Loop · GDB RSP
 
 [简体中文](./README.md) | **English** | [Full Guide](./docs/GUIDE.md) | [AI Agent Skill](./docs/SKILL.md)
 
@@ -14,8 +14,8 @@ Unicorn / Dynarmic JIT / Linux KVM / macOS Hypervisor.framework · Async Multi-C
 ![Target](https://img.shields.io/badge/Target-Android%20ARM64-3DDC84?logo=android&logoColor=white)
 ![Engines](https://img.shields.io/badge/Backends-Unicorn%20%7C%20Dynarmic%20%7C%20KVM%20%7C%20Hypervisor-blueviolet)
 ![Script](https://img.shields.io/badge/QuickJS-TypeScript%20d.ts-F7DF1E?logo=javascript&logoColor=black)
-![Protocol](https://img.shields.io/badge/RPC%20%7C%20MCP%20%7C%20GDB%20RSP-ready-0A66C2)
-![Tests](https://img.shields.io/badge/Tests-73%2F73%20passing-brightgreen)
+![Protocol](https://img.shields.io/badge/RPC%20%7C%20MCP%20%7C%20GDB%20RSP%20%7C%20Time--Travel-ready-0A66C2)
+![Tests](https://img.shields.io/badge/Tests-91%2F91%20passing-brightgreen)
 
 | 🚀 Cold Start | ⚡ HW / JIT Compute | 🔥 Full-Module Trace | 💾 Single-Worker RPC RAM | ⚙️ Multi-Core RPC |
 | :---: | :---: | :---: | :---: | :---: |
@@ -50,7 +50,10 @@ When opening an Issue or PR, please redact any private credentials (cookies/toke
 - **⚡ Zero-Copy Binary Tracer & Offline Analysis**: Three granularity levels (`fast` / `reg_delta` / `full`), dual-stream `mmap` persistence (`.idx` + `.ext`, truncated on finalize), post-exec register attribution with inline ASCII hints, millisecond offline `dump` / `search --val --ascii --bytes` / `stats` / `calltree` / `crypto-scan`, and one-command IDA Pro / Binary Ninja coverage script export.
 - **📜 Zero-Config QuickJS Engine + TypeScript IntelliSense**: Write reverse-engineering scripts in JS with `Emu` / `Module` / `jni` / `mem` / `regs` / Frida-style `hook` (`attach`, `replace`, `code`, `mem`, `syscall`) / `vfs` / `net` / `trace` / `fs` / CommonJS `require()`, and export full `runidbg.d.ts` definitions via `runidbg-cli init-types`.
 - **🌐 Production Async Multi-Core RPC Server**: Powered by `tokio` + `axum` + lock-free MPMC worker pool (`--workers auto`), with HTTP Keep-Alive, backpressure `503`, Unicorn hard timeout & instruction budget `504`, JSON-RPC 2.0 Batch, Prometheus `/metrics`, atomic rolling hot reload, and `async` exports.
-- **🤖 MCP AI Reverse-Engineering Loop & Debugger**: Native stdio and Streamable HTTP MCP server (**21 tools** including `bad64` disassembly, `trace_calltree`, `trace_crypto_scan`, `trace_inspect` byte-stream search, `emu_load_dex` / `emu_dex_class_info`, `emu_jni_set_field`, `emu_jni_call_native`, one-shot hooks, and crash inspection), `EnvDiag` missing-environment auto-patcher (files/properties/syscalls/JNI/HLE/JNI fields/auxv), lightweight DEX metadata index, full `stdio` HLE, embedded dark-mode Web UI, in-memory APK loader, and ARM64 GDB RSP stub (IDA Pro / Binary Ninja / pwndbg).
+- **📼 Persistent `.rtape` Snapshots & Deterministic Time-Travel Debugging (Phase 1 + Phase 2)**:
+  - **Multi-Checkpoint Sparse 4KB Dirty-Page Delta + 4-Backend Relay**: Persists full CPU registers, VMAs / heap / non-zero 4KB pages, linker + APK memory libs, HLE handles, JNI + `DexIndex`, and VFS / Socket state into a compact single-file `.rtape` (`BASE` skips zero pages; `DELTA` stores only 4KB dirty-page diffs). Fast-forward initialization on **`Dynarmic` / `Hypervisor` / `KVM`**, save a tape, and relay seamlessly into **`Unicorn`** for Tracing, GDB, or Time-Travel recording.
+  - **Deterministic Time-Travel & Reverse Taint Tracking**: `EventLogBus` captures live clock reads (`realClock`), external `JniHandler` `ObjectTableDelta` mutations, and read-only host `sysroot` files for **100% bit-exact offline JS-free replay** (verified on real TikTok `libmetasec_ov.so`: 4.16M instructions in 5.5 MB, 43/43 keyframes bit-exact). Powered by an LRU keyframe cache + micro-snapshot ring for millisecond `seek`, sub-millisecond reverse single-step (`rs` / `bs`), GDB reverse continue (`rc` / `bc`), reverse write/read/access watchpoints (`Z2` / `Z3` / `Z4`), Live Fork exploration, and an embedded dark-mode Web UI timeline cockpit (`runidbg-cli ui <file.rtape>`).
+- **🤖 MCP AI Reverse-Engineering Loop & Debugger**: Native stdio and Streamable HTTP MCP server (**32 tools** covering `bad64` disassembly, `trace_calltree`, `trace_crypto_scan`, `trace_inspect`, `emu_load_dex`, `emu_save_tape` / `emu_load_tape` / `emu_seek_tape`, and the `tt_record_start` / `tt_record_stop` / `tt_open` / `tt_seek` / `tt_reverse_watch` / `tt_mem_read` / `tt_close` time-travel workflow), `EnvDiag` missing-environment auto-patcher, lightweight DEX metadata index, full `stdio` HLE, embedded dark-mode Web UI (Trace + Time-Travel Cockpit + RPC + EnvDiag), in-memory APK loader, and time-travel-capable ARM64 GDB RSP stub.
 
 ---
 
@@ -136,7 +139,7 @@ xychart-beta
 | **Performance & Footprint** | ✅ Pure Rust + **4 execution backends (Unicorn / Dynarmic / KVM / Hypervisor)**: **22.6×** faster cold start, up to **480×** HW compute speedup, **5.6×** lower single-worker RPC RAM (21.7 MB vs 122.1 MB) | ⚠️ JVM + JNI/JNA overhead (~1.7s cold start, ~122 MB per instance) |
 | **Instruction Tracing** | ✅ Zero-copy binary mmap + offline `bad64` decoding: **31×–114×** faster, 3.7× smaller, built-in `dump`/`search`/IDA/BN export | ⚠️ Online Capstone text formatting in hot path (~0.15 M insns/s, ~118 B/insn) |
 | **Scripting Ergonomics** | ✅ **Zero-compile QuickJS** + `runidbg.d.ts` IntelliSense + Frida-style hooks + `EnvDiag` auto-patch generator | ⚠️ Requires JDK/Maven project setup and Java compilation per iteration |
-| **Engineering & AI Integration** | ✅ Built-in async multi-core HTTP/JSON-RPC 2.0, Prometheus `/metrics`, hot reload, **21-tool MCP server**, Host Socket passthrough & packet capture, GDB RSP, APK loader | ⚠️ Primarily a Java library; RPC pooling, metrics, and AI agent integration require custom wrappers |
+| **Engineering & AI Integration** | ✅ Built-in async multi-core HTTP/JSON-RPC 2.0, Prometheus `/metrics`, hot reload, **32-tool MCP server**, **`.rtape` snapshots & time-travel reverse debugging**, Host Socket passthrough & packet capture, GDB RSP, APK loader | ⚠️ Primarily a Java library; RPC pooling, metrics, time-travel, and AI agent integration require custom wrappers |
 | **Platform & Arch Support** | ⚠️ **Android ARM64 (`aarch64`) only** — no ARM32 or iOS support yet | ✅ **Supports Android ARM32 / ARM64 and iOS (Mach-O / ObjC)** |
 | **Maturity & Sample Ecosystem** | ⚠️ **Newer project** — verified on Cronet, Conscrypt, MMKV, SQLite, WebP, Zstd, and real MSSDK, but long-tail Android framework stubs & edge syscalls are still growing | ✅ **Years of community battle-testing** with extensive public examples, tutorials, and edge-case stubs |
 | **Java Bytecode Execution** | ⚠️ No built-in ART/Dalvik bytecode interpreter; Java callbacks rely on built-in models + JS hooks | ⚠️ Same — relies on `AbstractJni` stubs rather than executing DEX bytecode |
@@ -153,21 +156,21 @@ xychart-beta
 ```mermaid
 flowchart TB
     subgraph Entry["Entry & Protocol Layer (CLI / Script / Service / Debugger)"]
-        CLI["runidbg-cli\nrun / serve / mcp / debug / trace / ui"]
+        CLI["runidbg-cli\nrun / serve / mcp / debug / tape / trace / ui"]
         RPC["Async RPC Server (tokio + axum)\nKeep-Alive · Batch · /metrics · Hot Reload"]
-        MCP["MCP Server (stdio / HTTP)\n21 Reverse-Engineering Tools"]
-        GDB["GDB RSP Stub (TCP · Unicorn Only)\nIDA Pro · Binary Ninja · pwndbg"]
+        MCP["MCP Server (stdio / HTTP)\n32 Reverse-Engineering & Time-Travel Tools"]
+        GDB["GDB RSP Stub (TCP · Unicorn Only)\nIDA Pro · Binary Ninja · pwndbg · rs / rc / watch"]
     end
 
     subgraph ScriptLayer["QuickJS & Multi-Core Worker Layer (src/script/)"]
         Pool["Worker Pool (async-channel MPMC)\nDefault 1 worker · --workers auto"]
-        Session["JsSession + bootstrap.js\nEmu.backends() · rpc.exports · Promise · require()"]
+        Session["JsSession + bootstrap.js\nEmu.backends() · loadTape · openTimeTravel · rpc.exports"]
         Bridge["Native Bridge & Hooks\nJNI Hook (All Backends) · Native Hook (Unicorn Only)"]
     end
 
     subgraph Facade["High-Level Facade & Analysis Engines"]
         Emu["AndroidEmulator\nTimeout/Insn Budget · Unified External SVC Trap Loop"]
-        Snap["EmuSnapshot\nCPU + Writable Pages + Heap + JNI Snapshot Replay"]
+        Snap["EmuSnapshot + .rtape Time-Travel\nSparse 4KB Dirty-Page Delta · 4-Backend Relay · Reverse Debug"]
         Tracer["BinaryTracer (mmap + bad64 · Unicorn Only)\nfast / reg_delta / full · Web UI · IDA/BN Export"]
         Diag["EnvDiag\nMissing JNI / VFS / Prop / Syscall / HLE Diagnosis"]
     end
@@ -289,13 +292,22 @@ runidbg-cli export-ida trace_full.idx --base 0x40000000 --out ida_cov.py
 runidbg-cli export-bn  trace_full.idx --base 0x40000000 --out bn_cov.py
 ```
 
-### 4. MCP AI Agent Integration & GDB RSP Debugging
+### 4. `.rtape` Relay, Time-Travel GDB Reverse Debugging & Web UI Cockpit
 
 ```bash
-# Streamable HTTP MCP server (or omit --http for stdio mode)
+# Inspect .rtape checkpoints, timeline events, and compression stats
+runidbg-cli tape info ./sign_tt.rtape
+
+# Start Time-Travel GDB RSP server (auto-detects EVENT_LOG; supports rs / rc / watch / monitor seek / monitor rw)
+runidbg-cli debug --tape ./sign_tt.rtape --listen 127.0.0.1:1234
+
+# Launch embedded dark-mode Web UI Time-Travel Cockpit (interactive timeline scrubber, reverse watchpoints, reg diff, hex dump)
+runidbg-cli ui ./sign_tt.rtape --listen 127.0.0.1:8088 --open
+
+# Streamable HTTP MCP server (32 tools including tt_* time-travel suite; omit --http for stdio)
 runidbg-cli mcp --http 127.0.0.1:8090 --cwd .
 
-# ARM64 GDB RSP server (connect via IDA Pro / Binary Ninja / gdb-multiarch `target remote 127.0.0.1:1234`)
+# Direct ARM64 GDB RSP debugging on a .so (IDA Pro / Binary Ninja / gdb-multiarch `target remote 127.0.0.1:1234`)
 runidbg-cli debug samples/libstatic-webp.so WebPGetDecoderVersion --listen 127.0.0.1:1234
 ```
 
@@ -304,15 +316,17 @@ runidbg-cli debug samples/libstatic-webp.so WebPGetDecoderVersion --listen 127.0
 ## 🧪 Testing & Verification
 
 ```bash
-# Full test suite (73/73 passing: 4-backend parity, Cronet, Conscrypt, MMKV, SQLite, WebP, Zstd, TikTok MSSDK, JS, RPC, MCP, GDB, APK, DeviceProfile)
-cargo test
+# Full test suite (91/91 passing: 4-backend parity, .rtape & time-travel, Web UI, Cronet, Conscrypt, MMKV, SQLite, WebP, Zstd, TikTok MSSDK, JS, RPC, MCP, GDB, APK, DeviceProfile)
+cargo test --features ui
 
 # Zero-warning Clippy across all feature combinations
 cargo clippy --all-targets -- -D warnings
 cargo clippy --no-default-features --all-targets -- -D warnings
 cargo clippy --no-default-features --features js --all-targets -- -D warnings
 cargo clippy --no-default-features --features mcp --all-targets -- -D warnings
-cargo clippy --no-default-features --features dynarmic --all-targets -- -D warnings
+cargo clippy --features dynarmic --all-targets -- -D warnings
+cargo clippy --features hypervisor --all-targets -- -D warnings
+cargo clippy --features ui --all-targets -- -D warnings
 ```
 
 ---

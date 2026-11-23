@@ -5,8 +5,8 @@
 
 # ⚡ runidbg (`runidbg-arm64-emu-tracer`)
 
-**`Rust + unidbg = runidbg` · 纯 Rust 实现的多后端高性能 Android ARM64 `.so` 仿真器、零拷贝二进制 Tracer 与 QuickJS 脚本引擎**  
-Unicorn / Dynarmic JIT / Linux KVM / macOS Hypervisor.framework 四引擎 · 异步多核 RPC · MCP AI 逆向闭环 · GDB RSP · 统一设备画像
+**`Rust + unidbg = runidbg` · 纯 Rust 实现的多后端高性能 Android ARM64 `.so` 仿真器、`.rtape` 时间旅行调试器、零拷贝二进制 Tracer 与 QuickJS 脚本引擎**  
+Unicorn / Dynarmic JIT / Linux KVM / macOS Hypervisor.framework 四引擎 · `.rtape` 磁带跨后端接力与反向调试 · 异步多核 RPC · MCP AI 逆向闭环 · GDB RSP
 
 **简体中文** | [English](./README_EN.md) | [完整使用指南](./docs/GUIDE.md) | [AI Agent Skill](./docs/SKILL.md)
 
@@ -14,8 +14,8 @@ Unicorn / Dynarmic JIT / Linux KVM / macOS Hypervisor.framework 四引擎 · 异
 ![Target](https://img.shields.io/badge/Target-Android%20ARM64-3DDC84?logo=android&logoColor=white)
 ![Engines](https://img.shields.io/badge/Backends-Unicorn%20%7C%20Dynarmic%20%7C%20KVM%20%7C%20Hypervisor-blueviolet)
 ![Script](https://img.shields.io/badge/QuickJS-TypeScript%20d.ts-F7DF1E?logo=javascript&logoColor=black)
-![Protocol](https://img.shields.io/badge/RPC%20%7C%20MCP%20%7C%20GDB%20RSP-ready-0A66C2)
-![Tests](https://img.shields.io/badge/Tests-73%2F73%20passing-brightgreen)
+![Protocol](https://img.shields.io/badge/RPC%20%7C%20MCP%20%7C%20GDB%20RSP%20%7C%20Time--Travel-ready-0A66C2)
+![Tests](https://img.shields.io/badge/Tests-91%2F91%20passing-brightgreen)
 
 | 🚀 冷启动速度 | ⚡ 硬件/JIT 纯算加速 | 🔥 全模块 Trace 吞吐 | 💾 单实例 RPC 内存 | ⚙️ 多核 RPC 吞吐 |
 | :---: | :---: | :---: | :---: | :---: |
@@ -50,7 +50,10 @@ Unicorn / Dynarmic JIT / Linux KVM / macOS Hypervisor.framework 四引擎 · 异
 - **⚡ 零拷贝二进制 Tracer 与离线分析**：支持 `fast` / `reg_delta` / `full` 三级分层追踪、`mmap` 双流落盘（`.idx` + `.ext`，结束时精确截断）、执行后寄存器精确归属 + ASCII 旁注、毫秒级离线检索（`dump` / `search --val --ascii --bytes` / `stats` / `calltree` / `crypto-scan`）以及 IDA Pro / Binary Ninja 覆盖率脚本一键导出。
 - **📜 QuickJS 零配置脚本引擎 + TypeScript 智能提示**：写 JS 即可完成逆向分析，内置 `Emu` / `Module` / `jni` / `mem` / `regs` / `hook`（Frida 风格 `attach`, `replace`, `code`, `mem`, `syscall`）/ `vfs` / `net` / `trace` / `fs` / `require()`，并通过 `runidbg-cli init-types` 导出完整 `runidbg.d.ts`。
 - **🌐 生产级异步多核 RPC 服务**：基于 `tokio` + `axum` + 无锁 MPMC Worker 池（`--workers auto`），内置 Keep-Alive、队列背压 `503`、Unicorn 硬超时与指令预算 `504`、JSON-RPC 2.0 Batch、Prometheus `/metrics`、滚动热重载及 `async` 导出。
-- **🤖 MCP AI 逆向闭环 & 调试工具链**：原生支持 stdio 与 Streamable HTTP 双模式 MCP（**21 个逆向工具**，含 `bad64` 反汇编、`trace_calltree`, `trace_crypto_scan`, `trace_inspect` 字节流搜索、`emu_load_dex` / `emu_dex_class_info`, `emu_jni_set_field`, `emu_jni_call_native`、一次性 Hook 抓取与崩溃现场诊断）、`EnvDiag` 缺环境自动诊断器（覆盖文件 / 属性 / Syscall / JNI / HLE 符号 / JNI 字段 / auxv）、轻量 DEX 元数据索引、完整 `stdio` HLE、内置暗黑 Web UI、APK 一键内存加载与 ARM64 GDB RSP 远程调试服务端。
+- **📼 `.rtape` 持久化运行磁带与时间旅行调试（Phase 1 + Phase 2）**：
+  - **多检查点稀疏脏页增量 + 四引擎无缝接力**：将 CPU 寄存器、VMA / 堆 / 非零 4KB 页、动态链接器与 APK 内存库、HLE 句柄、JNI 引用表与 `DexIndex`、VFS / Socket 状态压缩为单文件 `.rtape`（首个 `BASE` 跳过全零页，后续 `DELTA` 仅存 4KB 脏页 diff），支持 **`Dynarmic` / `Hypervisor` / `KVM` 极速跑完初始化 → 存盘 → 切入 `Unicorn` 做 Trace / GDB / 精录**；
+  - **确定性时间旅行与反向污点溯源**：内置 `EventLogBus` 自动捕获实时时钟（`realClock`）、外部 `JniHandler` 回调的 `ObjectTableDelta` 以及只读宿主机 `sysroot` 文件，实现 **脱离原 JS 运行时的 100% bit-exact 离线重放**（实测 TikTok `libmetasec_ov.so` 416 万条指令录制仅 5.5 MB，全 43 关键帧逐位校验通过）；配合 LRU 关键帧缓存 + 微快照环支持毫秒级 `seek`、亚毫秒级单步回退（`rs` / `bs`）、GDB 反向继续（`rc` / `bc`）、反向内存写/读/访问观察点（`Z2` / `Z3` / `Z4`）、Live Fork 探索与暗黑 Web UI 时间轴面板（`runidbg-cli ui <file.rtape>`）。
+- **🤖 MCP AI 逆向闭环 & 调试工具链**：原生支持 stdio 与 Streamable HTTP 双模式 MCP（**32 个逆向工具**，覆盖 `bad64` 反汇编、`trace_calltree`, `trace_crypto_scan`, `trace_inspect`, `emu_load_dex`, `emu_save_tape` / `emu_load_tape` / `emu_seek_tape` 以及 `tt_record_start` / `tt_record_stop` / `tt_open` / `tt_seek` / `tt_reverse_watch` / `tt_mem_read` / `tt_close` 时间旅行工具链）、`EnvDiag` 缺环境自动诊断器、轻量 DEX 元数据索引、完整 `stdio` HLE、内置暗黑 Web UI（Trace 分析 + 时间旅行驾驶舱 + RPC 看板 + EnvDiag）、APK 一键内存加载与支持时间旅行的 ARM64 GDB RSP 远程调试服务端。
 
 ---
 
@@ -136,7 +139,7 @@ xychart-beta
 | **运行性能与内存** | ✅ 原生 Rust + **四执行引擎（Unicorn / Dynarmic / KVM / Hypervisor）**，冷启动快 **22.6×**、纯算硬件加速最高 **480×**、RPC 内存仅 **1/5.6**（21.7 MB vs 122.1 MB） | ⚠️ JVM + JNI/JNA 跨边界开销，冷启动 ~1.7s，单实例 ~122 MB |
 | **指令级 Trace** | ✅ 零拷贝 mmap 二进制双流 + 离线 `bad64` 解码，吞吐高 **31×–114×**，自带 `dump`/`search`/IDA/BN 导出 | ⚠️ 热路径实时 Capstone 文本反汇编落盘，吞吐 ~0.15 M/s，文本体积大 3.7× |
 | **脚本开发体验** | ✅ **零编译 QuickJS** + 完整 `runidbg.d.ts` 智能提示 + Frida 风格 Hook + `EnvDiag` 自动生成补环境 JS | ⚠️ 需配置 Maven/JDK 工程并编写/编译 Java 代码，迭代周期更长 |
-| **工程化与 AI 集成** | ✅ 原生内置多核异步 HTTP/JSON-RPC 2.0、Prometheus `/metrics`、热重载、**MCP 21 工具**、Host Socket 透传与抓包、GDB RSP、APK 加载 | ⚠️ 核心定位为 Java 库，RPC 服务池、监控、AI Agent 接入需自行二次封装 |
+| **工程化与 AI 集成** | ✅ 原生内置多核异步 HTTP/JSON-RPC 2.0、Prometheus `/metrics`、热重载、**MCP 32 工具**、**`.rtape` 持久化磁带与时间旅行反向调试**、Host Socket 透传与抓包、GDB RSP、APK 加载 | ⚠️ 核心定位为 Java 库，RPC 服务池、监控、时间旅行与 AI Agent 接入需自行二次封装 |
 | **平台与架构支持** | ⚠️ **目前仅支持 Android ARM64（`aarch64`）**，暂不支持 ARM32 与 iOS | ✅ **支持 Android ARM32 / ARM64 以及 iOS（Mach-O / ObjC）** |
 | **成熟度与样本生态** | ⚠️ **项目较新**，已验证 Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / 真实 MSSDK 等，但冷门系统库与长尾样本覆盖仍在持续扩充 | ✅ **多年社区沉淀**，公开案例、教程、Android 系统类桩与边缘 syscall 覆盖非常成熟 |
 | **Java 字节码执行** | ⚠️ 无内置 ART/Dalvik 解释器，Java 侧回调依赖内置模型与 JS Hook 补全 | ⚠️ 同样不直接解释执行 DEX 字节码，依赖 `AbstractJni` 补环境 |
@@ -153,21 +156,21 @@ xychart-beta
 ```mermaid
 flowchart TB
     subgraph Entry["接入与协议层 (CLI / Script / Service / Debugger)"]
-        CLI["runidbg-cli\nrun / serve / mcp / debug / trace / ui"]
+        CLI["runidbg-cli\nrun / serve / mcp / debug / tape / trace / ui"]
         RPC["Async RPC Server (tokio + axum)\nKeep-Alive · Batch · /metrics · Hot Reload"]
-        MCP["MCP Server (stdio / HTTP)\n21 Reverse-Engineering Tools"]
-        GDB["GDB RSP Stub (TCP · 仅 Unicorn)\nIDA Pro · Binary Ninja · pwndbg"]
+        MCP["MCP Server (stdio / HTTP)\n32 Reverse-Engineering & Time-Travel Tools"]
+        GDB["GDB RSP Stub (TCP · 仅 Unicorn)\nIDA Pro · Binary Ninja · pwndbg · rs / rc / watch"]
     end
 
     subgraph ScriptLayer["QuickJS 脚本与多核调度层 (src/script/)"]
         Pool["Worker Pool (async-channel MPMC)\n默认 1 实例 · 支持 --workers auto"]
-        Session["JsSession + bootstrap.js\nEmu.backends() · rpc.exports · Promise · require()"]
+        Session["JsSession + bootstrap.js\nEmu.backends() · loadTape · openTimeTravel · rpc.exports"]
         Bridge["Native Bridge & Hooks\nJNI Hook (全后端) · 原生 Hook (仅 Unicorn)"]
     end
 
     subgraph Facade["高层仿真门面与分析引擎"]
         Emu["AndroidEmulator\n超时/指令预算 · 统一外部 SVC 陷阱循环"]
-        Snap["EmuSnapshot\nCPU + 可写页 + 堆 + JNI 完整快照回放"]
+        Snap["EmuSnapshot + .rtape Time-Travel\n4KB 稀疏脏页增量 · 四引擎接力 · 离线反向调试"]
         Tracer["BinaryTracer (mmap + bad64 · 仅 Unicorn)\nfast / reg_delta / full · Web UI · IDA/BN"]
         Diag["EnvDiag\n缺失 JNI / VFS / Prop / Syscall / HLE 诊断"]
     end
@@ -239,12 +242,14 @@ src/
 ├── debug/gdbstub.rs            # ARM64 GDB Remote Serial Protocol 远程调试服务端（仅 Unicorn）
 ├── memory.rs                   # VMA 虚拟内存管理、Coalescing Free-List 堆与访存辅助
 ├── snapshot.rs                 # 内存 + 寄存器 + 堆 + JNI 快照保存与恢复
+├── tape.rs                     # .rtape 持久化多检查点稀疏脏页格式与跨后端状态编解码
+├── timetravel.rs               # 二期时间旅行引擎（EventLogBus / 关键帧缓存 / 微快照环 / 反向观察点）
 ├── error.rs                    # 统一错误类型
 ├── loader/                     # ELF 解析、动态链接器、APK/DEX 加载与 HLE Trampoline
 ├── os/                         # DeviceProfile、SVC 系统调用、VFS、Socket/Net 与协作调度
 ├── jni/                        # JNI 1.6 Env、对象表、LocalFrame、va_list 与 Hook 处理
 ├── tracer/                     # 高速二进制追踪引擎、记录格式与离线 Reader（仅 Unicorn）
-├── ui/                         # 内置暗黑 Trace 分析 Web UI
+├── ui/                         # 内置暗黑 Web UI（Trace 分析 + 时间旅行时间轴驾驶舱 + RPC + EnvDiag）
 ├── script/                     # QuickJS 脚本引擎、RPC 与 MCP
 │   ├── mod.rs                  # JsSession / JsRunner / RUNIDBG_DTS 门面
 │   ├── bridge.rs               # QuickJS ↔ Rust 原生桥接实现
@@ -253,8 +258,8 @@ src/
 │   ├── bootstrap.js            # JS 运行时封装与 Emu.backends() / rpc.exports 调度
 │   ├── runidbg.d.ts            # TypeScript 类型声明
 │   ├── rpc.rs                  # 异步 HTTP + JSON-RPC 2.0 + 多 Worker 池 + Metrics + 热重载
-│   └── mcp.rs                  # MCP stdio / Streamable HTTP 服务端（21 个逆向工具）
-└── bin/runidbg-cli.rs          # 统一命令行工具（run / serve / mcp / debug / ui / trace 分析）
+│   └── mcp.rs                  # MCP stdio / Streamable HTTP 服务端（32 个逆向与时间旅行工具）
+└── bin/runidbg-cli.rs          # 统一命令行工具（run / serve / mcp / debug / tape / ui / trace 分析）
 entitlements/
 └── hypervisor.plist            # macOS Hypervisor.framework ad-hoc 签名权限配置
 ```
@@ -385,12 +390,42 @@ runidbg-cli export-bn  trace_full.idx --base 0x40000000 --out bn_cov.py
 runidbg-cli mcp --http 127.0.0.1:8090 --cwd .
 ```
 
-### 5. GDB RSP 远程调试（直连 IDA Pro / Binary Ninja / pwndbg）
+### 5. `.rtape` 磁带接力、时间旅行 GDB 反向调试与 Web UI 时间轴
+
+```javascript
+// 1. 用 Dynarmic / Hypervisor 极速跑完漫长初始化并保存一期磁带
+const fast = Emu.create({ backend: "dynarmic", packageName: "com.example.app" });
+const mod = fast.load("./libtarget.so");
+fast.jniOnLoad(mod);
+fast.saveTape("./init.rtape", "after_init");
+
+// 2. 跨后端无缝接力到 Unicorn，开启二期确定性时间旅行精录
+const uc = Emu.loadTape("./init.rtape", { backend: "unicorn", checkpoint: "after_init", realClock: true });
+uc.record.start({ keyframeInterval: 100000, captureJni: true });
+uc.module("libtarget.so").call("sign_func", dst, src, len);
+uc.record.bookmark("sign_done");
+uc.record.stop("./sign_tt.rtape");
+
+// 3. 脱离原 JS 环境离线时间旅行与反向污点溯源
+const tt = Emu.openTimeTravel("./sign_tt.rtape");
+tt.verifyDeterminism();                // 逐关键帧 100% bit-exact 校验
+tt.seekBookmark("sign_done");          // 毫秒级直达末尾
+const hit = tt.findPrevWrite(dst, 4);  // 瞬间倒查改写输出缓冲区的精确 ARM64 指令！
+tt.close();
+```
 
 ```bash
+# 查看 .rtape 检查点、时间轴事件与压缩统计
+runidbg-cli tape info ./sign_tt.rtape
+
+# 启动支持时间旅行反向调试的 GDB RSP（自动识别 EVENT_LOG，支持 rs / rc / watch / monitor seek / monitor rw）
+runidbg-cli debug --tape ./sign_tt.rtape --listen 127.0.0.1:1234
+
+# 启动暗黑 Web UI 时间旅行驾驶舱（交互时间轴滑块、反向观察点、寄存器 diff、内存检查器）
+runidbg-cli ui ./sign_tt.rtape --listen 127.0.0.1:8088 --open
+
+# 普通 .so 直接启动 GDB RSP 远程调试（直连 IDA Pro / Binary Ninja / pwndbg）
 runidbg-cli debug samples/libstatic-webp.so WebPGetDecoderVersion --listen 127.0.0.1:1234
-# 在 gdb-multiarch / pwndbg 中连接：
-# target remote 127.0.0.1:1234
 ```
 
 ---
@@ -398,15 +433,17 @@ runidbg-cli debug samples/libstatic-webp.so WebPGetDecoderVersion --listen 127.0
 ## 🧪 测试与校验
 
 ```bash
-# 全量测试（73/73 通过，覆盖四引擎一致性 / Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / TikTok MSSDK / JS / RPC / MCP / GDB / APK / DeviceProfile）
-cargo test
+# 全量测试（91/91 通过，覆盖四引擎一致性 / .rtape 磁带与时间旅行 / Web UI / Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / TikTok MSSDK / JS / RPC / MCP / GDB / APK / DeviceProfile）
+cargo test --features ui
 
 # 全 feature 组合 Clippy 零警告校验
 cargo clippy --all-targets -- -D warnings
 cargo clippy --no-default-features --all-targets -- -D warnings
 cargo clippy --no-default-features --features js --all-targets -- -D warnings
 cargo clippy --no-default-features --features mcp --all-targets -- -D warnings
-cargo clippy --no-default-features --features dynarmic --all-targets -- -D warnings
+cargo clippy --features dynarmic --all-targets -- -D warnings
+cargo clippy --features hypervisor --all-targets -- -D warnings
+cargo clippy --features ui --all-targets -- -D warnings
 ```
 
 ---
