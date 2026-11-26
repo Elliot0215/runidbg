@@ -15,7 +15,7 @@ Unicorn / Dynarmic JIT / Linux KVM / macOS Hypervisor.framework 四引擎 · `.r
 ![Engines](https://img.shields.io/badge/Backends-Unicorn%20%7C%20Dynarmic%20%7C%20KVM%20%7C%20Hypervisor-blueviolet)
 ![Script](https://img.shields.io/badge/QuickJS-TypeScript%20d.ts-F7DF1E?logo=javascript&logoColor=black)
 ![Protocol](https://img.shields.io/badge/RPC%20%7C%20MCP%20%7C%20GDB%20RSP%20%7C%20Time--Travel-ready-0A66C2)
-![Tests](https://img.shields.io/badge/Tests-91%2F91%20passing-brightgreen)
+![Tests](https://img.shields.io/badge/Tests-104%2F104%20passing-brightgreen)
 
 | 🚀 冷启动速度 | ⚡ 硬件/JIT 纯算加速 | 🔥 全模块 Trace 吞吐 | 💾 单实例 RPC 内存 | ⚙️ 多核 RPC 吞吐 |
 | :---: | :---: | :---: | :---: | :---: |
@@ -47,13 +47,16 @@ Unicorn / Dynarmic JIT / Linux KVM / macOS Hypervisor.framework 四引擎 · `.r
 - **📱 统一设备画像与双模式时钟（`DeviceProfile`）**：内置 `pixel5` / `pixel8pro` / `s24ultra` / `xiaomi14` 真机画像与任意字段覆盖，一处配置自动联动 **30+ 系统属性**、`/proc/cpuinfo`, `/proc/meminfo`, `/proc/version`, `/sys/devices/system/cpu/online` 与 `uname`；支持确定性虚拟时钟与宿主机实时时钟（`realClock`）一键切换。
 - **🧬 JNI 1.6 完整环境**：支持 `JNI_OnLoad`, `RegisterNatives`、容器安全的引用生命周期与 `PushLocalFrame` / `PopLocalFrame`（JS 侧 `emu.jni.withLocalFrame` 自动回收常驻 RPC 临时引用与缓冲）、内置常用 Java 模型（`String` 构造与方法、`Thread.currentThread()`、基础类型装箱 `valueOf` 等）以及可插拔 JS/Rust JNI Hook。
 - **🌍 宿主机 Socket 透传、异步事件原语与虚拟网卡（`emu.net`）**：零额外依赖内置真实 TCP/UDP Socket 透传、`epoll` / `ppoll` / `eventfd2` / `pipe2` 异步事件循环、`getaddrinfo` / `getifaddrs` / `ioctl(SIOCGIF*)` 与 `/proc/net/*` 虚拟网卡画像，支持 QuickJS 抓包与 `onSend` / `onRecv` 实时改包；**运行期默认关闭真实联网（`-EACCES` 离线护栏），支持 `allowHosts` 白名单显式放行**。
-- **⚡ 零拷贝二进制 Tracer 与离线分析**：支持 `fast` / `reg_delta` / `full` 三级分层追踪、`mmap` 双流落盘（`.idx` + `.ext`，结束时精确截断）、执行后寄存器精确归属 + ASCII 旁注、毫秒级离线检索（`dump` / `search --val --ascii --bytes` / `stats` / `calltree` / `crypto-scan`）以及 IDA Pro / Binary Ninja 覆盖率脚本一键导出。
-- **📜 QuickJS 零配置脚本引擎 + TypeScript 智能提示**：写 JS 即可完成逆向分析，内置 `Emu` / `Module` / `jni` / `mem` / `regs` / `hook`（Frida 风格 `attach`, `replace`, `code`, `mem`, `syscall`）/ `vfs` / `net` / `trace` / `fs` / `require()`，并通过 `runidbg-cli init-types` 导出完整 `runidbg.d.ts`。
+- **⚡ 零拷贝二进制 Tracer、HLE 统一流、离线污点与 VM 专项分析**：
+  - 支持 `fast` / `reg_delta` / `full` 三级分层追踪、`mmap` 双流落盘（`.idx` + `.ext`，默认容量 `262144`，截断自动告警并暴露 `stats.truncated`）；`full` 模式将 HLE `memcpy`/`memmove`/`memset`/`bzero`/`malloc`/`calloc`/`realloc`/`free` 统一写入 `.ext` 时间轴；
+  - 内置纯 Rust **字节级前向污点追踪与反向因果切片**（`runidbg-cli taint` / `Trace.open().taintForward/taintBackward`，自动跨越 HLE `memcpy` 与 S-Box 变址查表，免疫栈帧/VM 寄存器堆地址复用）、**离线全知内存/值查询与任意时刻内存重建**（`Trace.open().query/findWrites/findReads/hleEvents/reconstructMem`）、**双跑差分**（`runidbg-cli diff` / `Trace.diff`）以及 **OLLVM / 自定义字节码 VM 专项分析**（`runidbg-cli vm` / `Trace.open().vmAnalyze` / 在线 `emu.vm.watchRegfile` + `decodeWord`，自动识别 Dispatch Loop、4B/8B 跳转表、字节码 PC 寄存器、Handler 步长分布与基址搬家差分）；
+  - 毫秒级离线检索（`dump` / `search|find --val --addr --pc --ascii --bytes` / `stats` / `calltree` / `crypto-scan`）与 IDA Pro / Binary Ninja 覆盖率脚本一键导出。
+- **📜 QuickJS 零配置脚本引擎 + TypeScript 智能提示**：写 JS 即可完成逆向分析，内置 `Emu` / `Module` / `Trace` / `jni` / `mem` / `regs`（含无损 64-bit `BigInt` `ctx.reg64()` / `emu.regs.get64()`）/ `hook`（Frida 风格 `attach`, `replace`, `code`, `mem` Rust 侧值/宽度/PC 过滤与未映射页告警, `watch`, `syscall`）/ `vm`（在线寄存器堆跟踪与指令字解码）/ `vfs` / `net` / `trace` / `fs` / `require()`，支持 `--freeze-layout` 隔离宿主分配稳定 guest 堆地址与 `emu.heapLayout()` 布局诊断，并通过 `runidbg-cli init-types` 导出完整 `runidbg.d.ts`。
 - **🌐 生产级异步多核 RPC 服务**：基于 `tokio` + `axum` + 无锁 MPMC Worker 池（`--workers auto`），内置 Keep-Alive、队列背压 `503`、Unicorn 硬超时与指令预算 `504`、JSON-RPC 2.0 Batch、Prometheus `/metrics`、滚动热重载及 `async` 导出。
 - **📼 `.rtape` 持久化运行磁带与时间旅行调试（Phase 1 + Phase 2）**：
-  - **多检查点稀疏脏页增量 + 四引擎无缝接力**：将 CPU 寄存器、VMA / 堆 / 非零 4KB 页、动态链接器与 APK 内存库、HLE 句柄、JNI 引用表与 `DexIndex`、VFS / Socket 状态压缩为单文件 `.rtape`（首个 `BASE` 跳过全零页，后续 `DELTA` 仅存 4KB 脏页 diff），支持 **`Dynarmic` / `Hypervisor` / `KVM` 极速跑完初始化 → 存盘 → 切入 `Unicorn` 做 Trace / GDB / 精录**；
-  - **确定性时间旅行与反向污点溯源**：内置 `EventLogBus` 自动捕获实时时钟（`realClock`）、外部 `JniHandler` 回调的 `ObjectTableDelta` 以及只读宿主机 `sysroot` 文件，实现 **脱离原 JS 运行时的 100% bit-exact 离线重放**（实测 TikTok `libmetasec_ov.so` 416 万条指令录制仅 5.5 MB，全 43 关键帧逐位校验通过）；配合 LRU 关键帧缓存 + 微快照环支持毫秒级 `seek`、亚毫秒级单步回退（`rs` / `bs`）、GDB 反向继续（`rc` / `bc`）、反向内存写/读/访问观察点（`Z2` / `Z3` / `Z4`）、Live Fork 探索与暗黑 Web UI 时间轴面板（`runidbg-cli ui <file.rtape>`）。
-- **🤖 MCP AI 逆向闭环 & 调试工具链**：原生支持 stdio 与 Streamable HTTP 双模式 MCP（**32 个逆向工具**，覆盖 `bad64` 反汇编、`trace_calltree`, `trace_crypto_scan`, `trace_inspect`, `emu_load_dex`, `emu_save_tape` / `emu_load_tape` / `emu_seek_tape` 以及 `tt_record_start` / `tt_record_stop` / `tt_open` / `tt_seek` / `tt_reverse_watch` / `tt_mem_read` / `tt_close` 时间旅行工具链）、`EnvDiag` 缺环境自动诊断器、轻量 DEX 元数据索引、完整 `stdio` HLE、内置暗黑 Web UI（Trace 分析 + 时间旅行驾驶舱 + RPC 看板 + EnvDiag）、APK 一键内存加载与支持时间旅行的 ARM64 GDB RSP 远程调试服务端。
+  - **多检查点稀疏脏页增量 + 四引擎无缝接力**：将 CPU 寄存器、VMA / 堆 / `[host-scratch]` / 非零 4KB 页、动态链接器与 APK 内存库、HLE 句柄、JNI 引用表与 `DexIndex`、VFS / Socket 状态压缩为单文件 `.rtape`（首个 `BASE` 跳过全零页，后续 `DELTA` 仅存 4KB 脏页 diff），支持 **`Dynarmic` / `Hypervisor` / `KVM` 极速跑完初始化 → 存盘 → 切入 `Unicorn` 做 Trace / GDB / 精录**；
+  - **确定性时间旅行与反向污点溯源**：内置 `EventLogBus` 自动捕获实时时钟（`realClock`）、外部 `JniHandler` 回调的 `ObjectTableDelta` 以及只读宿主机 `sysroot` 文件，实现 **脱离原 JS 运行时的 100% bit-exact 离线重放**（实测 416 万条指令录制仅 5.5 MB，全 43 关键帧逐位校验通过）；配合 LRU 关键帧缓存 + 微快照环支持毫秒级 `seek`、亚毫秒级单步回退（`rs` / `bs`）、GDB 反向继续（`rc` / `bc`）、反向内存写/读/访问观察点（`Z2` / `Z3` / `Z4`）、Live Fork 探索与暗黑 Web UI 时间轴面板（`runidbg-cli ui <file.rtape>`）。
+- **🤖 MCP AI 逆向闭环 & 调试工具链**：原生支持 stdio 与 Streamable HTTP 双模式 MCP（**36 个逆向工具**，覆盖 `bad64` 反汇编、`trace_calltree`, `trace_crypto_scan`, `trace_inspect`, `trace_taint`, `trace_query`, `trace_diff`, `trace_vm_analyze`, `emu_load_dex`, `emu_save_tape` / `emu_load_tape` / `emu_seek_tape` 以及 `tt_record_start` / `tt_record_stop` / `tt_open` / `tt_seek` / `tt_reverse_watch` / `tt_mem_read` / `tt_close` 时间旅行工具链）、`EnvDiag` 缺环境自动诊断器、轻量 DEX 元数据索引、完整 `stdio` HLE、内置暗黑 Web UI（Trace 分析 + 时间旅行驾驶舱 + RPC 看板 + EnvDiag）、APK 一键内存加载与支持时间旅行的 ARM64 GDB RSP 远程调试服务端。
 
 ---
 
@@ -139,7 +142,7 @@ xychart-beta
 | **运行性能与内存** | ✅ 原生 Rust + **四执行引擎（Unicorn / Dynarmic / KVM / Hypervisor）**，冷启动快 **22.6×**、纯算硬件加速最高 **480×**、RPC 内存仅 **1/5.6**（21.7 MB vs 122.1 MB） | ⚠️ JVM + JNI/JNA 跨边界开销，冷启动 ~1.7s，单实例 ~122 MB |
 | **指令级 Trace** | ✅ 零拷贝 mmap 二进制双流（含 HLE `memcpy`/`memset`/`malloc`/`free` 事件）+ 离线 `bad64` 解码 + **字节级前向污点/反向因果切片** + **双跑 `diff`** + **全知内存值查询**，吞吐高 **31×–114×** | ⚠️ 热路径实时 Capstone 文本反汇编落盘，吞吐 ~0.15 M/s，文本体积大 3.7× |
 | **脚本开发体验** | ✅ **零编译 QuickJS** + 完整 `runidbg.d.ts` + `ctx.reg64()` 无损 BigInt + `hook.mem` Rust 侧值/宽度/PC 过滤 + `--freeze-layout` 宿主堆隔离 + `EnvDiag` 自动生成补环境 JS | ⚠️ 需配置 Maven/JDK 工程并编写/编译 Java 代码，迭代周期更长 |
-| **工程化与 AI 集成** | ✅ 原生内置多核异步 HTTP/JSON-RPC 2.0、Prometheus `/metrics`、热重载、**MCP 35 工具**、**`.rtape` 持久化磁带与时间旅行反向调试**、Host Socket 透传与抓包、GDB RSP、APK 加载 | ⚠️ 核心定位为 Java 库，RPC 服务池、监控、时间旅行与 AI Agent 接入需自行二次封装 |
+| **工程化与 AI 集成** | ✅ 原生内置多核异步 HTTP/JSON-RPC 2.0、Prometheus `/metrics`、热重载、**MCP 36 工具**、**VM 专项自动分析**、**`.rtape` 持久化磁带与时间旅行反向调试**、Host Socket 透传与抓包、GDB RSP、APK 加载 | ⚠️ 核心定位为 Java 库，RPC 服务池、监控、时间旅行与 AI Agent 接入需自行二次封装 |
 | **平台与架构支持** | ⚠️ **目前仅支持 Android ARM64（`aarch64`）**，暂不支持 ARM32 与 iOS | ✅ **支持 Android ARM32 / ARM64 以及 iOS（Mach-O / ObjC）** |
 | **成熟度与样本生态** | ⚠️ **项目较新**，已验证 Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / 真实 MSSDK 等，但冷门系统库与长尾样本覆盖仍在持续扩充 | ✅ **多年社区沉淀**，公开案例、教程、Android 系统类桩与边缘 syscall 覆盖非常成熟 |
 | **Java 字节码执行** | ⚠️ 无内置 ART/Dalvik 解释器，Java 侧回调依赖内置模型与 JS Hook 补全 | ⚠️ 同样不直接解释执行 DEX 字节码，依赖 `AbstractJni` 补环境 |
@@ -156,9 +159,9 @@ xychart-beta
 ```mermaid
 flowchart TB
     subgraph Entry["接入与协议层 (CLI / Script / Service / Debugger)"]
-        CLI["runidbg-cli\nrun / serve / mcp / debug / tape / trace / ui"]
+        CLI["runidbg-cli\nrun / serve / mcp / debug / tape / trace / taint / diff / vm / ui"]
         RPC["Async RPC Server (tokio + axum)\nKeep-Alive · Batch · /metrics · Hot Reload"]
-        MCP["MCP Server (stdio / HTTP)\n35 Reverse-Engineering, Taint & Time-Travel Tools"]
+        MCP["MCP Server (stdio / HTTP)\n36 Reverse-Engineering, Taint, VM & Time-Travel Tools"]
         GDB["GDB RSP Stub (TCP · 仅 Unicorn)\nIDA Pro · Binary Ninja · pwndbg · rs / rc / watch"]
     end
 
@@ -248,18 +251,22 @@ src/
 ├── loader/                     # ELF 解析、动态链接器、APK/DEX 加载与 HLE Trampoline
 ├── os/                         # DeviceProfile、SVC 系统调用、VFS、Socket/Net 与协作调度
 ├── jni/                        # JNI 1.6 Env、对象表、LocalFrame、va_list 与 Hook 处理
-├── tracer/                     # 高速二进制追踪引擎、记录格式与离线 Reader（仅 Unicorn）
+├── tracer/                     # 高速二进制追踪引擎、HLE 统一流、离线污点切片与 VM 分析（仅 Unicorn）
+│   ├── engine.rs               # mmap 双流 BinaryTracer（fast / reg_delta / full + HLE 落盘）
+│   ├── reader.rs               # 离线 TraceReader（全知查询 / 内存重建 / 双跑 Diff / CallTree / CryptoScan）
+│   ├── taint.rs                # 纯 Rust 字节级 ARM64 前向污点传播与反向因果切片引擎
+│   └── vm.rs                   # 离线 VM 专项分析器（调度循环/跳转表自动识别、opmap 步长与寄存器堆差分）
 ├── ui/                         # 内置暗黑 Web UI（Trace 分析 + 时间旅行时间轴驾驶舱 + RPC + EnvDiag）
 ├── script/                     # QuickJS 脚本引擎、RPC 与 MCP
 │   ├── mod.rs                  # JsSession / JsRunner / RUNIDBG_DTS 门面
 │   ├── bridge.rs               # QuickJS ↔ Rust 原生桥接实现
-│   ├── hooks.rs                # 原生函数/指令/内存/Syscall Hook 与 TB 缓存刷新
+│   ├── hooks.rs                # 原生函数/指令/内存（Rust 侧过滤）/Syscall Hook 与 TB 缓存刷新
 │   ├── jni_bridge.rs           # JS JNI Hook 桥接
-│   ├── bootstrap.js            # JS 运行时封装与 Emu.backends() / rpc.exports 调度
+│   ├── bootstrap.js            # JS 运行时封装（Emu / Trace / emu.vm / hook.watch / rpc.exports）
 │   ├── runidbg.d.ts            # TypeScript 类型声明
 │   ├── rpc.rs                  # 异步 HTTP + JSON-RPC 2.0 + 多 Worker 池 + Metrics + 热重载
-│   └── mcp.rs                  # MCP stdio / Streamable HTTP 服务端（32 个逆向与时间旅行工具）
-└── bin/runidbg-cli.rs          # 统一命令行工具（run / serve / mcp / debug / tape / ui / trace 分析）
+│   └── mcp.rs                  # MCP stdio / Streamable HTTP 服务端（36 个逆向、污点、VM 与时间旅行工具）
+└── bin/runidbg-cli.rs          # 统一命令行工具（run / serve / mcp / debug / tape / diff / taint / vm / ui）
 entitlements/
 └── hypervisor.plist            # macOS Hypervisor.framework ad-hoc 签名权限配置
 ```
@@ -358,14 +365,15 @@ cargo run --release --bin runidbg-cli -- serve examples/scripts/rpc_demo.js \
 - `POST /admin/reload`：先校验后原子滚动热重载（需 `--allow-reload`）
 - `POST /eval`：动态执行 JS（需 `--allow-eval`）
 
-### 3. 离线二进制 Trace 分析、污点溯源、双跑 Diff 与 IDA / Binary Ninja 导出
+### 3. 离线 Trace 分析、污点溯源、双跑 Diff、VM 专项分析与 IDA / BN 导出
 
 ```bash
 # 查看指令反汇编、寄存器增量、访存 R/W 与 HLE memcpy/memset/malloc/free 事件（自动探测同级 .ext）
 runidbg-cli dump trace_full.idx --skip 0 --limit 50
 
-# 毫秒级检索指定寄存器值 / 访存地址 / PC
-runidbg-cli search trace_full.idx --val 0x03000001
+# 毫秒级检索指定寄存器值 / 访存地址 / PC / ASCII / 字节串（find 为 search 别名）
+runidbg-cli find trace_full.idx --val 0x03000001
+runidbg-cli find trace_full.idx --addr 0x50006470 --base 0x40000000
 
 # 字节级离线污点追踪与反向因果切片（免疫栈帧/VM 寄存器堆地址复用，自动跨越 HLE memcpy 与 S-Box 查表）
 runidbg-cli taint trace_full.idx --mode backward --addr 0x50006470 --len 8 --base 0x40000000
@@ -374,9 +382,35 @@ runidbg-cli taint trace_full.idx --mode forward  --addr 0x50001000 --len 16 --ba
 # 双跑 Trace 差分：一键定位首次控制流分歧与首次寄存器/内存/HLE 数据分歧
 runidbg-cli diff run_a.idx run_b.idx --base 0x40000000 --limit 50
 
+# OLLVM / 自定义字节码 VM 专项分析：自动识别调度循环、跳转表、Handler 分布、字节码步长与虚拟寄存器堆差分
+runidbg-cli vm trace_full.idx --base 0x40000000 --base-reg x25 --layout 6:6,12,17,22,27
+
 # 导出 IDA Pro / Binary Ninja 执行覆盖率高亮脚本
 runidbg-cli export-ida trace_full.idx --base 0x40000000 --out ida_cov.py
 runidbg-cli export-bn  trace_full.idx --base 0x40000000 --out bn_cov.py
+```
+
+QuickJS 侧同样提供一站式离线 `Trace.open()` 与在线 `emu.vm` / `hook.watch` / `--freeze-layout` 能力：
+
+```javascript
+// 1. 稳定 guest 堆布局 + 在线 VM 寄存器堆跟踪（自动处理基址搬家）+ 无损 BigInt 寄存器读取
+const emu = Emu.create({ freezeLayout: true }); // 或 CLI 加 --freeze-layout
+const watcher = emu.vm.watchRegfile({
+  baseReg: "x25", count: 32, size: 8,
+  dispatcherPc: mod.base + 0x12340, bcReg: "x23",
+  layout: { op: [6, 6], fields: [12, 17, 22, 27] },
+});
+const wh = emu.hook.watch([buf, buf + 64], "w", (ctx, access, addr, size, val, val64) => {
+  console.log("x8 =", ctx.reg64("x8").toString(16), "val64 =", val64.toString(16));
+});
+
+// 2. 离线全知查询 / 污点切片 / VM 画像 / 双跑 Diff
+const tr = Trace.open("trace_full.idx");
+const writes = tr.findWrites(0xdeadbeefn, { width: 4 });
+const slice  = tr.taintBackward({ addr: 0x50006470, len: 8 });
+const vmInfo = tr.vmAnalyze({ baseReg: "x25", layout: { op: [6, 6], fields: [12, 17, 22, 27] } });
+tr.close();
+const diff = Trace.diff("run_a.idx", "run_b.idx");
 ```
 
 ### 4. 接入 MCP 客户端（stdio 或 Streamable HTTP）
@@ -440,7 +474,7 @@ runidbg-cli debug samples/libstatic-webp.so WebPGetDecoderVersion --listen 127.0
 ## 🧪 测试与校验
 
 ```bash
-# 全量测试（99/99 通过，覆盖四引擎一致性 / 离线污点与反向切片 / HLE Trace 与双跑 Diff / .rtape 磁带与时间旅行 / Web UI / Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / TikTok MSSDK / JS / RPC / MCP / GDB / APK / DeviceProfile）
+# 全量测试（104/104 通过，覆盖四引擎一致性 / 离线污点与反向切片 / HLE Trace 与双跑 Diff / VM 专项自动分析 / 确定性与 Golden 守卫 / .rtape 磁带与时间旅行 / Web UI / Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / JS / RPC / MCP / GDB / APK / DeviceProfile）
 cargo test --features ui
 
 # 全 feature 组合 Clippy 零警告校验

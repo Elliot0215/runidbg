@@ -1,11 +1,11 @@
 ---
 name: runidbg
-description: Use runidbg (runidbg-cli) to emulate Android ARM64 .so libraries, write QuickJS JNI/Hook/DEX scripts, diagnose missing Android environments with EnvDiag, capture high-speed binary instruction traces (dump/search/stats/calltree/crypto-scan/IDA/BN), launch multi-core HTTP/JSON-RPC signing services & embedded Web UI, connect via MCP (21 tools), or debug with GDB RSP.
+description: Use runidbg (runidbg-cli) to emulate Android ARM64 .so libraries across 4 backends (Unicorn/Dynarmic/KVM/Hypervisor), write QuickJS JNI/Hook/VM/DEX scripts, diagnose missing Android environments with EnvDiag, capture high-speed binary instruction + HLE traces, run offline byte-granular taint/slicing, omniscient query, dual-run diff, custom VM analysis, `.rtape` time-travel debugging, multi-core HTTP/JSON-RPC services, embedded Web UI, MCP (36 tools), or GDB RSP.
 ---
 
 # runidbg Agent Skill
 
-Use `runidbg` when reversing, emulating, tracing, or serving **Android ARM64 (`aarch64`) `.so` libraries** without an Android device or JVM.
+Use `runidbg` when reversing, emulating, tracing, time-travel debugging, or serving **Android ARM64 (`aarch64`) `.so` libraries** without an Android device or JVM.
 
 ## Prerequisites & Build
 
@@ -13,29 +13,44 @@ Use `runidbg` when reversing, emulating, tracing, or serving **Android ARM64 (`a
 # macOS (requires pkgconf + cmake + ninja)
 brew install pkgconf cmake ninja
 cargo build --release
+codesign --force --sign - --entitlements entitlements/hypervisor.plist target/release/runidbg-cli
 
 # Binaries produced:
 #   target/release/runidbg-cli
 #   target/release/runidbg-arm64-emu-tracer
 ```
 
+## Critical Semantics & Pitfalls to Remember
+
+1. **64-bit register precision**: `ctx.reg("x8")` returns a JS `number` (loses precision above `2^53 - 1`). **Always use `ctx.reg64("x8")` or `emu.regs.get64("x8")`** (returns lossless `BigInt`) for 64-bit values, hashes, rotates, or high-bit pointers!
+2. **Hook execution timing**:
+   - `emu.hook.code` fires **BEFORE** the instruction executes (registers reflect state prior to the instruction).
+   - `emu.hook.mem` / `emu.hook.watch` fires on memory access; `value` (and `value64` `BigInt`) carries the actual byte-width-masked value for both `MEM_READ` and `MEM_WRITE`. If the target range has no mapped pages yet, `handle.unmapped === true` and a warning is logged.
+3. **Deterministic heap layout across probe scripts**: pass `--freeze-layout` (`runidbg-cli run --freeze-layout probe.js`) or `Emu.create({ freezeLayout: true })`. Host `emu.mem.alloc()` is isolated into `[host-scratch]` (`0x6400_0000`) so adding probe buffers never shifts guest `malloc` heap addresses! Inspect guest allocations anytime with `emu.heapLayout()`.
+4. **Trace truncation & level**:
+   - `fast`: PC + opcode only (no `.ext`).
+   - `reg_delta` (default): PC + opcode + register deltas (no memory `.ext`).
+   - `full`: registers + guest memory R/W + **HLE `memcpy`/`memmove`/`memset`/`bzero`/`malloc`/`calloc`/`realloc`/`free`** in `.ext` (required for `taint`, `vm`, `find --addr/--bytes`, and `Trace.open().query()`).
+   - Default `capacity` is `262144`. Always check `const st = emu.trace.stop(); if (st.truncated) ...` and raise `capacity` if truncated!
+5. **`rand()` / `srand()` stub**: HLE `rand`/`random`/`srand`/`srandom` use a deterministic `xorshift64*` PRNG (not glibc TYPE_3), logging a one-time warning. Override via `emu.hook.importReplace("rand", ...)` if a target depends on a specific sequence.
+6. **Backend choice**: `unicorn` is required for Trace, GDB RSP, and native code/mem/syscall hooks; use `dynarmic`, `hypervisor` (macOS), or `kvm` (Linux) for pure emulation acceleration, and relay via `.rtape` (`saveTape` -> `Emu.loadTape(..., { backend: "unicorn" })`) when fast-forwarding initialization.
+
 ## Standard Reverse-Engineering Workflow (Iterative Loop)
 
-Follow this fast closed loop whenever bringing up a new `.so`:
-
-1. **Create a minimal QuickJS probe script** with `emu.diag.enable()`, `device`, and `realClock`:
+1. **Create a minimal QuickJS probe script** with `freezeLayout`, `emu.diag.enable()`, `device`, and `realClock`:
    ```javascript
    const emu = Emu.create({
      packageName: "com.example.app",
      searchPaths: ["./libs"],
      device: "pixel8pro", // pixel5 | pixel8pro | s24ultra | xiaomi14 | { ... }
-     realClock: true,
+     realClock: false,
+     freezeLayout: true,  // keep guest heap addresses stable across probe scripts
    });
    emu.diag.enable();
    emu.setLimits({ timeoutMs: 30000, maxInstructions: 0 });
 
    emu.jni.onUnhandled((info) => {
-     console.log(`[JNI] ${info.kind} ${info.className}.${info.name}${info.sig} args=${JSON.stringify(info.args)}`);
+     console.log(`[JNI] ${info.kind} ${info.className}.${info.name}${info.sig}`);
      return 0;
    });
 
@@ -51,90 +66,117 @@ Follow this fast closed loop whenever bringing up a new `.so`:
    ```
 2. **Run with structured logging**:
    ```bash
-   ./target/release/runidbg-cli --log-level info run probe.js
+   ./target/release/runidbg-cli --log-level info run --freeze-layout probe.js
    ```
 3. **Patch missing environment using `EnvDiag`**:
    - `missingFiles` -> `emu.vfs.writeFile(path, content)` or `emu.vfs.mountOverlay(guestDir, hostDir)`
    - `missingProperties` -> `emu.vfs.setProperty(key, val)` or `emu.vfs.setDevice(...)`
    - `missingSyscalls` -> `emu.hook.syscall(nr, (ctx, nr) => retVal)`
    - `missingJni` -> `emu.jni.hook("pkg/Class", { method(a, b) { ... } })`
-   - Or call `emu.diag.generatePatchJs()` to auto-generate a starter patch template.
-4. **Inspect crashes immediately**:
-   - Always print `emu.lastCrash()?.formatted` on error — it includes fault PC + module offset, ARM64 disassembly around PC, all X0–X30/SP/FP/NZCV registers, FP backtrace, recent HLE/JNI/Syscall breadcrumbs, and VMA maps.
-   - If a heavy `.init_array` or `JNI_OnLoad` hits `ExecutionTimeout`, raise or remove the cap via `emu.setLimits({ timeoutMs: 30000, maxInstructions: 0 })`.
+   - Or call `emu.diag.generatePatchJs()` for an auto-generated patch template.
 
 ## Essential QuickJS Patterns
 
-### Calling Native Functions & JNI Helpers
+### Fast Guest Memory Watchpoints & Rust-Side Filtered Hooks
 ```javascript
-const cls = emu.jni.findClass("com/example/Native");
-const strRef = emu.jni.newString("hello");
-const arrRef = emu.jni.newStringArray(["k1", "v1", "k2", "v2"]);
-
-// Direct call by offset (passing emu.jni.envPtr as X0):
-const retRef = emu.call(mod.base + 0x120be0, emu.jni.envPtr, cls, 50331649, 0, 0, strRef, arrRef);
-const outStrings = emu.jni.getStringArray(retRef);
-
-// Or call registered JNI native directly by class + method name:
-const r = emu.jni.callNative("com/example/Native", "sign", [strRef]);
-```
-
-### Frida-Style Native Hooks (JNI-Safe Inside Callbacks)
-```javascript
-emu.hook.attach(mod.base + 0x12340, {
-  onEnter(ctx) {
-    this.arg0 = ctx.x0;
-    console.log("enter x0=", ctx.x0, "str=", emu.jni.getString(ctx.x1));
-  },
-  onLeave(ctx) {
-    console.log("leave ret=", ctx.retval);
-  },
+// Watch guest writes to a buffer range (lossless 64-bit BigInt value64):
+const wh = emu.hook.watch([buf, buf + 64], "w", (ctx, access, addr, size, val, val64) => {
+  console.log(`pc=0x${ctx.pc.toString(16)} write [${addr.toString(16)}] = 0x${val64.toString(16)}`);
 });
 
-emu.hook.replace(mod.base + 0x56780, (ctx) => 1);
-emu.hook.syscall(160, (ctx, nr) => undefined); // return undefined to fall through
+// Zero-JS-overhead Rust-side filtering (only enters JS when value, size, and PC match):
+const mh = emu.hook.mem(
+  [buf, buf + 64],
+  { write: true, value: 0xdeadbeefn, size: 4, pcRange: [mod.base, mod.base + mod.size], bigInt: true },
+  (ctx, access, addr, size, val, val64) => { ... }
+);
+if (mh.unmapped) console.warn("target range not mapped yet!");
 ```
 
-### High-Speed Binary Tracing & Offline Analysis
+### Online Custom-VM Regfile Watcher & Word Decoder
+```javascript
+const watcher = emu.vm.watchRegfile({
+  baseReg: "x25",                  // auto-tracks stack-frame base relocations!
+  count: 32,
+  size: 8,
+  dispatcherPc: mod.base + 0x12340,
+  bcReg: "x23",                    // optional; set bcDeref: true if [x23] holds bytecode PC
+  layout: { op: [6, 6], fields: [12, 17, 22, 27] },
+});
+emu.call(mod.base + 0x10000, ...);
+console.log(watcher.format(100));  // step#0001 bc=0x...(+8B) op=49 f=[1,5,0,7] | R[3]: 0x10->0x42
+watcher.detach();
+```
+
+### High-Speed Full Trace + Offline Taint, Omniscient Query, Diff & VM Analysis
 ```javascript
 emu.trace.start({
-  output: "run.idx",     // auto-creates run.ext in "full" mode, truncated on stop()
-  level: "full",         // "fast" (~17M/s) | "reg_delta" (~5M/s) | "full" (~4.7M/s + mem R/W)
+  output: "run.idx",     // auto-creates run.ext in "full" mode (includes HLE memcpy/memset/malloc/free)
+  level: "full",
   start: mod.base,
   end: mod.base + mod.size,
   capacity: 2000000,
 });
 emu.call(mod.base + 0x120be0, ...);
-const stats = emu.trace.stop(); // { records, extRecords, totalInsns, droppedInsns, droppedExt }
+const st = emu.trace.stop();
+if (st.truncated) console.warn("Trace truncated!", st);
+
+// Offline omniscient query, backward causal slicing & VM auto-analysis right in JS:
+const tr = Trace.open("run.idx");
+const writes = tr.findWrites(0xdeadbeefn, { width: 4 });
+const hist   = tr.findReads(0x50006470, { len: 8 });
+const snap   = tr.reconstructMem(0x50006470, 16);
+const slice  = tr.taintBackward({ addr: 0x50006470, len: 8 });
+const fwd    = tr.taintForward({ addr: 0x50001000, len: 16 });
+const vmRep  = tr.vmAnalyze({ baseReg: "x25", layout: { op: [6, 6], fields: [12, 17, 22, 27] } });
+tr.close();
+
+const diff = Trace.diff("run_a.idx", "run_b.idx");
 ```
-Analyze offline with `runidbg-cli`:
+
+Offline CLI equivalents:
 ```bash
 runidbg-cli stats       run.idx --base 0x40000000 --top 20
 runidbg-cli calltree    run.idx --base 0x40000000 --max-depth 4 --min-insns 1000
 runidbg-cli crypto-scan run.idx --base 0x40000000
 runidbg-cli dump        run.idx --base 0x40000000 --skip 0 --limit 50
-runidbg-cli search      run.idx --base 0x40000000 --val 0x03000001
-runidbg-cli search      run.idx --base 0x40000000 --ascii "8404" --limit 10
+runidbg-cli find        run.idx --base 0x40000000 --val 0x03000001
+runidbg-cli find        run.idx --base 0x40000000 --addr 0x50006470 --limit 50
+runidbg-cli find        run.idx --base 0x40000000 --ascii "8404" --limit 10
+runidbg-cli taint       run.idx --mode backward --addr 0x50006470 --len 8 --base 0x40000000
+runidbg-cli diff        run_a.idx run_b.idx --base 0x40000000 --limit 50
+runidbg-cli vm          run.idx --base 0x40000000 --base-reg x25 --layout 6:6,12,17,22,27
 runidbg-cli export-ida  run.idx --base 0x40000000 --out ida_cov.py
 runidbg-cli export-bn   run.idx --base 0x40000000 --out bn_cov.py
 ```
 
-### Serving as Multi-Core HTTP/JSON-RPC 2.0 Service
-Export functions on `rpc.exports = { sign(url) { ... } }`, then run:
-```bash
-runidbg-cli serve script.js --listen 127.0.0.1:8080 --workers auto --timeout-ms 15000 --allow-reload
-# Endpoints: GET /health, GET /metrics, GET /exports, POST /call/<method>, POST /rpc, POST /admin/reload
+### `.rtape` Snapshots & Deterministic Time-Travel Debugging
+```javascript
+// Fast-forward init on Dynarmic -> save tape -> relay to Unicorn for time-travel recording:
+fastEmu.saveTape("./init.rtape", "after_init");
+const uc = Emu.loadTape("./init.rtape", { backend: "unicorn", checkpoint: "after_init" });
+uc.record.start({ keyframeInterval: 100000, captureJni: true });
+uc.module("libtarget.so").call("sign_func", dst, src, len);
+uc.record.bookmark("done");
+uc.record.stop("./sign_tt.rtape");
+
+const tt = Emu.openTimeTravel("./sign_tt.rtape");
+tt.seekBookmark("done");
+const writer = tt.findPrevWrite(dst, 8);
+tt.close();
 ```
 
-### Using MCP Tools (AI Agent Direct Control)
-Start MCP server via stdio (`runidbg-cli mcp --cwd .`) or Streamable HTTP (`runidbg-cli mcp --http 127.0.0.1:8090 --cwd .`). Available 21 tools (including `emu_load_dex`, `emu_dex_class_info`, `emu_jni_set_field`, `emu_jni_call_native`):
-- Lifecycle & Execution: `emu_create`, `emu_load`, `emu_jni_onload`, `emu_exports`, `emu_call`, `emu_eval_js`
-- Inspection & Memory: `emu_regs`, `emu_mem_read`, `emu_mem_scan`, `emu_disasm`
-- Tracing & Hooks: `emu_trace_call`, `trace_inspect` (`dump`/`search_val`/`search_addr`/`search_ascii`/`search_bytes`), `trace_calltree`, `trace_crypto_scan`, `emu_hook_capture`
-- Diagnostics: `emu_diag_missing`, `emu_last_crash`
+### Using MCP Tools (36 Tools for Direct AI Agent Control)
+Start MCP server via stdio (`runidbg-cli mcp --cwd .`) or Streamable HTTP (`runidbg-cli mcp --http 127.0.0.1:8090 --cwd .`):
+- **Lifecycle & Execution**: `emu_create` (supports `backend`, `freezeLayout`), `emu_load`, `emu_jni_onload`, `emu_exports`, `emu_call`, `emu_eval_js`
+- **DEX & JNI**: `emu_load_dex`, `emu_dex_class_info`, `emu_jni_set_field`, `emu_jni_call_native`
+- **Inspection & Memory**: `emu_regs`, `emu_mem_read`, `emu_mem_scan`, `emu_disasm`
+- **Tracing, Taint, Diff, VM & Hooks**: `emu_trace_call`, `trace_inspect`, `trace_calltree`, `trace_crypto_scan`, `trace_taint`, `trace_query`, `trace_diff`, `trace_vm_analyze`, `emu_hook_capture`
+- **`.rtape` & Time-Travel**: `emu_save_tape`, `emu_load_tape`, `emu_seek_tape`, `tape_info`, `tt_record_start`, `tt_record_stop`, `tt_open`, `tt_seek`, `tt_reverse_watch`, `tt_mem_read`, `tt_close`
+- **Diagnostics**: `emu_diag_missing`, `emu_last_crash`
 
 ## Guardrails & Best Practices
 - Only targets **Android ARM64 (`aarch64`)** ELF shared libraries.
 - Never hardcode or commit real cookies, session tokens, or private keys into scripts or tests.
-- When tracing large calls, always scope `start`/`end` to `[mod.base, mod.base + mod.size]` to exclude libc HLE trampolines and keep traces compact.
+- Scope `trace.start({ start, end })` to `[mod.base, mod.base + mod.size]` to keep `.idx`/`.ext` compact while still capturing HLE `memcpy`/`memset`/`malloc`/`free` calls attributed to module call sites.
 - For full API details, read [docs/GUIDE.md](./GUIDE.md) and [src/script/runidbg.d.ts](../src/script/runidbg.d.ts).
