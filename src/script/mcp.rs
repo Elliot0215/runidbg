@@ -1159,6 +1159,121 @@ impl McpServer {
                     })).collect::<Vec<_>>(),
                 }))
             }
+            "trace_vm_analyze" => {
+                let idx_path = PathBuf::from(req_str(args, "idxPath")?);
+                let ext_path = resolve_ext_path(
+                    &idx_path,
+                    opt_str_strict(args, "extPath")?,
+                );
+                let mut opts = crate::tracer::VmAnalysisOptions::default();
+                if let Some(v) = args.get("dispatcherPc").filter(|v| !v.is_null()) {
+                    opts.dispatcher_pc = Some(parse_addr_val(Some(v))?);
+                }
+                if let Some(s) = opt_str_strict(args, "bcReg")? {
+                    let slot = crate::tracer::parse_gpr_slot(s)
+                        .ok_or_else(|| anyhow!("无效的 bcReg 寄存器名: {s}"))?;
+                    opts.bc_reg = Some(slot);
+                }
+                if let Some(b) = opt_bool_strict(args, "bcDeref")? {
+                    opts.bc_deref = b;
+                }
+                if let Some(v) = args.get("bcPtrAddr").filter(|v| !v.is_null()) {
+                    opts.bc_ptr_addr = Some(parse_addr_val(Some(v))?);
+                }
+                if opts.bc_reg.is_some() && opts.bc_ptr_addr.is_some() {
+                    return Err(anyhow!("trace_vm_analyze 的 bcReg 与 bcPtrAddr 互斥，请只提供其中一个"));
+                }
+                if opts.bc_deref && opts.bc_reg.is_none() {
+                    return Err(anyhow!("trace_vm_analyze 的 bcDeref: true 必须配合 bcReg 使用"));
+                }
+                let reg_count = opt_u64_range(args, "regCount", 1, 256)?.unwrap_or(32) as usize;
+                let reg_size = match opt_u64_strict(args, "regSize")? {
+                    None => 8u8,
+                    Some(4) => 4u8,
+                    Some(8) => 8u8,
+                    Some(other) => return Err(anyhow!("参数 `regSize` 仅支持 4 或 8，收到 {other}")),
+                };
+                if let Some(s) = opt_str_strict(args, "baseReg")? {
+                    let base_reg = crate::tracer::parse_gpr_slot(s)
+                        .ok_or_else(|| anyhow!("无效的 baseReg 寄存器名: {s}"))?;
+                    opts.regfile = Some(crate::tracer::VmRegfileConfig {
+                        base_reg,
+                        count: reg_count,
+                        size: reg_size,
+                    });
+                }
+                if let Some(spec) = opt_str_strict(args, "layout")? {
+                    let lay = crate::tracer::VmWordLayout::parse_spec(spec)
+                        .map_err(|e| anyhow!("无效的 layout: {e}"))?;
+                    opts.layout = Some(lay);
+                }
+                if let Some(mh) = opt_u64_range(args, "minHandlers", 1, 10000)? {
+                    opts.min_handlers = mh as usize;
+                }
+                if let Some(md) = opt_u64_range(args, "minDispatches", 1, 1_000_000)? {
+                    opts.min_dispatches = md as usize;
+                }
+                if let Some(mi) = opt_u64_strict(args, "maxInsns")? {
+                    opts.max_insns = mi as usize;
+                }
+                opts.max_steps = opt_u64_range(args, "maxSteps", 1, 2000)?.unwrap_or(200) as usize;
+                let base_addr = args
+                    .get("baseAddr")
+                    .filter(|v| !v.is_null())
+                    .map(|v| parse_addr_val(Some(v)))
+                    .transpose()?
+                    .unwrap_or(0);
+
+                let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+                let report = reader.analyze_vm(&opts);
+                Ok(json!({
+                    "scannedInsns": report.scanned_insns,
+                    "totalVmSteps": report.total_vm_steps,
+                    "selectedDispatcherHex": report.selected_dispatcher.map(|p| format!("0x{p:016x}")),
+                    "detectedBcReg": report.detected_bc_reg,
+                    "detectedBcMemAddrHex": report.detected_bc_mem_addr.map(|a| format!("0x{a:016x}")),
+                    "dispatchers": report.dispatchers.iter().map(|d| json!({
+                        "pcHex": format!("0x{:016x}", d.pc),
+                        "kind": d.kind,
+                        "targetReg": crate::tracer::format_reg_slot(d.target_reg),
+                        "totalDispatches": d.total_dispatches,
+                        "uniqueHandlers": d.unique_handlers,
+                        "score": d.score,
+                        "jumpTableBaseHex": d.jump_table_base.map(|b| format!("0x{b:016x}")),
+                        "jumpTableEntrySize": d.jump_table_entry_size,
+                        "detectedBcReg": d.detected_bc_reg.map(crate::tracer::format_reg_slot),
+                        "detectedBcMemAddrHex": d.detected_bc_mem_addr.map(|a| format!("0x{a:016x}")),
+                    })).collect::<Vec<_>>(),
+                    "handlers": report.handlers.iter().map(|h| json!({
+                        "handlerPcHex": format!("0x{:016x}", h.handler_pc),
+                        "opcodes": h.opcodes,
+                        "hitCount": h.hit_count,
+                        "minArm64Insns": h.min_arm64_insns,
+                        "maxArm64Insns": h.max_arm64_insns,
+                        "avgArm64Insns": h.avg_arm64_insns(),
+                        "bcStepHist": h.bc_step_hist,
+                        "firstStep": h.first_step,
+                        "firstTraceIdx": h.first_trace_idx,
+                    })).collect::<Vec<_>>(),
+                    "steps": report.steps.iter().map(|s| json!({
+                        "step": s.step,
+                        "traceIdx": s.trace_idx,
+                        "seq": s.seq,
+                        "handlerPcHex": format!("0x{:016x}", s.handler_pc),
+                        "arm64Insns": s.arm64_insns,
+                        "bcPcHex": s.bc_pc.map(|p| format!("0x{p:016x}")),
+                        "bcStep": s.bc_step,
+                        "rawWordHex": s.raw_word.map(|w| format!("0x{w:x}")),
+                        "decodedText": s.decoded.as_ref().map(|d| d.format_compact()),
+                        "op": s.decoded.as_ref().map(|d| d.op).or(s.table_opcode),
+                        "fields": s.decoded.as_ref().map(|d| &d.fields),
+                        "regfileBaseHex": s.regfile_base.map(|b| format!("0x{b:016x}")),
+                        "baseRelocated": s.base_relocated,
+                        "regDiffs": s.reg_diffs.iter().map(|d| d.format_compact()).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                    "summaryText": report.format_summary(base_addr),
+                }))
+            }
             _ => Err(anyhow!("未知的 MCP 工具: {name}")),
         }
     }
@@ -1758,6 +1873,31 @@ fn tool_definitions() -> Value {
                     "extPathA": { "type": "string" },
                     "extPathB": { "type": "string" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max diff entries returned (default 64)" }
+                }
+            }
+        },
+        {
+            "name": "trace_vm_analyze",
+            "description": "Offline custom-VM & OLLVM reverse-engineering analyzer on trace.idx + trace.ext: auto-detects dispatch loops (BR/BLR), jump tables, bytecode PC registers, handler distribution (vm_opmap), per-handler consumed bytecode lengths, optional bitfield instruction-word decoding, and symbolic VM regfile diffs (auto-handling base-register relocation).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["idxPath"],
+                "properties": {
+                    "idxPath": { "type": "string", "description": "Path to trace.idx file" },
+                    "extPath": { "type": "string", "description": "Optional trace.ext path (auto-detected if sibling exists)" },
+                    "dispatcherPc": { "description": "Optional explicit dispatcher PC (integer or '0x...' hex); omitted = auto-detect" },
+                    "bcReg": { "type": "string", "description": "Optional bytecode PC register (e.g. 'x23'); omitted = auto-detect" },
+                    "bcDeref": { "type": "boolean", "description": "If true, treat [bcReg] memory as the bytecode PC pointer" },
+                    "bcPtrAddr": { "description": "Optional fixed memory address holding the bytecode PC pointer" },
+                    "baseReg": { "type": "string", "description": "Optional VM regfile base register (e.g. 'x25') to emit symbolic R[n] diffs and track base relocation" },
+                    "regCount": { "type": "integer", "minimum": 1, "maximum": 256, "description": "Number of virtual registers (default 32)" },
+                    "regSize": { "type": "integer", "enum": [4, 8], "description": "Virtual register byte width (4 or 8, default 8)" },
+                    "layout": { "type": "string", "description": "Optional instruction-word bitfield spec '<op_lsb>:<op_width>[,<f0_lsb>[:<f0_width>],...]', e.g. '6:6,12:5,17:5,22:5,27:5'" },
+                    "minHandlers": { "type": "integer", "minimum": 1, "maximum": 10000, "description": "Min unique handler targets for dispatcher detection (default 3)" },
+                    "minDispatches": { "type": "integer", "minimum": 1, "maximum": 1000000, "description": "Min dispatch hits for dispatcher detection (default 4)" },
+                    "maxInsns": { "type": "integer", "minimum": 0, "description": "Max native instructions to scan (0 = all)" },
+                    "maxSteps": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Max VM steps returned in report (default 200)" },
+                    "baseAddr": { "description": "Optional module base address for +0x... offsets in summaryText" }
                 }
             }
         }

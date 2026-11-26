@@ -2513,13 +2513,14 @@ pub(super) fn register_native_bridge<'js>(
                 ctx.clone(),
                 move |ctx: Ctx<'js>,
                       emu_id: usize,
-                      addr: f64,
+                      addr_val: Value<'js>,
                       len: usize|
                       -> rquickjs::Result<TypedArray<'js, u8>> {
+                    let addr = js_addr_to_u64_strict(&ctx, &addr_val)?;
                     let buf = with_uc(&ctx, &host, emu_id, |uc| {
                         let mut buf = vec![0u8; len];
                         if len > 0 {
-                            uc.mem_read(addr as u64, &mut buf)
+                            uc.mem_read(addr, &mut buf)
                                 .map_err(|e| throw_err(&ctx, format!("mem_read 失败: {e:?}")))?;
                         }
                         Ok(buf)
@@ -4582,23 +4583,31 @@ pub(super) fn register_native_bridge<'js>(
                 ctx.clone(),
                 move |ctx: Ctx<'js>,
                       emu_id: usize,
-                      begin: f64,
-                      end: f64,
+                      begin_val: Value<'js>,
+                      end_val: Value<'js>,
                       max_hits: f64,
                       func: Function<'js>|
                       -> rquickjs::Result<usize> {
+                    let begin = js_addr_to_u64_strict(&ctx, &begin_val)?;
+                    let end = js_addr_to_u64_strict(&ctx, &end_val)?;
+                    if begin > end {
+                        return Err(throw_err(
+                            &ctx,
+                            format!("hook.code 区间非法: begin(0x{begin:x}) > end(0x{end:x})"),
+                        ));
+                    }
                     let persistent = Persistent::save(&ctx, func);
                     let limit = if max_hits < 0.0 {
                         None
                     } else {
-                        Some(max_hits as u64)
+                        Some(require_nonneg_int(&ctx, max_hits, "maxHits")?)
                     };
                     let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
                     with_unicorn_only(&ctx, &host, emu_id, "hook.code", |uc| {
                         handles
                             .native_hooks
                             .borrow_mut()
-                            .add_code_hook(emu_id, uc, begin as u64, end as u64, limit, persistent)
+                            .add_code_hook(emu_id, uc, begin, end, limit, persistent)
                             .map_err(|e| throw_err(&ctx, e))
                     })
                 },
@@ -5107,6 +5116,383 @@ pub(super) fn register_native_bridge<'js>(
                         mem_arr.set(i, o)?;
                     }
                     out.set("taintedMemRanges", mem_arr)?;
+                    Ok(out)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "traceVmAnalyze",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      trace_id: usize,
+                      opts: Object<'js>|
+                      -> rquickjs::Result<Object<'js>> {
+                    let mut cfg = crate::tracer::VmAnalysisOptions::default();
+
+                    let parse_opt_u64 = |key: &str| -> rquickjs::Result<Option<u64>> {
+                        match opts.get::<_, Value<'js>>(key) {
+                            Ok(v) if !v.is_undefined() && !v.is_null() => {
+                                let n = v.as_number().ok_or_else(|| {
+                                    throw_err(&ctx, format!("vmAnalyze 参数 {key} 必须为非负整数"))
+                                })?;
+                                Ok(Some(require_nonneg_int(&ctx, n, key)?))
+                            }
+                            _ => Ok(None),
+                        }
+                    };
+                    let parse_bit_u8 = |v: Value<'js>, label: &str| -> rquickjs::Result<u8> {
+                        let n = v.as_number().ok_or_else(|| {
+                            throw_err(&ctx, format!("{label} 必须为非负整数"))
+                        })?;
+                        let u = require_nonneg_int(&ctx, n, label)?;
+                        if u > 64 {
+                            return Err(throw_err(
+                                &ctx,
+                                format!("{label} 超出合法位域范围 [0, 64]: {u}"),
+                            ));
+                        }
+                        Ok(u as u8)
+                    };
+
+                    if let Some(v) = opts
+                        .get::<_, Value<'js>>("dispatcherPc")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null())
+                    {
+                        cfg.dispatcher_pc = Some(js_addr_to_u64_strict(&ctx, &v)?);
+                    }
+                    if let Some(v) = opts
+                        .get::<_, Value<'js>>("bcReg")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null())
+                    {
+                        let s = v
+                            .as_string()
+                            .and_then(|js| js.to_string().ok())
+                            .ok_or_else(|| throw_err(&ctx, "vmAnalyze 参数 bcReg 必须为字符串"))?;
+                        let slot = crate::tracer::parse_gpr_slot(&s).ok_or_else(|| {
+                            throw_err(&ctx, format!("无效的 bcReg 寄存器名: {s}"))
+                        })?;
+                        cfg.bc_reg = Some(slot);
+                    }
+                    if let Some(v) = opts
+                        .get::<_, Value<'js>>("bcDeref")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null())
+                    {
+                        cfg.bc_deref = v
+                            .as_bool()
+                            .ok_or_else(|| throw_err(&ctx, "vmAnalyze 参数 bcDeref 必须为布尔值"))?;
+                    }
+                    if let Some(v) = opts
+                        .get::<_, Value<'js>>("bcPtrAddr")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null())
+                    {
+                        cfg.bc_ptr_addr = Some(js_addr_to_u64_strict(&ctx, &v)?);
+                    }
+                    if cfg.bc_reg.is_some() && cfg.bc_ptr_addr.is_some() {
+                        return Err(throw_err(
+                            &ctx,
+                            "vmAnalyze 参数 bcReg 与 bcPtrAddr 互斥，请只提供其中一个",
+                        ));
+                    }
+                    if cfg.bc_deref && cfg.bc_reg.is_none() {
+                        return Err(throw_err(
+                            &ctx,
+                            "vmAnalyze 参数 bcDeref: true 必须配合 bcReg 使用",
+                        ));
+                    }
+
+                    // 无论是否传 baseReg，都严格校验 regCount / regSize 合法性
+                    let reg_count = match parse_opt_u64("regCount")? {
+                        Some(n) => {
+                            if !(1..=256).contains(&n) {
+                                return Err(throw_err(&ctx, format!("regCount 必须在 [1, 256] 之间，收到 {n}")));
+                            }
+                            n as usize
+                        }
+                        None => 32,
+                    };
+                    let reg_size = match parse_opt_u64("regSize")? {
+                        Some(4) => 4u8,
+                        Some(8) => 8u8,
+                        Some(other) => {
+                            return Err(throw_err(&ctx, format!("regSize 仅支持 4 或 8，收到 {other}")));
+                        }
+                        None => 8u8,
+                    };
+                    if let Some(v) = opts
+                        .get::<_, Value<'js>>("baseReg")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null())
+                    {
+                        let s = v
+                            .as_string()
+                            .and_then(|js| js.to_string().ok())
+                            .ok_or_else(|| throw_err(&ctx, "vmAnalyze 参数 baseReg 必须为字符串"))?;
+                        let base_reg = crate::tracer::parse_gpr_slot(&s).ok_or_else(|| {
+                            throw_err(&ctx, format!("无效的 baseReg 寄存器名: {s}"))
+                        })?;
+                        cfg.regfile = Some(crate::tracer::VmRegfileConfig {
+                            base_reg,
+                            count: reg_count,
+                            size: reg_size,
+                        });
+                    }
+                    if let Some(lv) = opts
+                        .get::<_, Value<'js>>("layout")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null())
+                    {
+                        if let Some(s) = lv.as_string().and_then(|js| js.to_string().ok()) {
+                            cfg.layout = Some(
+                                crate::tracer::VmWordLayout::parse_spec(&s)
+                                    .map_err(|e| throw_err(&ctx, e))?,
+                            );
+                        } else if let Some(lo) = lv.as_object() {
+                            if lv.is_array() {
+                                return Err(throw_err(&ctx, "layout 必须为字符串或 { op, fields } 对象"));
+                            }
+                            let op_val = lo
+                                .get::<_, Value<'js>>("op")
+                                .map_err(|_| throw_err(&ctx, "layout.op 必须为 [lsb, width] 数组"))?;
+                            let op_arr = op_val
+                                .as_array()
+                                .ok_or_else(|| throw_err(&ctx, "layout.op 必须为 [lsb, width] 数组"))?;
+                            if op_arr.len() != 2 {
+                                return Err(throw_err(&ctx, "layout.op 必须为 2 元素数组 [lsb, width]"));
+                            }
+                            let op_lsb = parse_bit_u8(op_arr.get::<Value<'js>>(0)?, "layout.op[0]")?;
+                            let op_w = parse_bit_u8(op_arr.get::<Value<'js>>(1)?, "layout.op[1]")?;
+                            let op_bf = crate::tracer::VmBitField::new(op_lsb, op_w)
+                                .ok_or_else(|| throw_err(&ctx, format!("layout.op 位域越界: lsb={op_lsb}, width={op_w}")))?;
+                            let mut raw_fields: Vec<(u8, Option<u8>)> = Vec::new();
+                            if let Ok(fv_prop) = lo.get::<_, Value<'js>>("fields") {
+                                if !fv_prop.is_undefined() && !fv_prop.is_null() {
+                                    let f_arr = fv_prop.as_array().ok_or_else(|| {
+                                        throw_err(&ctx, "layout.fields 必须为数组")
+                                    })?;
+                                    for i in 0..f_arr.len() {
+                                        let fv: Value<'js> = f_arr.get(i)?;
+                                        if let Some(sub) = fv.as_array() {
+                                            if sub.len() != 2 {
+                                                return Err(throw_err(&ctx, "layout.fields 元素若为数组则必须为 [lsb, width]"));
+                                            }
+                                            let lsb = parse_bit_u8(sub.get::<Value<'js>>(0)?, "field lsb")?;
+                                            let w = parse_bit_u8(sub.get::<Value<'js>>(1)?, "field width")?;
+                                            raw_fields.push((lsb, Some(w)));
+                                        } else if fv.is_number() {
+                                            let lsb = parse_bit_u8(fv, "field lsb")?;
+                                            raw_fields.push((lsb, None));
+                                        } else {
+                                            return Err(throw_err(&ctx, "layout.fields 元素必须为整数或 [lsb, width]"));
+                                        }
+                                    }
+                                }
+                            }
+                            let mut fields = Vec::with_capacity(raw_fields.len());
+                            for (i, &(lsb, w_opt)) in raw_fields.iter().enumerate() {
+                                let w = match w_opt {
+                                    Some(w) => w,
+                                    None => {
+                                        if let Some(&(next_lsb, _)) = raw_fields.get(i + 1) {
+                                            if next_lsb > lsb && (next_lsb - lsb) <= 16 {
+                                                next_lsb - lsb
+                                            } else {
+                                                5u8.min(64u8.saturating_sub(lsb))
+                                            }
+                                        } else {
+                                            5u8.min(64u8.saturating_sub(lsb))
+                                        }
+                                    }
+                                };
+                                let bf = crate::tracer::VmBitField::new(lsb, w)
+                                    .ok_or_else(|| throw_err(&ctx, format!("layout.fields 位域越界: lsb={lsb}, width={w}")))?;
+                                fields.push(bf);
+                            }
+                            cfg.layout = Some(crate::tracer::VmWordLayout { op: op_bf, fields });
+                        } else {
+                            return Err(throw_err(&ctx, "layout 必须为字符串或 { op, fields } 对象"));
+                        }
+                    }
+                    if let Some(n) = parse_opt_u64("minHandlers")? {
+                        if n == 0 {
+                            return Err(throw_err(&ctx, "minHandlers 必须 >= 1"));
+                        }
+                        cfg.min_handlers = n as usize;
+                    }
+                    if let Some(n) = parse_opt_u64("minDispatches")? {
+                        if n == 0 {
+                            return Err(throw_err(&ctx, "minDispatches 必须 >= 1"));
+                        }
+                        cfg.min_dispatches = n as usize;
+                    }
+                    if let Some(n) = parse_opt_u64("maxInsns")? {
+                        cfg.max_insns = n as usize;
+                    }
+                    if let Some(n) = parse_opt_u64("maxSteps")? {
+                        cfg.max_steps = n as usize;
+                    }
+                    let base_addr = opts
+                        .get::<_, Value<'js>>("baseAddr")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null())
+                        .map(|v| js_addr_to_u64_strict(&ctx, &v))
+                        .transpose()?
+                        .unwrap_or(0);
+
+                    let h = host.try_borrow().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let reader = h
+                        .trace_readers
+                        .get(trace_id)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| throw_err(&ctx, "无效或已关闭的 traceId"))?;
+                    let report = reader.analyze_vm(&cfg);
+
+                    let out = Object::new(ctx.clone())?;
+                    out.set("scannedInsns", report.scanned_insns as f64)?;
+                    out.set("totalVmSteps", report.total_vm_steps as f64)?;
+                    if let Some(pc) = report.selected_dispatcher {
+                        out.set("selectedDispatcher", pc as f64)?;
+                        out.set("selectedDispatcherHex", format!("0x{pc:016x}"))?;
+                    } else {
+                        out.set("selectedDispatcher", Value::new_null(ctx.clone()))?;
+                        out.set("selectedDispatcherHex", Value::new_null(ctx.clone()))?;
+                    }
+                    if let Some(ref r) = report.detected_bc_reg {
+                        out.set("detectedBcReg", r.as_str())?;
+                    } else {
+                        out.set("detectedBcReg", Value::new_null(ctx.clone()))?;
+                    }
+                    if let Some(a) = report.detected_bc_mem_addr {
+                        out.set("detectedBcMemAddr", a as f64)?;
+                        out.set("detectedBcMemAddrHex", format!("0x{a:016x}"))?;
+                    } else {
+                        out.set("detectedBcMemAddr", Value::new_null(ctx.clone()))?;
+                        out.set("detectedBcMemAddrHex", Value::new_null(ctx.clone()))?;
+                    }
+
+                    let disp_arr = Array::new(ctx.clone())?;
+                    for (i, d) in report.dispatchers.iter().enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("pc", d.pc as f64)?;
+                        o.set("pcHex", format!("0x{:016x}", d.pc))?;
+                        o.set("kind", d.kind)?;
+                        o.set("targetReg", crate::tracer::format_reg_slot(d.target_reg))?;
+                        o.set("totalDispatches", d.total_dispatches as f64)?;
+                        o.set("uniqueHandlers", d.unique_handlers as f64)?;
+                        o.set("score", d.score as f64)?;
+                        if let Some(tb) = d.jump_table_base {
+                            o.set("jumpTableBase", tb as f64)?;
+                            o.set("jumpTableBaseHex", format!("0x{tb:016x}"))?;
+                        }
+                        if let Some(esz) = d.jump_table_entry_size {
+                            o.set("jumpTableEntrySize", esz as f64)?;
+                        }
+                        if let Some(r) = d.detected_bc_reg {
+                            o.set("detectedBcReg", crate::tracer::format_reg_slot(r))?;
+                        }
+                        if let Some(a) = d.detected_bc_mem_addr {
+                            o.set("detectedBcMemAddrHex", format!("0x{a:016x}"))?;
+                        }
+                        disp_arr.set(i, o)?;
+                    }
+                    out.set("dispatchers", disp_arr)?;
+
+                    let h_arr = Array::new(ctx.clone())?;
+                    for (i, hs) in report.handlers.iter().enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("handlerPc", hs.handler_pc as f64)?;
+                        o.set("handlerPcHex", format!("0x{:016x}", hs.handler_pc))?;
+                        let op_arr = Array::new(ctx.clone())?;
+                        let op_hex_arr = Array::new(ctx.clone())?;
+                        for (j, &op) in hs.opcodes.iter().enumerate() {
+                            op_arr.set(j, op as f64)?;
+                            op_hex_arr.set(j, format!("0x{op:x}"))?;
+                        }
+                        o.set("opcodes", op_arr)?;
+                        o.set("opcodeHexes", op_hex_arr)?;
+                        o.set("hitCount", hs.hit_count as f64)?;
+                        o.set("minArm64Insns", hs.min_arm64_insns as f64)?;
+                        o.set("maxArm64Insns", hs.max_arm64_insns as f64)?;
+                        o.set("avgArm64Insns", hs.avg_arm64_insns())?;
+                        o.set("firstStep", hs.first_step as f64)?;
+                        o.set("firstTraceIdx", hs.first_trace_idx as f64)?;
+                        let hist_obj = Object::new(ctx.clone())?;
+                        for (&st, &cnt) in &hs.bc_step_hist {
+                            hist_obj.set(st.to_string(), cnt as f64)?;
+                        }
+                        o.set("bcStepHist", hist_obj)?;
+                        h_arr.set(i, o)?;
+                    }
+                    out.set("handlers", h_arr)?;
+
+                    let s_arr = Array::new(ctx.clone())?;
+                    for (i, st) in report.steps.iter().enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("step", st.step as f64)?;
+                        o.set("traceIdx", st.trace_idx as f64)?;
+                        o.set("seq", st.seq as f64)?;
+                        o.set("dispatcherPcHex", format!("0x{:016x}", st.dispatcher_pc))?;
+                        o.set("handlerPc", st.handler_pc as f64)?;
+                        o.set("handlerPcHex", format!("0x{:016x}", st.handler_pc))?;
+                        o.set("arm64Insns", st.arm64_insns as f64)?;
+                        if let Some(bp) = st.bc_pc {
+                            o.set("bcPc", bp as f64)?;
+                            o.set("bcPcHex", format!("0x{bp:016x}"))?;
+                        }
+                        if let Some(bs) = st.bc_step {
+                            o.set("bcStep", bs as f64)?;
+                        }
+                        if let Some(w) = st.raw_word {
+                            o.set("rawWord", w as f64)?;
+                            o.set("rawWordHex", format!("0x{w:x}"))?;
+                        }
+                        if let Some(ref dec) = st.decoded {
+                            o.set("op", dec.op as f64)?;
+                            o.set("opHex", format!("0x{:x}", dec.op))?;
+                            let fa = Array::new(ctx.clone())?;
+                            let fha = Array::new(ctx.clone())?;
+                            for (j, &fv) in dec.fields.iter().enumerate() {
+                                fa.set(j, fv as f64)?;
+                                fha.set(j, format!("0x{fv:x}"))?;
+                            }
+                            o.set("fields", fa)?;
+                            o.set("fieldsHex", fha)?;
+                            o.set("decodedText", dec.format_compact())?;
+                        } else if let Some(top) = st.table_opcode {
+                            o.set("op", top as f64)?;
+                            o.set("opHex", format!("0x{top:x}"))?;
+                        }
+                        if let Some(rfb) = st.regfile_base {
+                            o.set("regfileBaseHex", format!("0x{rfb:016x}"))?;
+                        }
+                        o.set("baseRelocated", st.base_relocated)?;
+                        let da = Array::new(ctx.clone())?;
+                        for (j, d) in st.reg_diffs.iter().enumerate() {
+                            let do_ = Object::new(ctx.clone())?;
+                            do_.set("reg", d.reg_index as f64)?;
+                            do_.set("name", format!("R[{}]", d.reg_index))?;
+                            if let Some(ov) = d.old_val {
+                                do_.set("oldHex", format!("0x{ov:x}"))?;
+                            } else {
+                                do_.set("oldHex", Value::new_null(ctx.clone()))?;
+                            }
+                            do_.set("newHex", format!("0x{:x}", d.new_val))?;
+                            do_.set("text", d.format_compact())?;
+                            da.set(j, do_)?;
+                        }
+                        o.set("regDiffs", da)?;
+                        s_arr.set(i, o)?;
+                    }
+                    out.set("steps", s_arr)?;
+                    out.set("summaryText", report.format_summary(base_addr))?;
                     Ok(out)
                 },
             )?,

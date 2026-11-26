@@ -783,6 +783,194 @@ interface EmuHandle {
   readonly record: RecordNamespace;
   /** 打印/查询当前 guest 堆布局指纹与关键分配点（`emu.mem.heapLayout()` 的便捷别名） */
   heapLayout(limit?: number): HeapLayoutInfo;
+  /** 针对 OLLVM / 自定义字节码 VM 的在线实时辅助命名空间（寄存器堆跟踪 + 指令字解码） */
+  readonly vm: VmNamespace;
+}
+
+interface VmWordLayout {
+  /** opcode 位域 `[lsb, width]`（如 `[6, 6]` 表示 bits `[11:6]`） */
+  op: [number, number];
+  /** 操作数字段列表：传 `lsb` 自动按相邻间距推算位宽（末段默认 5 bit），或显式传 `[lsb, width]` */
+  fields?: Array<number | [number, number]>;
+}
+
+interface VmDecodedWord {
+  readonly raw: bigint;
+  readonly rawHex: string;
+  readonly op: number;
+  readonly opBigInt: bigint;
+  readonly opHex: string;
+  readonly fields: number[];
+  readonly fieldsBigInt: bigint[];
+  readonly fieldsHex: string[];
+  readonly text: string;
+}
+
+interface VmWatchRegfileOptions {
+  /** VM 寄存器堆基址寄存器名（如 `"x25"`），自动追踪栈帧迁移导致的基址搬家 */
+  baseReg: string;
+  /** 虚拟寄存器数量（默认 32，范围 1..256） */
+  count?: number;
+  /** 每个虚拟寄存器字节宽（`4` 或 `8`，默认 `8`） */
+  size?: 4 | 8;
+  /** VM 调度点 PC 或 `[start, end]` 区间 */
+  dispatcherPc?: number | bigint | [number | bigint, number | bigint];
+  /** `dispatcherPc` 的简写别名 */
+  pc?: number | bigint | [number | bigint, number | bigint];
+  /** `dispatcherPc` 的区间别名 `[start, end]` */
+  range?: [number | bigint, number | bigint];
+  /** 可选：字节码指针寄存器名（如 `"x23"`，与 `bcPtrAddr` 互斥） */
+  bcReg?: string;
+  /** 若为 `true`，表示 `[bcReg]` 内存中存放字节码指针（须配合 `bcReg`） */
+  bcDeref?: boolean;
+  /** 可选：存放字节码指针的固定内存地址（与 `bcReg` 互斥） */
+  bcPtrAddr?: number | bigint;
+  /** 从字节码指针读取指令字的宽度（`1` / `2` / `4` / `8`，默认 `4`） */
+  wordSize?: 1 | 2 | 4 | 8;
+  /** 可选：字节码指令字位域解码器 */
+  layout?: VmWordLayout;
+  /** 内存中最多保留的事件步数（默认 10000，>= 1） */
+  maxSteps?: number;
+  /** 可选：每步实时回调（注意：回调触发时尚未进入下一步，因此 `ev.bcStep` 在回调内为 `null`，下一步执行后回填） */
+  onStep?: (ev: VmWatchStepEvent) => void;
+}
+
+interface VmWatchRegDiff {
+  readonly reg: number;
+  readonly name: string;
+  readonly oldVal: bigint;
+  readonly newVal: bigint;
+  readonly oldHex: string;
+  readonly newHex: string;
+}
+
+interface VmWatchStepEvent {
+  readonly step: number;
+  readonly pc: number;
+  readonly pcHex: string;
+  readonly base: bigint;
+  readonly baseHex: string;
+  readonly prevBase: bigint | null;
+  readonly baseRelocated: boolean;
+  readonly bcPc: bigint | null;
+  readonly bcPcHex: string | null;
+  bcStep: number | null;
+  readonly rawWord: bigint | null;
+  readonly rawWordHex: string | null;
+  readonly op: number | null;
+  readonly opHex: string | null;
+  readonly fields: number[] | null;
+  readonly fieldsHex: string[] | null;
+  readonly decodedText: string | null;
+  readonly diffs: VmWatchRegDiff[];
+}
+
+interface VmWatchHandle extends HookHandle {
+  events(): VmWatchStepEvent[];
+  stats(): Array<{ readonly op: number; readonly opHex: string; readonly hits: number; readonly stepHist: Record<string, number> }>;
+  format(limit?: number): string;
+}
+
+interface VmNamespace {
+  /** 按位域布局解码单条字节码指令字，返回 `{ op, fields, text }`（如 `"op=49 f=[1,5,0,7]"`） */
+  decodeWord(word: number | bigint, layout: VmWordLayout): VmDecodedWord;
+  /** 挂载在线 VM 寄存器堆跟踪器，自动输出 `R[n]: old->new` 符号差分、字节码消费步长与基址搬家事件 */
+  watchRegfile(opts: VmWatchRegfileOptions): VmWatchHandle;
+}
+
+interface VmAnalyzeOptions {
+  /** 手动指定调度点 PC（省略时自动检测最高分热 `BR`/`BLR` 调度循环） */
+  dispatcherPc?: number | bigint;
+  /** 手动指定字节码指针寄存器（如 `"x23"`；省略时自动推断） */
+  bcReg?: string;
+  /** 若为 `true`，表示 `[bcReg]` 内存中存放字节码指针 */
+  bcDeref?: boolean;
+  /** 可选：直接指定存放字节码指针的内存地址 */
+  bcPtrAddr?: number | bigint;
+  /** 可选：虚拟寄存器堆基址寄存器名（如 `"x25"`），开启离线 `R[n]` 符号差分与基址搬家追踪 */
+  baseReg?: string;
+  /** 虚拟寄存器数量（默认 32，范围 1..256） */
+  regCount?: number;
+  /** 单个虚拟寄存器字节宽（`4` 或 `8`，默认 `8`） */
+  regSize?: 4 | 8;
+  /** 字节码指令字位域布局（对象或字符串如 `"6:6,12:5,17:5,22:5,27:5"`） */
+  layout?: VmWordLayout | string;
+  /** 自动识别调度点所需最少唯一 Handler 数（默认 3） */
+  minHandlers?: number;
+  /** 自动识别调度点所需最少分发次数（默认 4） */
+  minDispatches?: number;
+  /** 最大扫描原生指令数（0 = 全部） */
+  maxInsns?: number;
+  /** 返回轨迹最多保留的 VM 步数（默认 256，`0` 表示不限） */
+  maxSteps?: number;
+  /** 模块基址（用于 `summaryText` 中输出 `+0x...` 相对偏移） */
+  baseAddr?: number | bigint;
+}
+
+interface VmAnalysisReport {
+  readonly scannedInsns: number;
+  readonly totalVmSteps: number;
+  readonly selectedDispatcher: number | null;
+  readonly selectedDispatcherHex: string | null;
+  readonly detectedBcReg: string | null;
+  readonly detectedBcMemAddr: number | null;
+  readonly detectedBcMemAddrHex: string | null;
+  readonly dispatchers: Array<{
+    readonly pc: number;
+    readonly pcHex: string;
+    readonly kind: "br" | "blr";
+    readonly targetReg: string;
+    readonly totalDispatches: number;
+    readonly uniqueHandlers: number;
+    readonly score: number;
+    readonly jumpTableBase?: number;
+    readonly jumpTableBaseHex?: string;
+    readonly jumpTableEntrySize?: number;
+    readonly detectedBcReg?: string;
+    readonly detectedBcMemAddrHex?: string;
+  }>;
+  readonly handlers: Array<{
+    readonly handlerPc: number;
+    readonly handlerPcHex: string;
+    readonly opcodes: number[];
+    readonly opcodeHexes: string[];
+    readonly hitCount: number;
+    readonly minArm64Insns: number;
+    readonly maxArm64Insns: number;
+    readonly avgArm64Insns: number;
+    readonly firstStep: number;
+    readonly firstTraceIdx: number;
+    readonly bcStepHist: Record<string, number>;
+  }>;
+  readonly steps: Array<{
+    readonly step: number;
+    readonly traceIdx: number;
+    readonly seq: number;
+    readonly dispatcherPcHex: string;
+    readonly handlerPc: number;
+    readonly handlerPcHex: string;
+    readonly arm64Insns: number;
+    readonly bcPc?: number;
+    readonly bcPcHex?: string;
+    readonly bcStep?: number;
+    readonly rawWord?: number;
+    readonly rawWordHex?: string;
+    readonly op?: number;
+    readonly opHex?: string;
+    readonly fields?: number[];
+    readonly fieldsHex?: string[];
+    readonly decodedText?: string;
+    readonly regfileBaseHex?: string;
+    readonly baseRelocated: boolean;
+    readonly regDiffs: Array<{
+      readonly reg: number;
+      readonly name: string;
+      readonly oldHex: string | null;
+      readonly newHex: string;
+      readonly text: string;
+    }>;
+  }>;
+  readonly summaryText: string;
 }
 
 interface TraceQueryOptions {
@@ -936,6 +1124,8 @@ interface TraceReaderHandle {
   taintForward(opts: TraceTaintOptions): TraceTaintReport;
   /** 离线反向因果切片：从输出字节/寄存器倒推精确的指令与 HLE 计算链，直达输入起源 */
   taintBackward(opts: TraceTaintOptions): TraceTaintReport;
+  /** 离线 VM 专项分析：自动识别调度循环与跳转表、统计 Handler 分布与字节码消费步长、按位域解码指令字并输出虚拟寄存器堆符号差分 */
+  vmAnalyze(opts?: VmAnalyzeOptions): VmAnalysisReport;
   close(): boolean;
 }
 

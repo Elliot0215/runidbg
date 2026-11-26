@@ -275,7 +275,7 @@
           return __native.memHeapLayout(emuId, Number(limit));
         },
         readBytes(addr, len) {
-          return __native.memReadBytes(emuId, toAddr(addr), Number(len));
+          return __native.memReadBytes(emuId, addr, Number(len));
         },
         writeBytes(addr, bytes) {
           if (!(bytes instanceof Uint8Array)) {
@@ -502,12 +502,15 @@
               throw new TypeError("hook.code(addrOrRange, fn, opts?) expects a function");
             }
             let begin, end;
-            if (Array.isArray(addrOrRange) && addrOrRange.length >= 2) {
-              begin = toAddr(addrOrRange[0]);
-              end = toAddr(addrOrRange[1]);
+            if (Array.isArray(addrOrRange)) {
+              if (addrOrRange.length !== 2) {
+                throw new RangeError("hook.code([begin, end], ...) expects a 2-element range");
+              }
+              begin = addrOrRange[0];
+              end = addrOrRange[1];
             } else {
-              begin = toAddr(addrOrRange);
-              end = begin;
+              begin = addrOrRange;
+              end = addrOrRange;
             }
             let maxHits = -1;
             if (opts && opts.once) {
@@ -955,6 +958,337 @@
         heapLayout(limit = 512) {
           return __native.memHeapLayout(emuId, Number(limit));
         },
+        vm: {
+          decodeWord(word, layout) {
+            if (!layout || typeof layout !== "object" || Array.isArray(layout) || !Array.isArray(layout.op) || layout.op.length !== 2) {
+              throw new TypeError("vm.decodeWord(word, { op: [lsb, width], fields?: [...] }) expects a valid layout");
+            }
+            let w;
+            if (typeof word === "bigint") {
+              if (word < 0n || word > 0xFFFFFFFFFFFFFFFFn) {
+                throw new RangeError("vm.decodeWord bigint word must be in [0n, 0xffffffffffffffffn]");
+              }
+              w = word;
+            } else if (typeof word === "number") {
+              if (!Number.isSafeInteger(word) || word < 0) {
+                throw new RangeError("vm.decodeWord number word must be a non-negative safe integer (use BigInt for > 2^53-1)");
+              }
+              w = BigInt(word);
+            } else {
+              throw new TypeError("vm.decodeWord word must be a non-negative safe integer or BigInt");
+            }
+
+            const parseBitField = (lsb, width, label) => {
+              if (typeof lsb !== "number" || !Number.isInteger(lsb) || typeof width !== "number" || !Number.isInteger(width)) {
+                throw new TypeError(`${label} lsb/width must be integers`);
+              }
+              if (lsb < 0 || lsb >= 64 || width <= 0 || lsb + width > 64) {
+                throw new RangeError(`${label} bitfield out of range: lsb=${lsb}, width=${width}`);
+              }
+              return [BigInt(lsb), width];
+            };
+
+            const extractBig = (lsbBig, width) => {
+              const mask = width >= 64 ? 0xFFFFFFFFFFFFFFFFn : ((1n << BigInt(width)) - 1n);
+              return (w >> lsbBig) & mask;
+            };
+
+            const [opLsb, opW] = parseBitField(layout.op[0], layout.op[1], "layout.op");
+            const opBig = extractBig(opLsb, opW);
+
+            if (layout.fields !== undefined && !Array.isArray(layout.fields)) {
+              throw new TypeError("layout.fields must be an array");
+            }
+            const rawFields = layout.fields || [];
+            const fieldsBig = rawFields.map((item, idx) => {
+              if (Array.isArray(item)) {
+                if (item.length !== 2) {
+                  throw new TypeError("layout.fields tuple must be [lsb, width]");
+                }
+                const [fLsb, fW] = parseBitField(item[0], item[1], `layout.fields[${idx}]`);
+                return extractBig(fLsb, fW);
+              }
+              if (typeof item !== "number" || !Number.isInteger(item)) {
+                throw new TypeError(`layout.fields[${idx}] must be an integer or [lsb, width]`);
+              }
+              const lsb = item;
+              const next = rawFields[idx + 1];
+              const nextLsb = Array.isArray(next) ? next[0] : next;
+              const width =
+                typeof nextLsb === "number" && Number.isInteger(nextLsb) && nextLsb > lsb && (nextLsb - lsb) <= 16
+                  ? (nextLsb - lsb)
+                  : Math.min(5, Math.max(0, 64 - lsb));
+              const [fLsb, fW] = parseBitField(lsb, width, `layout.fields[${idx}]`);
+              return extractBig(fLsb, fW);
+            });
+
+            const text =
+              fieldsBig.length > 0
+                ? `op=${opBig.toString()} f=[${fieldsBig.map((x) => x.toString()).join(",")}]`
+                : `op=${opBig.toString()}`;
+            return {
+              raw: w,
+              rawHex: "0x" + w.toString(16),
+              op: Number(opBig),
+              opBigInt: opBig,
+              opHex: "0x" + opBig.toString(16),
+              fields: fieldsBig.map((x) => Number(x)),
+              fieldsBigInt: fieldsBig,
+              fieldsHex: fieldsBig.map((x) => "0x" + x.toString(16)),
+              text,
+            };
+          },
+          watchRegfile(watchOpts) {
+            if (!watchOpts || typeof watchOpts !== "object" || Array.isArray(watchOpts)) {
+              throw new TypeError("emu.vm.watchRegfile(opts) expects an options object");
+            }
+            if (typeof watchOpts.baseReg !== "string" || !watchOpts.baseReg.trim()) {
+              throw new TypeError("emu.vm.watchRegfile requires baseReg (e.g. 'x25')");
+            }
+            const baseReg = watchOpts.baseReg.trim();
+            // 提前校验寄存器名有效性，避免延迟到 hook 回调时报错
+            __native.regGetBigInt(emuId, baseReg);
+
+            const count = watchOpts.count === undefined ? 32 : watchOpts.count;
+            if (typeof count !== "number" || !Number.isInteger(count) || count < 1 || count > 256) {
+              throw new RangeError("emu.vm.watchRegfile count must be an integer in [1, 256]");
+            }
+            const size = watchOpts.size === undefined ? 8 : watchOpts.size;
+            if (size !== 4 && size !== 8) {
+              throw new RangeError("emu.vm.watchRegfile size must be 4 or 8");
+            }
+            const wordSize = watchOpts.wordSize === undefined ? 4 : watchOpts.wordSize;
+            if (wordSize !== 1 && wordSize !== 2 && wordSize !== 4 && wordSize !== 8) {
+              throw new RangeError("emu.vm.watchRegfile wordSize must be 1, 2, 4, or 8");
+            }
+            const maxSteps = watchOpts.maxSteps === undefined ? 10000 : watchOpts.maxSteps;
+            if (typeof maxSteps !== "number" || !Number.isInteger(maxSteps) || maxSteps < 1) {
+              throw new RangeError("emu.vm.watchRegfile maxSteps must be an integer >= 1");
+            }
+
+            const pcOrRange =
+              watchOpts.dispatcherPc !== undefined
+                ? watchOpts.dispatcherPc
+                : watchOpts.pc !== undefined
+                  ? watchOpts.pc
+                  : watchOpts.range;
+            if (pcOrRange === undefined || pcOrRange === null) {
+              throw new TypeError("emu.vm.watchRegfile requires dispatcherPc (or pc / range)");
+            }
+            let range;
+            if (Array.isArray(pcOrRange)) {
+              if (pcOrRange.length !== 2) {
+                throw new RangeError("emu.vm.watchRegfile range must be [begin, end]");
+              }
+              range = [pcOrRange[0], pcOrRange[1]];
+            } else {
+              range = [pcOrRange, pcOrRange];
+            }
+
+            const bcReg =
+              watchOpts.bcReg !== undefined && watchOpts.bcReg !== null
+                ? String(watchOpts.bcReg).trim()
+                : null;
+            if (bcReg !== null) {
+              if (!bcReg) throw new TypeError("emu.vm.watchRegfile bcReg cannot be empty");
+              __native.regGetBigInt(emuId, bcReg);
+            }
+            const bcDeref = Boolean(watchOpts.bcDeref);
+            const bcPtrAddr =
+              watchOpts.bcPtrAddr !== undefined && watchOpts.bcPtrAddr !== null
+                ? watchOpts.bcPtrAddr
+                : null;
+            if (bcReg !== null && bcPtrAddr !== null) {
+              throw new TypeError("emu.vm.watchRegfile bcReg and bcPtrAddr are mutually exclusive");
+            }
+            if (bcDeref && bcReg === null) {
+              throw new TypeError("emu.vm.watchRegfile bcDeref: true requires bcReg");
+            }
+
+            const layout = watchOpts.layout !== undefined && watchOpts.layout !== null ? watchOpts.layout : null;
+            if (layout !== null) {
+              // 提前校验 layout 合法性
+              this.decodeWord(0n, layout);
+            }
+            if (watchOpts.onStep !== undefined && typeof watchOpts.onStep !== "function") {
+              throw new TypeError("emu.vm.watchRegfile onStep must be a function");
+            }
+            const onStep = watchOpts.onStep || null;
+            const selfVm = this;
+
+            let prevBase = null;
+            let prevVals = null;
+            let prevBcPc = null;
+            let prevEv = null;
+            let stepNo = 0;
+            const events = [];
+            const opStats = new Map();
+
+            const readSlotBytes = (memNs, addr, nBytes) => {
+              try {
+                return memNs.readBytes(addr, nBytes);
+              } catch (_) {
+                return null;
+              }
+            };
+
+            const hookId = __native.hookCode(emuId, range[0], range[1], -1, (ctx, pc) => {
+              const base = ctx.reg64(baseReg);
+              const baseRelocated = prevBase !== null && base !== prevBase;
+              const byteLen = count * size;
+              const rawBytes = readSlotBytes(ctx.mem, base, byteLen);
+              const diffs = [];
+              let curVals = null;
+
+              if (rawBytes && rawBytes.length === byteLen) {
+                curVals = new Array(count);
+                const dv = new DataView(rawBytes.buffer, rawBytes.byteOffset, rawBytes.byteLength);
+                for (let i = 0; i < count; i++) {
+                  const val =
+                    size === 8
+                      ? dv.getBigUint64(i * 8, true)
+                      : BigInt(dv.getUint32(i * 4, true));
+                  curVals[i] = val;
+                  if (prevVals !== null && !baseRelocated && prevVals[i] !== val) {
+                    diffs.push({
+                      reg: i,
+                      name: `R[${i}]`,
+                      oldVal: prevVals[i],
+                      newVal: val,
+                      oldHex: "0x" + prevVals[i].toString(16),
+                      newHex: "0x" + val.toString(16),
+                    });
+                  }
+                }
+              }
+
+              let bcPc = null;
+              if (bcPtrAddr !== null) {
+                const b = readSlotBytes(ctx.mem, bcPtrAddr, 8);
+                if (b && b.length === 8) {
+                  bcPc = new DataView(b.buffer, b.byteOffset, 8).getBigUint64(0, true);
+                }
+              } else if (bcReg) {
+                const rVal = ctx.reg64(bcReg);
+                if (bcDeref) {
+                  const b = readSlotBytes(ctx.mem, rVal, 8);
+                  if (b && b.length === 8) {
+                    bcPc = new DataView(b.buffer, b.byteOffset, 8).getBigUint64(0, true);
+                  }
+                } else {
+                  bcPc = rVal;
+                }
+              }
+
+              // 使用独立 prevEv 回填上一步 bcStep 与 opStats，避免超 maxSteps 后反复覆写 events 末项！
+              if (bcPc !== null && prevBcPc !== null && prevEv !== null) {
+                const delta = Number(bcPc - prevBcPc);
+                prevEv.bcStep = delta;
+                if (prevEv.opHex !== null && prevEv.opHex !== undefined) {
+                  const st = opStats.get(prevEv.opHex);
+                  if (st) {
+                    st.stepHist[delta] = (st.stepHist[delta] || 0) + 1;
+                  }
+                }
+              }
+
+              let rawWord = null;
+              let decoded = null;
+              if (bcPc !== null) {
+                const wb = readSlotBytes(ctx.mem, bcPc, wordSize);
+                if (wb && wb.length === wordSize) {
+                  const wdv = new DataView(wb.buffer, wb.byteOffset, wb.byteLength);
+                  if (wordSize === 8) rawWord = wdv.getBigUint64(0, true);
+                  else if (wordSize === 4) rawWord = BigInt(wdv.getUint32(0, true));
+                  else if (wordSize === 2) rawWord = BigInt(wdv.getUint16(0, true));
+                  else rawWord = BigInt(wb[0]);
+                  if (layout) {
+                    decoded = selfVm.decodeWord(rawWord, layout);
+                  }
+                }
+              }
+
+              const ev = {
+                step: stepNo++,
+                pc,
+                pcHex: "0x" + pc.toString(16),
+                base,
+                baseHex: "0x" + base.toString(16),
+                prevBase: baseRelocated ? prevBase : null,
+                baseRelocated,
+                bcPc,
+                bcPcHex: bcPc !== null ? "0x" + bcPc.toString(16) : null,
+                bcStep: null,
+                rawWord,
+                rawWordHex: rawWord !== null ? "0x" + rawWord.toString(16) : null,
+                op: decoded ? decoded.op : null,
+                opHex: decoded ? decoded.opHex : null,
+                fields: decoded ? decoded.fields : null,
+                fieldsHex: decoded ? decoded.fieldsHex : null,
+                decodedText: decoded ? decoded.text : null,
+                diffs,
+              };
+
+              if (decoded) {
+                let st = opStats.get(decoded.opHex);
+                if (!st) {
+                  st = { op: decoded.op, opHex: decoded.opHex, hits: 0, stepHist: {} };
+                  opStats.set(decoded.opHex, st);
+                }
+                st.hits++;
+              }
+
+              if (events.length < maxSteps) {
+                events.push(ev);
+              }
+              prevBase = base;
+              prevVals = curVals; // 若本次读取失败则为 null，绝不会留下全 undefined 数组！
+              prevBcPc = bcPc;
+              prevEv = ev;
+              if (onStep) {
+                onStep(ev);
+              }
+            });
+
+            const baseHandle = makeHookHandle(emuId, hookId);
+            return {
+              id: baseHandle.id,
+              detach: baseHandle.detach,
+              events() {
+                return events;
+              },
+              stats() {
+                return Array.from(opStats.values()).sort((a, b) => b.hits - a.hits);
+              },
+              format(limit = 200) {
+                if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 0) {
+                  throw new RangeError("watcher.format(limit) expects a non-negative integer");
+                }
+                return events
+                  .slice(0, limit)
+                  .map((e) => {
+                    const bc = e.bcPcHex
+                      ? e.bcStep !== null
+                        ? ` bc=${e.bcPcHex}(${e.bcStep >= 0 ? "+" : ""}${e.bcStep}B)`
+                        : ` bc=${e.bcPcHex}`
+                      : "";
+                    const dec = e.decodedText
+                      ? ` ${e.decodedText}`
+                      : e.rawWordHex
+                        ? ` word=${e.rawWordHex}`
+                        : "";
+                    const reloc = e.baseRelocated ? ` [REGFILE->${e.baseHex}]` : "";
+                    const ds =
+                      e.diffs.length > 0
+                        ? " | " + e.diffs.map((d) => `${d.name}: ${d.oldHex}->${d.newHex}`).join(", ")
+                        : "";
+                    return `step#${String(e.step).padStart(4, "0")}${bc}${dec}${reloc}${ds}`;
+                  })
+                  .join("\n");
+              },
+            };
+          },
+        },
         record: {
           start(opts = {}) {
             const o = opts || {};
@@ -1157,6 +1491,9 @@
         },
         taintBackward(opts) {
           return __native.traceTaint(traceId, "backward", opts || {});
+        },
+        vmAnalyze(opts) {
+          return __native.traceVmAnalyze(traceId, opts || {});
         },
         close() {
           return __native.traceClose(traceId);

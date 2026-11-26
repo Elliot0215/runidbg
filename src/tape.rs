@@ -1123,7 +1123,9 @@ fn encode_chunk_payload(out: &mut Vec<u8>, c: &TapeCheckpointChunk) -> EmuResult
     for v in &c.vmas {
         w.u64(v.start);
         w.u64(v.end);
-        w.u32(v.perms.0);
+        #[allow(clippy::unnecessary_cast)]
+        let perms_u32 = v.perms.0 as u32;
+        w.u32(perms_u32);
         w.str(&v.label)?;
         w.u64(v.file_offset);
     }
@@ -1493,7 +1495,9 @@ fn decode_chunk_payload(r: &mut BinReader<'_>, is_delta: bool) -> EmuResult<Tape
                 ".rtape VMA 区间非法: [0x{start:x}, 0x{end:x})"
             )));
         }
-        if (perms_raw & !Prot::ALL.0) != 0 {
+        #[allow(clippy::unnecessary_cast)]
+        let all_perms_u32 = Prot::ALL.0 as u32;
+        if (perms_raw & !all_perms_u32) != 0 {
             return Err(EmuError::Backend(format!(
                 ".rtape VMA 权限位非法: 0x{perms_raw:x}"
             )));
@@ -1505,10 +1509,12 @@ fn decode_chunk_payload(r: &mut BinReader<'_>, is_delta: bool) -> EmuResult<Tape
                 ".rtape VMA 总映射页数超过安全上限".to_string(),
             ));
         }
+        #[allow(clippy::unnecessary_cast)]
+        let perms = Prot(perms_raw as _);
         vmas.push(VmaRegion {
             start,
             end,
-            perms: Prot(perms_raw),
+            perms,
             label,
             file_offset,
         });

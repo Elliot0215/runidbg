@@ -58,6 +58,9 @@ fn print_usage() {
            runidbg-cli diff <a.idx> <b.idx> [--ext-a <a.ext>] [--ext-b <b.ext>] [--base <hex>] [--limit N]\n\
            runidbg-cli taint <trace.idx> [--ext <trace.ext>] [--mode <forward|backward>] (--addr <hex> [--len N] | --reg <x0>)\n\
                      [--at <idx>] [--max-insns N] [--limit N] [--base <hex>] [--no-mem-index] [--track-sp]\n\
+           runidbg-cli vm <trace.idx> [--ext <trace.ext>] [--dispatcher <hex>] [--bc-reg <x23>] [--bc-deref]\n\
+                     [--bc-addr <hex>] [--base-reg <x25>] [--reg-count 32] [--reg-size 8]\n\
+                     [--layout <op_lsb:w,f0_lsb[:w],...>] [--min-handlers N] [--min-dispatches N] [--base <hex>] [--limit N] [--max-insns N]\n\
            runidbg-cli stats <trace.idx> [--base <hex>] [--top N]\n\
            runidbg-cli calltree <trace.idx> [--base <hex>] [--max-depth N] [--min-insns N]\n\
            runidbg-cli crypto-scan <trace.idx> [--ext <trace.ext>] [--base <hex>]\n\
@@ -797,6 +800,132 @@ fn taint_command(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn vm_command(args: &[String]) -> Result<()> {
+    let usage = "用法: runidbg-cli vm <trace.idx> [--ext <trace.ext>] [--dispatcher <hex>] [--bc-reg <x23>] [--bc-deref] [--bc-addr <hex>] [--base-reg <x25>] [--reg-count 32] [--reg-size 8] [--layout <op_lsb:w,f0_lsb[:w],...>] [--min-handlers N] [--min-dispatches N] [--base <hex>] [--limit N] [--max-insns N]";
+    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help") {
+        if args.is_empty() {
+            bail!("{usage}");
+        }
+        eprintln!("{usage}");
+        return Ok(());
+    }
+    let idx_path = PathBuf::from(&args[0]);
+    let mut ext_path: Option<PathBuf> = None;
+    let mut opts = runidbg_arm64_emu_tracer::tracer::VmAnalysisOptions::default();
+    let mut base_reg_name: Option<String> = None;
+    let mut reg_count: usize = 32;
+    let mut reg_size: u8 = 8;
+    let mut base_addr: u64 = 0;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ext" => {
+                ext_path = Some(PathBuf::from(take_flag_value(args, &mut i, "vm", "--ext")?));
+            }
+            "--dispatcher" => {
+                let v = take_flag_value(args, &mut i, "vm", "--dispatcher")?;
+                opts.dispatcher_pc = Some(parse_u64_hex_or_dec(v)?);
+            }
+            "--bc-reg" => {
+                let v = take_flag_value(args, &mut i, "vm", "--bc-reg")?;
+                let slot = runidbg_arm64_emu_tracer::tracer::parse_gpr_slot(v)
+                    .ok_or_else(|| anyhow::anyhow!("无效的 --bc-reg 寄存器名: {v}"))?;
+                opts.bc_reg = Some(slot);
+            }
+            "--bc-deref" => {
+                opts.bc_deref = true;
+                i += 1;
+            }
+            "--bc-addr" => {
+                let v = take_flag_value(args, &mut i, "vm", "--bc-addr")?;
+                opts.bc_ptr_addr = Some(parse_u64_hex_or_dec(v)?);
+            }
+            "--base-reg" => {
+                base_reg_name = Some(take_flag_value(args, &mut i, "vm", "--base-reg")?.to_string());
+            }
+            "--reg-count" => {
+                let v = take_flag_value(args, &mut i, "vm", "--reg-count")?;
+                reg_count = v.parse::<usize>().context("无效的 --reg-count 值")?;
+                if reg_count == 0 || reg_count > 256 {
+                    bail!("--reg-count 必须在 1..=256 之间");
+                }
+            }
+            "--reg-size" => {
+                let v = take_flag_value(args, &mut i, "vm", "--reg-size")?;
+                reg_size = v.parse::<u8>().context("无效的 --reg-size 值")?;
+                if reg_size != 4 && reg_size != 8 {
+                    bail!("--reg-size 仅支持 4 或 8");
+                }
+            }
+            "--layout" => {
+                let v = take_flag_value(args, &mut i, "vm", "--layout")?;
+                let layout = runidbg_arm64_emu_tracer::tracer::VmWordLayout::parse_spec(v)
+                    .map_err(|e| anyhow::anyhow!("无效的 --layout: {e}"))?;
+                opts.layout = Some(layout);
+            }
+            "--min-handlers" => {
+                let v = take_flag_value(args, &mut i, "vm", "--min-handlers")?;
+                let mh = v.parse::<usize>().context("无效的 --min-handlers 值")?;
+                if mh == 0 {
+                    bail!("--min-handlers 必须 >= 1");
+                }
+                opts.min_handlers = mh;
+            }
+            "--min-dispatches" => {
+                let v = take_flag_value(args, &mut i, "vm", "--min-dispatches")?;
+                let md = v.parse::<usize>().context("无效的 --min-dispatches 值")?;
+                if md == 0 {
+                    bail!("--min-dispatches 必须 >= 1");
+                }
+                opts.min_dispatches = md;
+            }
+            "--max-insns" => {
+                let v = take_flag_value(args, &mut i, "vm", "--max-insns")?;
+                opts.max_insns = v.parse().context("无效的 --max-insns 值")?;
+            }
+            "--limit" => {
+                let v = take_flag_value(args, &mut i, "vm", "--limit")?;
+                let lim = v.parse::<usize>().context("无效的 --limit 值")?;
+                if lim == 0 {
+                    bail!("--limit 必须 >= 1");
+                }
+                opts.max_steps = lim;
+            }
+            "--base" => {
+                let v = take_flag_value(args, &mut i, "vm", "--base")?;
+                base_addr = parse_u64_hex_or_dec(v)?;
+            }
+            other => bail!("vm 未知参数: {other}"),
+        }
+    }
+
+    if opts.bc_reg.is_some() && opts.bc_ptr_addr.is_some() {
+        bail!("vm 的 --bc-reg 与 --bc-addr 互斥，请只提供其中一个");
+    }
+    if opts.bc_deref && opts.bc_reg.is_none() {
+        bail!("vm 的 --bc-deref 必须配合 --bc-reg 使用");
+    }
+
+    if let Some(ref br) = base_reg_name {
+        let base_reg = runidbg_arm64_emu_tracer::tracer::parse_gpr_slot(br)
+            .ok_or_else(|| anyhow::anyhow!("无效的 --base-reg 寄存器名: {br}"))?;
+        opts.regfile = Some(runidbg_arm64_emu_tracer::tracer::VmRegfileConfig {
+            base_reg,
+            count: reg_count,
+            size: reg_size,
+        });
+    }
+
+    if ext_path.is_none() {
+        ext_path = runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path(&idx_path);
+    }
+    let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+    let report = reader.analyze_vm(&opts);
+    print!("{}", report.format_summary(base_addr));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let raw_args: Vec<String> = env::args().collect();
     let mut log_level: Option<String> = None;
@@ -846,6 +975,7 @@ fn main() -> Result<()> {
         "tape" => return tape_command(&args[2..]),
         "diff" => return diff_command(&args[2..]),
         "taint" => return taint_command(&args[2..]),
+        "vm" => return vm_command(&args[2..]),
         "ui" => return ui_command(&args[2..]),
         "init-types" => return init_types_command(&args[2..]),
         "-h" | "--help" | "help" => {
