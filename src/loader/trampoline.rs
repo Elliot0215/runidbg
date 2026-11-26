@@ -1779,12 +1779,13 @@ where
             let alloc_sz = x2.max(1);
             let raw = {
                 let (_, mem, _) = get_state(uc.get_data_mut());
-                mem.alloc_heap(alignment + 16 + alloc_sz).unwrap_or(0)
+                mem.alloc_heap_aligned_with_header(alloc_sz, alignment)
+                    .unwrap_or(0)
             };
             if raw != 0 && x0 != 0 {
-                let aligned = align_up(raw + 16, alignment);
-                let _ = uc.mem_write(aligned - 16, &0x4845_4150_424C_4B31u64.to_le_bytes());
-                let _ = uc.mem_write(aligned - 8, &alloc_sz.to_le_bytes());
+                let aligned = raw + 16;
+                let _ = uc.mem_write(raw, &0x4845_4150_424C_4B31u64.to_le_bytes());
+                let _ = uc.mem_write(raw + 8, &alloc_sz.to_le_bytes());
                 let _ = uc.mem_write(x0, &aligned.to_le_bytes());
                 let (tramp, mem, _) = get_state(uc.get_data_mut());
                 mem.record_heap_alloc(aligned, alloc_sz, caller_pc, "posix_memalign");
@@ -1799,6 +1800,10 @@ where
                 });
                 0
             } else {
+                if raw != 0 {
+                    let (_, mem, _) = get_state(uc.get_data_mut());
+                    mem.free_heap(raw);
+                }
                 12 // ENOMEM
             }
         }
@@ -2122,11 +2127,14 @@ where
             let mut out = formatted.as_bytes().to_vec();
             out.push(0);
             let alloc_sz = out.len() as u64;
-            let ptr = {
+            let raw = {
                 let (_, mem, _) = get_state(uc.get_data_mut());
-                mem.alloc_heap(alloc_sz).unwrap_or(0)
+                mem.alloc_heap(16 + alloc_sz).unwrap_or(0)
             };
-            if ptr != 0 {
+            if raw != 0 {
+                let _ = uc.mem_write(raw, &0x4845_4150_424C_4B31u64.to_le_bytes());
+                let _ = uc.mem_write(raw + 8, &alloc_sz.to_le_bytes());
+                let ptr = raw + 16;
                 let _ = uc.mem_write(ptr, &out);
                 if x0 != 0 {
                     let _ = uc.mem_write(x0, &ptr.to_le_bytes());
@@ -2154,11 +2162,14 @@ where
             let mut out = formatted.as_bytes().to_vec();
             out.push(0);
             let alloc_sz = out.len() as u64;
-            let ptr = {
+            let raw = {
                 let (_, mem, _) = get_state(uc.get_data_mut());
-                mem.alloc_heap(alloc_sz).unwrap_or(0)
+                mem.alloc_heap(16 + alloc_sz).unwrap_or(0)
             };
-            if ptr != 0 {
+            if raw != 0 {
+                let _ = uc.mem_write(raw, &0x4845_4150_424C_4B31u64.to_le_bytes());
+                let _ = uc.mem_write(raw + 8, &alloc_sz.to_le_bytes());
+                let ptr = raw + 16;
                 let _ = uc.mem_write(ptr, &out);
                 if x0 != 0 {
                     let _ = uc.mem_write(x0, &ptr.to_le_bytes());
@@ -2612,7 +2623,7 @@ where
                     "srand()/srandom() 当前作用于确定性 PRNG 桩实现（xorshift64*，非真 glibc TYPE_3 状态机）；如需特定序列请用 emu.hook.importReplace(\"rand\", ...) 替换"
                 );
             }
-            vfs.seed_random(x0);
+            vfs.seed_random((x0 as u32) as u64);
             0
         }
         HleBuiltin::Arc4RandomBuf => {
@@ -2778,12 +2789,14 @@ where
             let size = x1.max(1);
             let raw = {
                 let (_, mem, _) = get_state(uc.get_data_mut());
-                mem.alloc_heap(size + align).unwrap_or(0)
+                mem.alloc_heap_aligned_with_header(size, align).unwrap_or(0)
             };
             if raw == 0 {
                 0
             } else {
-                let aligned = align_up(raw, align);
+                let _ = uc.mem_write(raw, &0x4845_4150_424C_4B31u64.to_le_bytes());
+                let _ = uc.mem_write(raw + 8, &size.to_le_bytes());
+                let aligned = raw + 16;
                 let (tramp, mem, _) = get_state(uc.get_data_mut());
                 mem.record_heap_alloc(aligned, size, caller_pc, "memalign");
                 tramp.push_hle_event(crate::tracer::HleOpEvent {

@@ -412,9 +412,14 @@ fn tape_command(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn take_flag_value<'a>(args: &'a [String], i: &mut usize, flag: &str) -> Result<&'a str> {
+fn take_flag_value<'a>(
+    args: &'a [String],
+    i: &mut usize,
+    cmd: &str,
+    flag: &str,
+) -> Result<&'a str> {
     if *i + 1 >= args.len() || args[*i + 1].starts_with("--") {
-        bail!("debug 参数 `{flag}` 缺少参数值");
+        bail!("{cmd} 参数 `{flag}` 缺少参数值");
     }
     let val = args[*i + 1].as_str();
     *i += 2;
@@ -436,20 +441,20 @@ fn debug_gdb_command(args: &[String]) -> Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--listen" => {
-                listen_addr = take_flag_value(args, &mut i, "--listen")?.to_string();
+                listen_addr = take_flag_value(args, &mut i, "debug", "--listen")?.to_string();
             }
             "--pkg" => {
-                pkg = Some(take_flag_value(args, &mut i, "--pkg")?.to_string());
+                pkg = Some(take_flag_value(args, &mut i, "debug", "--pkg")?.to_string());
             }
             "--tape" => {
-                tape_path = Some(PathBuf::from(take_flag_value(args, &mut i, "--tape")?));
+                tape_path = Some(PathBuf::from(take_flag_value(args, &mut i, "debug", "--tape")?));
             }
             "--checkpoint" => {
-                let raw = take_flag_value(args, &mut i, "--checkpoint")?;
+                let raw = take_flag_value(args, &mut i, "debug", "--checkpoint")?;
                 checkpoint_sel = Some(runidbg_arm64_emu_tracer::TapeSelector::parse(raw));
             }
             "--backend" => {
-                let raw = take_flag_value(args, &mut i, "--backend")?;
+                let raw = take_flag_value(args, &mut i, "debug", "--backend")?;
                 let kind: runidbg_arm64_emu_tracer::BackendKind = raw.parse()?;
                 if !kind.supports_gdb() {
                     bail!(
@@ -619,19 +624,19 @@ fn diff_command(args: &[String]) -> Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--ext-a" => {
-                let v = take_flag_value(args, &mut i, "--ext-a")?;
+                let v = take_flag_value(args, &mut i, "diff", "--ext-a")?;
                 a_ext = Some(PathBuf::from(v));
             }
             "--ext-b" => {
-                let v = take_flag_value(args, &mut i, "--ext-b")?;
+                let v = take_flag_value(args, &mut i, "diff", "--ext-b")?;
                 b_ext = Some(PathBuf::from(v));
             }
             "--base" => {
-                let v = take_flag_value(args, &mut i, "--base")?;
+                let v = take_flag_value(args, &mut i, "diff", "--base")?;
                 base_addr = parse_u64_hex_or_dec(v)?;
             }
             "--limit" => {
-                let v = take_flag_value(args, &mut i, "--limit")?;
+                let v = take_flag_value(args, &mut i, "diff", "--limit")?;
                 limit = v.parse::<usize>().context("无效的 --limit 值")?;
                 if limit == 0 {
                     bail!("--limit 必须 >= 1");
@@ -641,16 +646,10 @@ fn diff_command(args: &[String]) -> Result<()> {
         }
     }
     if a_ext.is_none() {
-        let sib = a_idx.with_extension("ext");
-        if sib != a_idx && sib.is_file() {
-            a_ext = Some(sib);
-        }
+        a_ext = runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path(&a_idx);
     }
     if b_ext.is_none() {
-        let sib = b_idx.with_extension("ext");
-        if sib != b_idx && sib.is_file() {
-            b_ext = Some(sib);
-        }
+        b_ext = runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path(&b_idx);
     }
     let ra = TraceReader::open(&a_idx, a_ext.as_deref())?;
     let rb = TraceReader::open(&b_idx, b_ext.as_deref())?;
@@ -710,43 +709,43 @@ fn taint_command(args: &[String]) -> Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--ext" => {
-                let v = take_flag_value(args, &mut i, "--ext")?;
+                let v = take_flag_value(args, &mut i, "taint", "--ext")?;
                 ext_path = Some(PathBuf::from(v));
             }
             "--mode" => {
-                let v = take_flag_value(args, &mut i, "--mode")?;
+                let v = take_flag_value(args, &mut i, "taint", "--mode")?;
                 mode = v.to_ascii_lowercase();
             }
             "--addr" => {
-                let v = take_flag_value(args, &mut i, "--addr")?;
+                let v = take_flag_value(args, &mut i, "taint", "--addr")?;
                 target_addr = Some(parse_u64_hex_or_dec(v)?);
             }
             "--len" => {
-                let v = take_flag_value(args, &mut i, "--len")?;
+                let v = take_flag_value(args, &mut i, "taint", "--len")?;
                 target_len = v.parse::<usize>().context("无效的 --len 值")?;
                 if target_len == 0 {
                     bail!("--len 必须 >= 1");
                 }
             }
             "--reg" => {
-                let v = take_flag_value(args, &mut i, "--reg")?;
+                let v = take_flag_value(args, &mut i, "taint", "--reg")?;
                 target_reg = Some(v.to_string());
             }
             "--at" | "--start" => {
                 let flag = args[i].as_str();
-                let v = take_flag_value(args, &mut i, flag)?;
+                let v = take_flag_value(args, &mut i, "taint", flag)?;
                 anchor_idx = Some(v.parse().context("无效的 --at 值")?);
             }
             "--max-insns" => {
-                let v = take_flag_value(args, &mut i, "--max-insns")?;
+                let v = take_flag_value(args, &mut i, "taint", "--max-insns")?;
                 max_insns = v.parse().context("无效的 --max-insns 值")?;
             }
             "--limit" => {
-                let v = take_flag_value(args, &mut i, "--limit")?;
+                let v = take_flag_value(args, &mut i, "taint", "--limit")?;
                 limit = v.parse().context("无效的 --limit 值")?;
             }
             "--base" => {
-                let v = take_flag_value(args, &mut i, "--base")?;
+                let v = take_flag_value(args, &mut i, "taint", "--base")?;
                 base_addr = parse_u64_hex_or_dec(v)?;
             }
             "--no-mem-index" => {
@@ -779,10 +778,7 @@ fn taint_command(args: &[String]) -> Result<()> {
     };
 
     if ext_path.is_none() {
-        let sib = idx_path.with_extension("ext");
-        if sib != idx_path && sib.is_file() {
-            ext_path = Some(sib);
-        }
+        ext_path = runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path(&idx_path);
     }
     let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
     let opts = runidbg_arm64_emu_tracer::tracer::TaintOptions {
@@ -882,67 +878,71 @@ fn main() -> Result<()> {
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
-            "--ext" if i + 1 < args.len() => {
-                ext_path = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
+            "--ext" => {
+                ext_path = Some(PathBuf::from(take_flag_value(&args, &mut i, cmd, "--ext")?));
             }
-            "--skip" if i + 1 < args.len() => {
-                skip = args[i + 1].parse().context("无效的 --skip 值")?;
-                i += 2;
+            "--skip" => {
+                skip = take_flag_value(&args, &mut i, cmd, "--skip")?
+                    .parse()
+                    .context("无效的 --skip 值")?;
             }
-            "--limit" if i + 1 < args.len() => {
-                limit = args[i + 1].parse().context("无效的 --limit 值")?;
-                i += 2;
+            "--limit" => {
+                limit = take_flag_value(&args, &mut i, cmd, "--limit")?
+                    .parse()
+                    .context("无效的 --limit 值")?;
             }
-            "--val" if i + 1 < args.len() => {
-                val_filter = Some(parse_u64_hex_or_dec(&args[i + 1])?);
-                i += 2;
+            "--val" => {
+                val_filter = Some(parse_u64_hex_or_dec(take_flag_value(
+                    &args, &mut i, cmd, "--val",
+                )?)?);
             }
-            "--addr" if i + 1 < args.len() => {
-                addr_filter = Some(parse_u64_hex_or_dec(&args[i + 1])?);
-                i += 2;
+            "--addr" => {
+                addr_filter = Some(parse_u64_hex_or_dec(take_flag_value(
+                    &args, &mut i, cmd, "--addr",
+                )?)?);
             }
-            "--pc" if i + 1 < args.len() => {
-                pc_filter = Some(parse_u64_hex_or_dec(&args[i + 1])?);
-                i += 2;
+            "--pc" => {
+                pc_filter = Some(parse_u64_hex_or_dec(take_flag_value(
+                    &args, &mut i, cmd, "--pc",
+                )?)?);
             }
-            "--ascii" if i + 1 < args.len() => {
-                ascii_filter = Some(args[i + 1].clone());
-                i += 2;
+            "--ascii" => {
+                ascii_filter = Some(take_flag_value(&args, &mut i, cmd, "--ascii")?.to_string());
             }
-            "--bytes" if i + 1 < args.len() => {
-                bytes_filter = Some(parse_hex_bytes(&args[i + 1])?);
-                i += 2;
+            "--bytes" => {
+                bytes_filter = Some(parse_hex_bytes(take_flag_value(
+                    &args, &mut i, cmd, "--bytes",
+                )?)?);
             }
-            "--base" if i + 1 < args.len() => {
-                base_addr = parse_u64_hex_or_dec(&args[i + 1])?;
-                i += 2;
+            "--base" => {
+                base_addr = parse_u64_hex_or_dec(take_flag_value(
+                    &args, &mut i, cmd, "--base",
+                )?)?;
             }
-            "--top" if i + 1 < args.len() => {
-                top_n = args[i + 1].parse().context("无效的 --top 值")?;
-                i += 2;
+            "--top" => {
+                top_n = take_flag_value(&args, &mut i, cmd, "--top")?
+                    .parse()
+                    .context("无效的 --top 值")?;
             }
-            "--max-depth" if i + 1 < args.len() => {
-                max_depth = args[i + 1].parse().context("无效的 --max-depth 值")?;
-                i += 2;
+            "--max-depth" => {
+                max_depth = take_flag_value(&args, &mut i, cmd, "--max-depth")?
+                    .parse()
+                    .context("无效的 --max-depth 值")?;
             }
-            "--min-insns" if i + 1 < args.len() => {
-                min_insns = args[i + 1].parse().context("无效的 --min-insns 值")?;
-                i += 2;
+            "--min-insns" => {
+                min_insns = take_flag_value(&args, &mut i, cmd, "--min-insns")?
+                    .parse()
+                    .context("无效的 --min-insns 值")?;
             }
-            "--out" if i + 1 < args.len() => {
-                out_path = Some(PathBuf::from(&args[i + 1]));
-                i += 2;
+            "--out" => {
+                out_path = Some(PathBuf::from(take_flag_value(&args, &mut i, cmd, "--out")?));
             }
             other => bail!("未知参数: {other}"),
         }
     }
 
     if ext_path.is_none() {
-        let sibling = idx_path.with_extension("ext");
-        if sibling != idx_path && sibling.is_file() {
-            ext_path = Some(sibling);
-        }
+        ext_path = runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path(&idx_path);
     }
 
     let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
@@ -992,6 +992,16 @@ fn main() -> Result<()> {
             }
         }
         "search" | "find" => {
+            if val_filter.is_none()
+                && ascii_filter.is_none()
+                && bytes_filter.is_none()
+                && addr_filter.is_none()
+                && pc_filter.is_none()
+            {
+                bail!(
+                    "{cmd} 需要至少提供一个过滤条件：--val <hex> / --addr <hex> / --pc <hex> / --ascii <str> / --bytes <hex>"
+                );
+            }
             if let Some(target) = val_filter {
                 let reg_hits = reader.search_value_attributed(target);
                 println!("# 命中寄存器写入值 0x{target:016x}: {} 条", reg_hits.len());

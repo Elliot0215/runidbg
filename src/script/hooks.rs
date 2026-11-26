@@ -416,7 +416,7 @@ impl JsNativeHookTable {
                     (value as u64) & width_mask
                 };
                 if let Some(exp_val) = filter.value {
-                    if val_u64 != (exp_val & width_mask) {
+                    if val_u64 != exp_val {
                         return true;
                     }
                 }

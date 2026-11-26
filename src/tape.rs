@@ -1948,34 +1948,49 @@ fn decode_chunk_payload(r: &mut BinReader<'_>, is_delta: bool) -> EmuResult<Tape
 
     let mut host_scratch = None;
     let mut freeze_layout = None;
-    if r.remaining() >= 4 {
+    if r.remaining() > 0 {
         let tag = r.u32()?;
-        if tag == 0x5343_5254 {
-            let fl = r.bool()?;
-            let s_base = r.u64()?;
-            let s_size = r.u64()?;
-            let s_cursor = r.u64()?;
-            let s_in_use = r.u64()?;
-            let (sf_len, sf_cap) = r.read_count(16)?;
-            let mut s_free = Vec::with_capacity(sf_cap);
-            for _ in 0..sf_len {
-                s_free.push((r.u64()?, r.u64()?));
-            }
-            let (sa_len, sa_cap) = r.read_count(16)?;
-            let mut s_alloc = Vec::with_capacity(sa_cap);
-            for _ in 0..sa_len {
-                s_alloc.push((r.u64()?, r.u64()?));
-            }
-            host_scratch = Some(BumpAllocator::from_raw(crate::memory::BumpAllocatorRaw {
-                base: s_base,
-                size: s_size,
-                cursor: s_cursor,
-                free_blocks: s_free,
-                allocated: s_alloc,
-                in_use: s_in_use,
-            }));
-            freeze_layout = Some(fl);
+        if tag != 0x5343_5254 {
+            return Err(EmuError::Backend(format!(
+                "无效的 checkpoint 尾部扩展块魔数: 0x{tag:08x}"
+            )));
         }
+        let fl = r.bool()?;
+        let s_base = r.u64()?;
+        let s_size = r.u64()?;
+        let s_cursor = r.u64()?;
+        let s_in_use = r.u64()?;
+        let s_end = s_base.checked_add(s_size).ok_or_else(|| {
+            EmuError::Backend("SCRT 尾部块 host_scratch base+size 溢出".into())
+        })?;
+        if s_base != crate::memory::HOST_SCRATCH_BASE
+            || s_size != crate::memory::HOST_SCRATCH_SIZE
+            || s_cursor < s_base
+            || s_cursor > s_end
+        {
+            return Err(EmuError::Backend(format!(
+                "SCRT 尾部块 host_scratch 元数据越界: base=0x{s_base:x}, size=0x{s_size:x}, cursor=0x{s_cursor:x}"
+            )));
+        }
+        let (sf_len, sf_cap) = r.read_count(16)?;
+        let mut s_free = Vec::with_capacity(sf_cap);
+        for _ in 0..sf_len {
+            s_free.push((r.u64()?, r.u64()?));
+        }
+        let (sa_len, sa_cap) = r.read_count(16)?;
+        let mut s_alloc = Vec::with_capacity(sa_cap);
+        for _ in 0..sa_len {
+            s_alloc.push((r.u64()?, r.u64()?));
+        }
+        host_scratch = Some(BumpAllocator::from_raw(crate::memory::BumpAllocatorRaw {
+            base: s_base,
+            size: s_size,
+            cursor: s_cursor,
+            free_blocks: s_free,
+            allocated: s_alloc,
+            in_use: s_in_use,
+        }));
+        freeze_layout = Some(fl);
     }
 
     Ok(TapeCheckpointChunk {

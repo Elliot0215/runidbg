@@ -87,6 +87,8 @@ pub struct BinaryTracer {
     /// 最近一条已记录指令的 `seq_low32` 与 `pc`（供内存 R/W Hook 关联）
     last_seq_low32: u32,
     last_pc: u64,
+    /// 防止 `finalize()` 与 `Drop` 重复输出截断告警
+    truncation_warned: bool,
     pub stats: TraceStats,
 }
 
@@ -114,6 +116,7 @@ impl BinaryTracer {
             initialized: false,
             last_seq_low32: 0,
             last_pc: 0,
+            truncation_warned: false,
             stats: TraceStats::default(),
         }
     }
@@ -121,7 +124,8 @@ impl BinaryTracer {
     /// 创建基于 `memmap2` 的单流零拷贝落盘 Tracer（`trace.idx`）
     pub fn new_mmap(path: impl AsRef<Path>, max_records: usize) -> EmuResult<Self> {
         let path_buf = path.as_ref().to_path_buf();
-        let mmap = create_mmap_file(&path_buf, max_records * size_of::<TraceRecord>())?;
+        let total_bytes = checked_mmap_bytes(max_records, size_of::<TraceRecord>())?;
+        let mmap = create_mmap_file(&path_buf, total_bytes)?;
         Ok(Self {
             sink: TraceSink::Mmap {
                 path: path_buf,
@@ -137,6 +141,7 @@ impl BinaryTracer {
             initialized: false,
             last_seq_low32: 0,
             last_pc: 0,
+            truncation_warned: false,
             stats: TraceStats::default(),
         })
     }
@@ -151,8 +156,10 @@ impl BinaryTracer {
     ) -> EmuResult<Self> {
         let idx_buf = idx_path.as_ref().to_path_buf();
         let ext_buf = ext_path.as_ref().to_path_buf();
-        let idx_mmap = create_mmap_file(&idx_buf, max_idx_records * size_of::<TraceRecord>())?;
-        let ext_mmap = create_mmap_file(&ext_buf, max_ext_records * size_of::<ExtRecord>())?;
+        let idx_bytes = checked_mmap_bytes(max_idx_records, size_of::<TraceRecord>())?;
+        let ext_bytes = checked_mmap_bytes(max_ext_records, size_of::<ExtRecord>())?;
+        let idx_mmap = create_mmap_file(&idx_buf, idx_bytes)?;
+        let ext_mmap = create_mmap_file(&ext_buf, ext_bytes)?;
 
         Ok(Self {
             sink: TraceSink::Mmap {
@@ -174,6 +181,7 @@ impl BinaryTracer {
             initialized: false,
             last_seq_low32: 0,
             last_pc: 0,
+            truncation_warned: false,
             stats: TraceStats::default(),
         })
     }
@@ -463,7 +471,8 @@ impl BinaryTracer {
 
     /// 刷盘、解除内存映射并将 `.idx` / `.ext` 文件精确截断至实际写入字节数（消除尾部零填充）
     pub fn finalize(&mut self) -> EmuResult<()> {
-        if self.stats.dropped_insns > 0 || self.stats.dropped_ext > 0 {
+        if !self.truncation_warned && (self.stats.dropped_insns > 0 || self.stats.dropped_ext > 0) {
+            self.truncation_warned = true;
             tracing::warn!(
                 target: "runidbg::trace",
                 recorded_insns = self.stats.recorded_insns,
@@ -538,6 +547,23 @@ impl Drop for BinaryTracer {
     }
 }
 
+fn checked_mmap_bytes(max_records: usize, elem_size: usize) -> EmuResult<usize> {
+    let total = max_records.checked_mul(elem_size).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Trace 容量过大导致字节数溢出: max_records={max_records}"),
+        )
+    })?;
+    if total > isize::MAX as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Trace mmap 大小超出平台寻址上限: {total} bytes"),
+        )
+        .into());
+    }
+    Ok(total)
+}
+
 fn create_mmap_file(path: impl AsRef<Path>, total_bytes: usize) -> EmuResult<MmapMut> {
     let file = OpenOptions::new()
         .read(true)
@@ -545,9 +571,17 @@ fn create_mmap_file(path: impl AsRef<Path>, total_bytes: usize) -> EmuResult<Mma
         .create(true)
         .truncate(true)
         .open(path)?;
-    file.set_len(total_bytes.max(32) as u64)?;
+    let map_len = total_bytes.max(32);
+    file.set_len(map_len as u64)?;
     // SAFETY: 文件已创建并扩展到固定长度，且当前进程独占写入该映射区
     let mmap = unsafe { MmapMut::map_mut(&file)? };
+    if mmap.len() < total_bytes {
+        return Err(std::io::Error::other(format!(
+            "mmap 实际长度 ({}) 小于请求大小 ({total_bytes})",
+            mmap.len()
+        ))
+        .into());
+    }
     Ok(mmap)
 }
 
@@ -565,7 +599,7 @@ where
     let hook_id = uc.add_code_hook(begin, end, move |uc, addr, size| {
         let level = {
             let tracer = get_tracer(uc.get_data_mut());
-            if !tracer.should_trace(addr) {
+            if !tracer.is_active() || !tracer.should_trace(addr) {
                 return;
             }
             tracer.level()

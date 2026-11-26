@@ -672,7 +672,7 @@ async function loadDump(skip, highlightIdx = -1) {
     if (item.mems) {
       for (const m of item.mems) {
         const cls =
-          m.includes("[MEM W") || m.includes("[HLE memcpy") || m.includes("[HLE memmove") || m.includes("[HLE memset") || m.includes("[HLE bzero")
+          m.includes("[MEM W") || m.includes("[HLE memcpy") || m.includes("[HLE memmove") || m.includes("[HLE realloc_copy") || m.includes("[HLE memset") || m.includes("[HLE bzero") || m.includes("[HLE calloc_zero")
             ? "mem-w"
             : "mem-r";
         rows.push(`<div class="mem-row"><span class="${cls}">${esc(m)}</span></div>`);

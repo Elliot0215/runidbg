@@ -94,19 +94,56 @@ impl BumpAllocator {
 
     /// 按指定对齐要求分配内存（优先复用空闲链表中合适块，不足时再推进游标）
     pub fn alloc(&mut self, size: u64, align: u64) -> EmuResult<u64> {
-        let align = align.max(1).next_power_of_two();
-        let alloc_size = align_up(size.max(1), 16);
+        self.alloc_with_prefix(0, size, align)
+    }
+
+    /// 分配带前置块头（如 16B `HEAPBLK1`）的对齐块：保证返回地址 `raw` 满足 `(raw + prefix) % align == 0`，
+    /// 使 `free(payload - prefix)` 精确回收原始块，彻底避免对齐分配泄漏或错释放相邻块。
+    pub fn alloc_with_prefix(&mut self, prefix: u64, size: u64, align: u64) -> EmuResult<u64> {
+        let limit = self.base + self.size;
+        let available = limit.saturating_sub(self.cursor);
+        let align = align
+            .max(1)
+            .checked_next_power_of_two()
+            .filter(|&a| a <= self.size)
+            .ok_or(EmuError::OutOfMemory {
+                requested: size,
+                available,
+            })?;
+        let total_req = prefix
+            .checked_add(size.max(1))
+            .ok_or(EmuError::OutOfMemory {
+                requested: size,
+                available,
+            })?;
+        let alloc_size = total_req
+            .checked_add(15)
+            .map(|v| v & !15u64)
+            .ok_or(EmuError::OutOfMemory {
+                requested: size,
+                available,
+            })?;
+
+        let align_raw_for = |start: u64| -> Option<u64> {
+            let with_prefix = start.checked_add(prefix)?;
+            let payload = with_prefix.checked_add(align - 1)? & !(align - 1);
+            payload.checked_sub(prefix)
+        };
 
         // 1. 优先从 free_blocks 查找满足对齐与大小的空闲块（Best-Fit 降低碎片）
-        let mut best: Option<(u64, u64, u64)> = None; // (block_start, block_size, aligned_start)
+        let mut best: Option<(u64, u64, u64)> = None; // (block_start, block_size, raw_start)
         for (&b_start, &b_size) in &self.free_blocks {
-            let aligned = align_up(b_start, align);
+            let Some(raw_start) = align_raw_for(b_start) else {
+                continue;
+            };
             let b_end = b_start.saturating_add(b_size);
-            let req_end = aligned.saturating_add(alloc_size);
+            let Some(req_end) = raw_start.checked_add(alloc_size) else {
+                continue;
+            };
             if req_end <= b_end {
                 let waste = b_size - alloc_size;
                 if best.is_none_or(|(_, prev_sz, _)| b_size < prev_sz) {
-                    best = Some((b_start, b_size, aligned));
+                    best = Some((b_start, b_size, raw_start));
                     if waste == 0 {
                         break;
                     }
@@ -114,47 +151,54 @@ impl BumpAllocator {
             }
         }
 
-        if let Some((b_start, b_size, aligned)) = best {
+        if let Some((b_start, b_size, raw_start)) = best {
             self.free_blocks.remove(&b_start);
             let b_end = b_start + b_size;
-            let req_end = aligned + alloc_size;
+            let req_end = raw_start + alloc_size;
             // 前置对齐空隙放回空闲表
-            if aligned > b_start {
-                self.free_blocks.insert(b_start, aligned - b_start);
+            if raw_start > b_start {
+                self.free_blocks.insert(b_start, raw_start - b_start);
             }
             // 后置剩余块 >= 16 字节则切分放回空闲表，否则并入本次分配避免极小碎片
             let actual_size = if b_end - req_end >= 16 {
                 self.free_blocks.insert(req_end, b_end - req_end);
                 alloc_size
             } else {
-                b_end - aligned
+                b_end - raw_start
             };
-            self.allocated.insert(aligned, actual_size);
+            self.allocated.insert(raw_start, actual_size);
             self.in_use = self.in_use.saturating_add(actual_size);
-            return Ok(aligned);
+            return Ok(raw_start);
         }
 
         // 2. 空闲链表无可用块时，从线性前沿 cursor 分配
-        let aligned = align_up(self.cursor, align);
-        let end = aligned.saturating_add(alloc_size);
-        let limit = self.base + self.size;
+        let raw_start = align_raw_for(self.cursor).ok_or(EmuError::OutOfMemory {
+            requested: size,
+            available,
+        })?;
+        let end = raw_start
+            .checked_add(alloc_size)
+            .ok_or(EmuError::OutOfMemory {
+                requested: size,
+                available,
+            })?;
 
         if end > limit {
             return Err(EmuError::OutOfMemory {
                 requested: size,
-                available: limit.saturating_sub(self.cursor),
+                available,
             });
         }
 
         // 若因高对齐跳过了前段空隙，顺手纳入空闲表供小块复用
-        if aligned > self.cursor && aligned - self.cursor >= 16 {
-            self.insert_and_coalesce(self.cursor, aligned - self.cursor);
+        if raw_start > self.cursor && raw_start - self.cursor >= 16 {
+            self.insert_and_coalesce(self.cursor, raw_start - self.cursor);
         }
 
         self.cursor = end;
-        self.allocated.insert(aligned, alloc_size);
+        self.allocated.insert(raw_start, alloc_size);
         self.in_use = self.in_use.saturating_add(alloc_size);
-        Ok(aligned)
+        Ok(raw_start)
     }
 
     /// 回收先前分配的块并与前后相邻空闲块自动合并；若触达堆顶则同步回缩 `cursor`
@@ -627,6 +671,12 @@ impl MemoryManager {
     /// 从模拟堆中按自定义对齐分配内存
     pub fn alloc_heap_aligned(&mut self, size: u64, align: u64) -> EmuResult<u64> {
         self.heap.alloc(size, align)
+    }
+
+    /// 为 `posix_memalign`/`memalign` 分配带 16B `HEAPBLK1` 前置头的对齐块，返回头地址 `raw`（用户指针为 `raw + 16`，严格按 `align` 对齐且可被 `hle_free`/`realloc` 精确回收）
+    pub fn alloc_heap_aligned_with_header(&mut self, size: u64, align: u64) -> EmuResult<u64> {
+        self.heap
+            .alloc_with_prefix(HEAP_HEADER_SIZE, size.max(1), align.max(16))
     }
 
     /// 释放由 `alloc_heap` / `alloc_heap_aligned` 或 `alloc_host_scratch` 分配的原始堆块

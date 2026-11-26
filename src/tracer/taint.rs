@@ -1008,10 +1008,6 @@ impl TraceReader {
                 InsnCategory::Call => {
                     // BL/BLR 写入返回地址到 LR(X30)，清除 LR 污点
                     reg_taint[30] = 0;
-                    // 若本次调用命中定义新返回值的 HLE（如 malloc/calloc/realloc/free），清除 X0 旧污点
-                    if hle_evts.iter().any(|h| hle_defines_fresh_x0(h.op)) {
-                        reg_taint[0] = 0;
-                    }
                 }
                 InsnCategory::ConstDef => {
                     for &d in &sem.dst_regs {
@@ -1334,9 +1330,12 @@ impl TraceReader {
                 }
             }
 
-            // 应用附着在当前指令序号上的 HLE 批量拷贝/清零事件（彻底补齐 HLE 黑盒断链！）
+            // 应用附着在当前指令序号上的 HLE 批量拷贝/清零与新返回值事件（兼容 BL/BLR、.plt BR X17、尾调用 B 及跳板 RET）
             for hle in &hle_evts {
                 apply_hle_forward(hle, idx, seq, &mut mem_taint, &mut push_step);
+            }
+            if hle_evts.iter().any(|h| hle_defines_fresh_x0(h.op)) {
+                reg_taint[0] = 0;
             }
         }
 
@@ -1437,10 +1436,32 @@ impl TraceReader {
             let opcode = rec.opcode;
             let seq = rec.seq_low32;
 
-            // 1. 逆序先处理附着在本条指令上的 HLE 批量拷贝/清零事件
+            // 1. 逆序先处理附着在本条指令上的 HLE 批量拷贝/清零与新返回值事件（兼容 BL/BLR、.plt BR X17、尾调用 B 及跳板 RET）
             let hle_evts = self.hle_events_for(idx);
             for hle in hle_evts.iter().rev() {
                 apply_hle_backward(hle, idx, seq, &mut wanted_mem, &mut push_step);
+            }
+            if wanted_regs[0] {
+                if let Some(hle) = hle_evts.iter().rev().find(|h| hle_defines_fresh_x0(h.op)) {
+                    wanted_regs[0] = false;
+                    let fallback = match hle.op {
+                        "posix_memalign" | "free" | "bzero" => Some(0),
+                        _ => Some(hle.dst),
+                    };
+                    let ret_val = lookup_reg_delta(self, idx, 0).or(fallback);
+                    let (hle_asm, _) = decode_semantics(opcode, pc, track_sp);
+                    push_step(TaintStep {
+                        idx,
+                        seq,
+                        pc,
+                        asm: hle_asm,
+                        kind: "hle_ret",
+                        sources: vec![format!("HLE {}(len={})", hle.op, hle.len)],
+                        dests: vec!["X0".to_string()],
+                        tag_mask: 0,
+                        value: ret_val,
+                    });
+                }
             }
 
             if wanted_mem.is_empty() && !wanted_regs.iter().any(|&w| w) {
@@ -1460,32 +1481,13 @@ impl TraceReader {
                             idx,
                             seq,
                             pc,
-                            asm: asm.clone(),
+                            asm,
                             kind: "const",
                             sources: vec![format!("const(pc+4=0x{:x})", pc.wrapping_add(4))],
                             dests: vec!["X30".to_string()],
                             tag_mask: 0,
                             value: Some(pc.wrapping_add(4)),
                         });
-                    }
-                    // 若本次 Call 执行了返回新指针/状态码的 HLE（如 malloc/calloc/realloc/free），在此终止 X0 回溯，不穿透到 size 参数
-                    if wanted_regs[0] {
-                        if let Some(hle) = hle_evts.iter().rev().find(|h| hle_defines_fresh_x0(h.op))
-                        {
-                            wanted_regs[0] = false;
-                            let ret_val = lookup_reg_delta(self, idx, 0).or(Some(hle.dst));
-                            push_step(TaintStep {
-                                idx,
-                                seq,
-                                pc,
-                                asm,
-                                kind: "hle_ret",
-                                sources: vec![format!("HLE {}(len={})", hle.op, hle.len)],
-                                dests: vec!["X0".to_string()],
-                                tag_mask: 0,
-                                value: ret_val,
-                            });
-                        }
                     }
                 }
                 InsnCategory::ConstDef => {

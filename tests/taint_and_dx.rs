@@ -1005,3 +1005,273 @@ fn test_js_highbit_bigint_and_mem_read_filter_regression() {
 
     let _ = std::fs::remove_dir_all(&tmp_dir);
 }
+
+#[test]
+fn test_second_pass_core_and_taint_regressions() {
+    use runidbg_arm64_emu_tracer::backend::BackendWithData;
+    use runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path;
+
+    // 1. mmap 容量乘法溢出必须安全返回 Err，严禁 Release 静默回绕导致越界写 UB
+    let tmp = std::env::temp_dir().join(format!("runidbg_p2_core_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let ovf_idx = tmp.join("ovf.idx");
+    let ovf_ext = tmp.join("ovf.ext");
+    assert!(BinaryTracer::new_mmap(&ovf_idx, usize::MAX / 4).is_err());
+    assert!(BinaryTracer::new_dual_mmap(&ovf_idx, &ovf_ext, 1024, usize::MAX / 4, TraceLevel::Full).is_err());
+
+    // 2. resolve_sibling_ext_path 同时支持 a.idx -> a.ext 与 a.bin -> a.bin.ext
+    let bin_idx = tmp.join("custom.bin");
+    let bin_ext = tmp.join("custom.bin.ext");
+    std::fs::write(&bin_idx, b"").unwrap();
+    std::fs::write(&bin_ext, b"").unwrap();
+    assert_eq!(resolve_sibling_ext_path(&bin_idx).as_deref(), Some(bin_ext.as_path()));
+
+    // 3. aligned_with_header + hle_free 精确回收且不泄漏/不破坏相邻块
+    let mut emu = AndroidEmulator::builder().hle_accel(true).build().expect("emu");
+    {
+        let mem = &mut emu.cpu_mut().get_data_mut().mem;
+        let in_use_before = mem.heap_used();
+        let raw_a = mem.alloc_heap_aligned_with_header(32, 64).expect("aligned 64");
+        let ptr_a = raw_a + 16;
+        assert_eq!(ptr_a % 64, 0, "user pointer must be 64-byte aligned");
+        let raw_b = mem.alloc_heap_aligned_with_header(48, 256).expect("aligned 256");
+        let ptr_b = raw_b + 16;
+        assert_eq!(ptr_b % 256, 0, "user pointer must be 256-byte aligned");
+        assert!(mem.hle_free(ptr_b));
+        assert!(mem.hle_free(ptr_a));
+        assert_eq!(mem.heap_used(), in_use_before, "aligned blocks must be reclaimed with zero leak");
+    }
+
+    // 4. HLE asprintf + memalign 带 16B HEAPBLK1 头：free(b) 不错杀存活相邻块 a，realloc 完整保留数据
+    let code_base: u64 = 0x4600_0000;
+    let data_base: u64 = 0x4610_0000;
+    emu.cpu_mut().mem_map(code_base, 0x4000, Prot::ALL).unwrap();
+    emu.cpu_mut().mem_map(data_base, 0x4000, Prot::READ | Prot::WRITE).unwrap();
+    let fmt_addr = data_base;
+    let strp_a = data_base + 0x100;
+    let strp_b = data_base + 0x108;
+    emu.cpu_mut().mem_write(fmt_addr, b"hello\0").unwrap();
+    let asprintf_slot = emu.register_hle_builtin("asprintf", HleBuiltin::Asprintf).unwrap();
+    let realloc_slot = emu.register_hle_builtin("realloc", HleBuiltin::Realloc).unwrap();
+    let free_slot = emu.register_hle_builtin("free", HleBuiltin::Free).unwrap();
+    let memalign_slot = emu.register_hle_builtin("memalign", HleBuiltin::Memalign).unwrap();
+
+    let mut insns: Vec<u32> = vec![
+        0xAA1E_03FB, // mov x27, x30
+        0xAA00_03F3, // mov x19, x0 (fmt_addr)
+        0xAA01_03F4, // mov x20, x1 (strp_a)
+        0xAA02_03F5, // mov x21, x2 (strp_b)
+        // asprintf(strp_a, fmt_addr)
+        0xAA14_03E0, // mov x0, x20
+        0xAA13_03E1, // mov x1, x19
+    ];
+    emit_blr_target(&mut insns, asprintf_slot);
+    insns.extend_from_slice(&[
+        // asprintf(strp_b, fmt_addr)
+        0xAA15_03E0, // mov x0, x21
+        0xAA13_03E1, // mov x1, x19
+    ]);
+    emit_blr_target(&mut insns, asprintf_slot);
+    insns.extend_from_slice(&[
+        // free(*strp_b) — 必须仅释放 b，不得错释放 a
+        0xF940_02A0, // ldr x0, [x21]
+    ]);
+    emit_blr_target(&mut insns, free_slot);
+    insns.extend_from_slice(&[
+        // x22 = realloc(*strp_a, 32) — 必须拷贝 "hello\0"
+        0xF940_0280, // ldr x0, [x20]
+        0xD280_0401, // mov x1, #32
+    ]);
+    emit_blr_target(&mut insns, realloc_slot);
+    insns.extend_from_slice(&[
+        0xAA00_03F6, // mov x22, x0
+        // x0 = memalign(64, 32) -> 写入后 realloc 到 64 字节
+        0xD280_0800, // mov x0, #64
+        0xD280_0401, // mov x1, #32
+    ]);
+    emit_blr_target(&mut insns, memalign_slot);
+    insns.extend_from_slice(&[
+        0xAA00_03F7, // mov x23, x0
+        0xAA16_03E0, // mov x0, x22 (return realloc'd asprintf ptr)
+        0xAA1B_03FE, // mov x30, x27
+        0xD65F_03C0, // ret
+    ]);
+    write_insns(&mut emu, code_base, &insns);
+    let realloc_ptr = emu.call_address(code_base, &[fmt_addr, strp_a, strp_b]).unwrap();
+    let mut got = [0u8; 6];
+    emu.cpu().mem_read(realloc_ptr, &mut got).unwrap();
+    assert_eq!(&got, b"hello\0", "realloc on asprintf buffer must preserve payload");
+
+    // 5. .plt 风格 BR X17 跳入 malloc：前向必须清除 X0 旧污点，反向切片必须在 hle_ret 终止不穿透到 size
+    let (plt_idx, plt_ext) = temp_trace_paths("taint_plt_br");
+    let malloc_slot = emu.register_hle_builtin("malloc", HleBuiltin::Malloc).unwrap();
+    let plt_code = code_base + 0x1000;
+    let plt_stub = code_base + 0x1800;
+    let out_slot = data_base + 0x300;
+    // plt_stub: movz/movk x17, malloc_slot; br x17 (InsnCategory::NoDataFlow!)
+    let mut stub_insns: Vec<u32> = vec![
+        0xD280_0011 | (((malloc_slot & 0xFFFF) as u32) << 5),
+        0xF2A0_0011 | ((((malloc_slot >> 16) & 0xFFFF) as u32) << 5),
+        0xF2C0_0011 | ((((malloc_slot >> 32) & 0xFFFF) as u32) << 5),
+        0xD61F_0220, // br x17
+    ];
+    write_insns(&mut emu, plt_stub, &stub_insns);
+    let _ = &mut stub_insns;
+
+    let mut caller_insns: Vec<u32> = vec![
+        0xAA1E_03FB, // mov x27, x30
+        0xAA01_03F4, // mov x20, x1 (out_slot)
+        // x0 初始带污点（malloc size），通过 BL plt_stub -> BR x17 -> HLE malloc
+    ];
+    emit_blr_target(&mut caller_insns, plt_stub);
+    caller_insns.extend_from_slice(&[
+        0xF900_0280, // str x0, [x20]
+        0xAA1B_03FE, // mov x30, x27
+        0xD65F_03C0, // ret
+    ]);
+    write_insns(&mut emu, plt_code, &caller_insns);
+
+    let tracer = BinaryTracer::new_dual_mmap(&plt_idx, &plt_ext, 4096, 16384, TraceLevel::Full).unwrap();
+    emu.set_tracer(tracer).unwrap();
+    emu.attach_tracer(plt_code, plt_code + 0x1000).unwrap();
+    emu.call_address(plt_code, &[64, out_slot]).unwrap();
+    emu.tracer().flush().unwrap();
+
+    let reader = TraceReader::open(&plt_idx, Some(&plt_ext)).unwrap();
+    let fwd = reader.taint_forward(&TaintSeed::Reg { reg_id: 0 }, &TaintOptions::default());
+    assert!(
+        !fwd.tainted_mem_ranges.iter().any(|&(a, _, _)| a == out_slot),
+        "BR X17 PLT malloc must clear tainted size X0 before STR [out_slot]: {:?}",
+        fwd.tainted_mem_ranges
+    );
+    let bwd = reader.taint_backward(&TaintSeed::Mem { addr: out_slot, len: 8 }, &TaintOptions::default());
+    assert!(
+        bwd.steps.iter().any(|s| s.kind == "hle_ret"),
+        "backward slice through PLT BR X17 malloc must terminate at hle_ret: {:?}",
+        bwd.steps
+    );
+    assert!(
+        bwd.tainted_regs.is_empty(),
+        "backward slice must not leak past PLT malloc hle_ret into size arg: {:?}",
+        bwd.tainted_regs
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
+    let _ = std::fs::remove_dir_all(plt_idx.parent().unwrap());
+}
+
+#[cfg(all(feature = "js", feature = "mcp"))]
+#[test]
+fn test_second_pass_js_watch_filter_and_validation_regressions() {
+    use runidbg_arm64_emu_tracer::script::JsSession;
+
+    let tmp_dir = std::env::temp_dir().join(format!("runidbg_js_p2_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    let idx_path = tmp_dir.join("p2.bin"); // 非 .idx 后缀，顺便测 .bin -> .bin.ext 自动发现
+    let so_path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("samples/libstatic-webp.so");
+    let so_str = so_path.to_string_lossy().into_owned();
+    let idx_str = idx_path.to_string_lossy().into_owned();
+
+    let session = JsSession::new(&[], &tmp_dir, true).expect("session");
+    let script = format!(
+        r#"(() => {{
+            const emu = Emu.create({{ freezeLayout: true }});
+            const mod = emu.load({so_str:?});
+            const fnAddr = mod.symbol("WebPGetDecoderVersion");
+            const buf = emu.mem.alloc(64);
+            emu.mem.writeU64(buf, 0x11223344n);
+
+            // ldrb w9, [x0]; strb wzr, [x0, #1]; str w9, [x0, #8]; ret
+            const insns = new Uint32Array([0x39400009, 0x3900041F, 0xB9000809, 0xD65F03C0]);
+            emu.mem.patch(fnAddr, new Uint8Array(insns.buffer));
+
+            // 1. watch({{ mode: "write" }}) 绝不能被 "write".includes("r") 误判成读！
+            let objWriteModeReadHits = 0;
+            let objWriteModeWriteHits = 0;
+            const h1 = emu.hook.watch([buf, buf + 16], {{ mode: "write" }}, (ctx, access) => {{
+                if (access === "read") objWriteModeReadHits++;
+                if (access === "write") objWriteModeWriteHits++;
+            }});
+
+            // 2. watch({{ read: true }}) 绝不能被默认注入 write: true！
+            let objReadOnlyReadHits = 0;
+            let objReadOnlyWriteHits = 0;
+            const h2 = emu.hook.watch([buf, buf + 16], {{ read: true }}, (ctx, access) => {{
+                if (access === "read") objReadOnlyReadHits++;
+                if (access === "write") objReadOnlyWriteHits++;
+            }});
+
+            // 3. hook.mem({{ write: true, value: 0x100 }}) 绝不能被 STRB WZR (1B 写 0x00) 误命中！
+            let narrowFalseHits = 0;
+            const h3 = emu.hook.mem([buf, buf + 16], {{ write: true, value: 0x100 }}, () => {{
+                narrowFalseHits++;
+            }});
+
+            // 4. 非法 mode 必须抛 TypeError
+            let badModeThrew = false;
+            try {{ emu.hook.watch([buf, buf + 16], {{ mode: "error" }}, () => {{}}); }} catch (e) {{ badModeThrew = true; }}
+
+            // 5. trace.start 超大 capacity (2**58) 必须抛错而不是 mmap 乘法溢出 UB
+            let hugeCapThrew = false;
+            try {{ emu.trace.start({{ output: {idx_str:?}, level: "full", capacity: 2 ** 58 }}); }} catch (e) {{ hugeCapThrew = true; }}
+
+            // 6. js_addr_to_u64_strict 必须拒绝 > Number.MAX_SAFE_INTEGER 的 JS number（防止 2^64 静默饱和/丢精度）
+            let unsafeNumThrew = false;
+            try {{ emu.hook.mem([buf, buf + 16], {{ write: true, value: 2 ** 64 }}, () => {{}}); }} catch (e) {{ unsafeNumThrew = true; }}
+
+            emu.trace.start({{ output: {idx_str:?}, level: "full", start: fnAddr, end: fnAddr + 16, capacity: 2048 }});
+            emu.call(fnAddr, buf);
+            emu.trace.stop();
+            h1.detach();
+            h2.detach();
+            h3.detach();
+
+            // 7. Trace.open("p2.bin") 自动发现 p2.bin.ext + 互斥校验 + reconstructMem(len=0) + minSeq on addr
+            const tr = Trace.open({idx_str:?});
+            let mutexThrew = false;
+            try {{ tr.query({{ value: 0x44, addr: buf }}); }} catch (e) {{ mutexThrew = true; }}
+            let badRegTypeThrew = false;
+            try {{ tr.taintBackward({{ reg: 123 }}); }} catch (e) {{ badRegTypeThrew = true; }}
+            const emptyRec = tr.reconstructMem(buf, 0);
+            const allAddrHits = tr.query({{ addr: buf, len: 16 }});
+            const minSeqFiltered = tr.query({{ addr: buf, len: 16, minSeq: 999999 }});
+            const extLen = tr.totalExt;
+            tr.close();
+
+            return {{
+                objWriteModeReadHits,
+                objWriteModeWriteHits,
+                objReadOnlyReadHits,
+                objReadOnlyWriteHits,
+                narrowFalseHits,
+                badModeThrew,
+                hugeCapThrew,
+                unsafeNumThrew,
+                mutexThrew,
+                badRegTypeThrew,
+                emptyRecLen: emptyRec.bytes.length,
+                allAddrHits: allAddrHits.length,
+                minSeqFiltered: minSeqFiltered.length,
+                extLen,
+            }};
+        }})()"#
+    );
+    let out = session.eval_json_string(&script).expect("p2 js regression");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["objWriteModeReadHits"], 0);
+    assert_eq!(v["objWriteModeWriteHits"], 2);
+    assert_eq!(v["objReadOnlyReadHits"], 1);
+    assert_eq!(v["objReadOnlyWriteHits"], 0);
+    assert_eq!(v["narrowFalseHits"], 0);
+    assert_eq!(v["badModeThrew"], true);
+    assert_eq!(v["hugeCapThrew"], true);
+    assert_eq!(v["unsafeNumThrew"], true);
+    assert_eq!(v["mutexThrew"], true);
+    assert_eq!(v["badRegTypeThrew"], true);
+    assert_eq!(v["emptyRecLen"], 0);
+    assert!(v["allAddrHits"].as_u64().unwrap() >= 3);
+    assert_eq!(v["minSeqFiltered"], 0);
+    assert!(v["extLen"].as_u64().unwrap() >= 3);
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}

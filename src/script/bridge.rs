@@ -268,6 +268,12 @@ fn js_addr_to_u64_strict<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> rquickjs::Resul
         if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
             return Err(throw_err(ctx, "地址必须为非负整数"));
         }
+        if n > 9_007_199_254_740_991.0 {
+            return Err(throw_err(
+                ctx,
+                "数值超过 JS Number 安全整数上限 (2^53 - 1)，会丢失低位精度；请改用 BigInt (0x...n) 或十六进制字符串 (\"0x...\")",
+            ));
+        }
         return Ok(n as u64);
     }
     if let Some(s) = v.as_string().and_then(|js| js.to_string().ok()) {
@@ -288,6 +294,12 @@ fn js_addr_to_u64_strict<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> rquickjs::Resul
 fn require_nonneg_int(ctx: &Ctx<'_>, v: f64, name: &str) -> rquickjs::Result<u64> {
     if !v.is_finite() || v < 0.0 || v.fract() != 0.0 {
         return Err(throw_err(ctx, format!("{name} 必须为非负整数")));
+    }
+    if v > 9_007_199_254_740_991.0 {
+        return Err(throw_err(
+            ctx,
+            format!("{name} 超过 JS Number 安全整数上限 (2^53 - 1)"),
+        ));
     }
     Ok(v as u64)
 }
@@ -3305,8 +3317,17 @@ pub(super) fn register_native_bridge<'js>(
                       level_str: String,
                       start: f64,
                       end: f64,
-                      capacity: usize|
+                      capacity: f64|
                       -> rquickjs::Result<()> {
+                    const MAX_JS_TRACE_CAPACITY: u64 = 100_000_000;
+                    let cap_u64 = require_nonneg_int(&ctx, capacity, "capacity")?;
+                    if cap_u64 > MAX_JS_TRACE_CAPACITY {
+                        return Err(throw_err(
+                            &ctx,
+                            format!("trace capacity 超过上限 ({MAX_JS_TRACE_CAPACITY}): {cap_u64}"),
+                        ));
+                    }
+                    let cap = (cap_u64 as usize).max(1024);
                     let mut h = host.try_borrow_mut().map_err(|_| {
         throw_err(
             &ctx,
@@ -3332,7 +3353,14 @@ pub(super) fn register_native_bridge<'js>(
                         _ => TraceLevel::RegDelta,
                     };
                     let mut tracer = if output.is_empty() {
-                        BinaryTracer::new_in_memory_with_level(capacity.max(1024), level)
+                        const MAX_IN_MEM_CAPACITY: usize = 8_000_000;
+                        if cap > MAX_IN_MEM_CAPACITY {
+                            return Err(throw_err(
+                                &ctx,
+                                format!("纯内存模式 trace capacity 超过上限 ({MAX_IN_MEM_CAPACITY})，请指定 output 文件路径"),
+                            ));
+                        }
+                        BinaryTracer::new_in_memory_with_level(cap, level)
                     } else if level == TraceLevel::Full {
                         let ext = if output.ends_with(".idx") {
                             Path::new(&output)
@@ -3342,7 +3370,6 @@ pub(super) fn register_native_bridge<'js>(
                         } else {
                             format!("{output}.ext")
                         };
-                        let cap = capacity.max(1024);
                         BinaryTracer::new_dual_mmap(
                             &output,
                             &ext,
@@ -3352,7 +3379,7 @@ pub(super) fn register_native_bridge<'js>(
                         )
                         .map_err(|e| throw_err(&ctx, e))?
                     } else {
-                        let mut t = BinaryTracer::new_mmap(&output, capacity.max(1024))
+                        let mut t = BinaryTracer::new_mmap(&output, cap)
                             .map_err(|e| throw_err(&ctx, e))?;
                         t.set_level(level);
                         t
@@ -4684,8 +4711,7 @@ pub(super) fn register_native_bridge<'js>(
                     let resolved_ext = if let Some(ep) = ext_opt {
                         Some(std::path::PathBuf::from(ep))
                     } else {
-                        let sib = idx_p.with_extension("ext");
-                        (sib != idx_p && sib.is_file()).then_some(sib)
+                        crate::tracer::resolve_sibling_ext_path(&idx_p)
                     };
                     let reader = crate::tracer::TraceReader::open(&idx_p, resolved_ext.as_deref())
                         .map_err(|e| throw_err(&ctx, e))?;
@@ -4763,6 +4789,10 @@ pub(super) fn register_native_bridge<'js>(
                         .get::<_, Value<'js>>("addr")
                         .ok()
                         .filter(|v| !v.is_undefined() && !v.is_null());
+                    if val_opt.is_some() && addr_opt.is_some() {
+                        return Err(throw_err(&ctx, "trace.query 的 value 与 addr 参数互斥，请只提供其中一个"));
+                    }
+                    let upper_seq = max_seq.or(at_seq);
 
                     let hits = if let Some(v) = val_opt {
                         let target = js_addr_to_u64_strict(&ctx, &v)?;
@@ -4777,7 +4807,7 @@ pub(super) fn register_native_bridge<'js>(
                             })
                             .map(|w| (w.clamp(1.0, 8.0)) as u8)
                             .unwrap_or_else(|| if target > u32::MAX as u64 { 8 } else { 4 });
-                        reader.query_writes_by_value(target, width, min_seq, max_seq.or(at_seq), limit)
+                        reader.query_writes_by_value(target, width, min_seq, upper_seq, limit)
                     } else if let Some(av) = addr_opt {
                         let addr = js_addr_to_u64_strict(&ctx, &av)?;
                         let len = opts
@@ -4787,7 +4817,14 @@ pub(super) fn register_native_bridge<'js>(
                             .map(|l| l as u64)
                             .unwrap_or(1);
                         let writes_only: bool = opts.get("writesOnly").unwrap_or(false);
-                        reader.query_addr_history(addr, len, at_seq.or(max_seq), writes_only, limit)
+                        reader.query_addr_history_in_range(
+                            addr,
+                            len,
+                            min_seq,
+                            upper_seq,
+                            writes_only,
+                            limit,
+                        )
                     } else {
                         return Err(throw_err(&ctx, "trace.query 需要提供 value 或 addr 参数"));
                     };
@@ -4864,7 +4901,7 @@ pub(super) fn register_native_bridge<'js>(
                       at_seq_val: Value<'js>|
                       -> rquickjs::Result<Object<'js>> {
                     let addr = js_addr_to_u64_strict(&ctx, &addr_val)?;
-                    let byte_len = require_nonneg_int(&ctx, len, "len")?.clamp(1, 65536) as usize;
+                    let byte_len = require_nonneg_int(&ctx, len, "len")?.min(65536) as usize;
                     let seq = if at_seq_val.is_undefined() || at_seq_val.is_null() {
                         u32::MAX
                     } else {
@@ -4876,6 +4913,15 @@ pub(super) fn register_native_bridge<'js>(
                         .get(trace_id)
                         .and_then(Option::as_ref)
                         .ok_or_else(|| throw_err(&ctx, "无效或已关闭的 traceId"))?;
+                    if byte_len == 0 {
+                        let out = Object::new(ctx.clone())?;
+                        out.set("addrHex", format!("0x{addr:016x}"))?;
+                        out.set("atSeq", seq as f64)?;
+                        out.set("knownBytes", 0.0f64)?;
+                        out.set("hex", "")?;
+                        out.set("bytes", TypedArray::new(ctx.clone(), Vec::<u8>::new())?)?;
+                        return Ok(out);
+                    }
                     let bytes = reader.reconstruct_mem_at(addr, byte_len, seq);
                     let mut hex = String::with_capacity(byte_len * 2);
                     let mut known = 0usize;
@@ -4916,15 +4962,27 @@ pub(super) fn register_native_bridge<'js>(
                       mode: String,
                       opts: Object<'js>|
                       -> rquickjs::Result<Object<'js>> {
-                    let seed = if let Ok(reg_name) = opts.get::<_, String>("reg") {
+                    let reg_val = opts
+                        .get::<_, Value<'js>>("reg")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null());
+                    let addr_val = opts
+                        .get::<_, Value<'js>>("addr")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null());
+                    if reg_val.is_some() && addr_val.is_some() {
+                        return Err(throw_err(&ctx, "taint 的 addr 与 reg 参数互斥，请只提供其中一个"));
+                    }
+                    let seed = if let Some(rv) = reg_val {
+                        let reg_name = rv
+                            .as_string()
+                            .and_then(|s| s.to_string().ok())
+                            .ok_or_else(|| throw_err(&ctx, "taint 参数 reg 必须为字符串"))?;
                         let slot = crate::tracer::parse_reg_slot(&reg_name).ok_or_else(|| {
                             throw_err(&ctx, format!("无效的寄存器名: {reg_name}"))
                         })?;
                         crate::tracer::TaintSeed::Reg { reg_id: slot }
-                    } else if let Ok(av) = opts.get::<_, Value<'js>>("addr") {
-                        if av.is_undefined() || av.is_null() {
-                            return Err(throw_err(&ctx, "taint 需要提供 addr 或 reg 参数"));
-                        }
+                    } else if let Some(av) = addr_val {
                         let addr = js_addr_to_u64_strict(&ctx, &av)?;
                         let len = opts
                             .get::<_, f64>("len")
@@ -5067,11 +5125,11 @@ pub(super) fn register_native_bridge<'js>(
                       -> rquickjs::Result<Object<'js>> {
                     let pa = std::path::PathBuf::from(&idx_a);
                     let pb = std::path::PathBuf::from(&idx_b);
-                    let ea = pa.with_extension("ext");
-                    let eb = pb.with_extension("ext");
-                    let ra = crate::tracer::TraceReader::open(&pa, (ea != pa && ea.is_file()).then_some(ea.as_path()))
+                    let ea = crate::tracer::resolve_sibling_ext_path(&pa);
+                    let eb = crate::tracer::resolve_sibling_ext_path(&pb);
+                    let ra = crate::tracer::TraceReader::open(&pa, ea.as_deref())
                         .map_err(|e| throw_err(&ctx, e))?;
-                    let rb = crate::tracer::TraceReader::open(&pb, (eb != pb && eb.is_file()).then_some(eb.as_path()))
+                    let rb = crate::tracer::TraceReader::open(&pb, eb.as_deref())
                         .map_err(|e| throw_err(&ctx, e))?;
                     let cap = if max_diffs.is_finite() && max_diffs > 0.0 {
                         max_diffs as usize

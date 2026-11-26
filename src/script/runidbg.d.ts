@@ -919,9 +919,15 @@ interface TraceReaderHandle {
   /** 离线全知内存/值查询（内置替代手写 numpy 扫描 `.idx`/`.ext`） */
   query(opts: TraceQueryOptions): TraceQueryHit[];
   /** 值溯源便捷别名：查找所有写入过 `value` 的 guest 指令与 HLE 拷贝事件 */
-  findWrites(value: number | bigint, opts?: Omit<TraceQueryOptions, "value" | "addr">): TraceQueryHit[];
-  /** 地址溯源便捷别名：查找读写过 `addr` 的全部访存与 HLE 事件 */
-  findReads(addr: number | bigint, opts?: Omit<TraceQueryOptions, "value" | "addr">): TraceQueryHit[];
+  findWrites(
+    value: number | bigint,
+    opts?: Omit<TraceQueryOptions, "value" | "addr" | "len" | "writesOnly">
+  ): TraceQueryHit[];
+  /** 地址溯源便捷别名：查找访问 `addr` 的读写及 HLE 历史事件（默认 `writesOnly: false`） */
+  findReads(
+    addr: number | bigint,
+    opts?: Omit<TraceQueryOptions, "value" | "addr" | "width" | "align">
+  ): TraceQueryHit[];
   /** 读取 trace.ext 中的全部 HLE 事件（memcpy / memmove / memset / malloc / calloc / realloc / free） */
   hleEvents(limit?: number): TraceHleEvent[];
   /** 基于 trace.ext 写历史 + HLE 拷贝/填充事件重建指定 `atSeq`（省略则重建至末尾）时刻的内存区间内容 */

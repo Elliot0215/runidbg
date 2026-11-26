@@ -560,31 +560,42 @@
             return handle;
           },
           watch(range, modeOrOpts, fn) {
+            const parseWatchMode = (mode) => {
+              if (typeof mode !== "string") {
+                throw new TypeError("hook.watch mode must be 'w' | 'r' | 'rw', got " + typeof mode);
+              }
+              const m = mode.trim().toLowerCase();
+              if (m === "w" || m === "write") return { read: false, write: true };
+              if (m === "r" || m === "read") return { read: true, write: false };
+              if (m === "rw" || m === "wr" || m === "access" || m === "a") {
+                return { read: true, write: true };
+              }
+              throw new TypeError("hook.watch mode must be 'w' | 'r' | 'rw', got " + mode);
+            };
             let opts;
             let cb = fn;
             if (typeof modeOrOpts === "function") {
               opts = { read: false, write: true };
               cb = modeOrOpts;
+            } else if (modeOrOpts === undefined || modeOrOpts === null) {
+              opts = { read: false, write: true };
             } else if (typeof modeOrOpts === "string") {
-              const m = modeOrOpts.trim().toLowerCase();
-              if (m === "w" || m === "write") {
-                opts = { read: false, write: true };
-              } else if (m === "r" || m === "read") {
-                opts = { read: true, write: false };
-              } else if (m === "rw" || m === "wr" || m === "access" || m === "a") {
-                opts = { read: true, write: true };
+              opts = parseWatchMode(modeOrOpts);
+            } else if (typeof modeOrOpts === "object" && !Array.isArray(modeOrOpts)) {
+              opts = Object.assign({}, modeOrOpts);
+              if (modeOrOpts.mode !== undefined) {
+                const parsed = parseWatchMode(modeOrOpts.mode);
+                opts.read = parsed.read;
+                opts.write = parsed.write;
+              } else if (opts.read === undefined && opts.write === undefined) {
+                opts.read = false;
+                opts.write = true;
               } else {
-                throw new TypeError("hook.watch mode must be 'w' | 'r' | 'rw', got " + modeOrOpts);
-              }
-            } else if (modeOrOpts && typeof modeOrOpts === "object") {
-              opts = Object.assign({ read: false, write: true }, modeOrOpts);
-              if (typeof modeOrOpts.mode === "string") {
-                const m = modeOrOpts.mode.trim().toLowerCase();
-                opts.read = m.includes("r") || m === "access" || m === "a";
-                opts.write = m.includes("w") || m === "access" || m === "a";
+                opts.read = Boolean(opts.read);
+                opts.write = Boolean(opts.write);
               }
             } else {
-              opts = { read: false, write: true };
+              throw new TypeError("hook.watch expects mode string, options object, or callback");
             }
             return this.mem(range, opts, cb);
           },
@@ -1127,7 +1138,7 @@
         findReads(addr, opts = {}) {
           return __native.traceQuery(
             traceId,
-            Object.assign({}, opts || {}, { addr, writesOnly: false })
+            Object.assign({ writesOnly: false }, opts || {}, { addr })
           );
         },
         hleEvents(limit = 500) {

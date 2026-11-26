@@ -1,13 +1,29 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::mem::size_of;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr;
 
 use memmap2::Mmap;
 
 use crate::error::EmuResult;
 use crate::tracer::record::{format_ext_record, ExtKind, ExtRecord, HleTraceEvent, TraceRecord};
+
+/// 按约定自动定位与 `trace.idx` 同目录伴生的 `.ext` 扩展流文件：
+/// 优先匹配替换扩展名后的 `<stem>.ext`，若不存在则回退 `<idx_path>.ext`（兼容非 `.idx` 后缀输出路径）。
+pub fn resolve_sibling_ext_path(idx_path: &Path) -> Option<PathBuf> {
+    let replaced = idx_path.with_extension("ext");
+    if replaced != idx_path && replaced.is_file() {
+        return Some(replaced);
+    }
+    let mut appended = idx_path.as_os_str().to_os_string();
+    appended.push(".ext");
+    let appended_path = PathBuf::from(appended);
+    if appended_path.is_file() {
+        return Some(appended_path);
+    }
+    None
+}
 
 /// 内存写入字节流匹配命中项
 #[derive(Debug, Clone)]
@@ -734,11 +750,24 @@ impl TraceReader {
         writes_only: bool,
         limit: usize,
     ) -> Vec<TraceQueryHit> {
+        self.query_addr_history_in_range(addr, len, None, at_seq, writes_only, limit)
+    }
+
+    /// Omniscient 地址历史查询（支持 `min_seq`..=`max_seq` 闭区间过滤）
+    pub fn query_addr_history_in_range(
+        &self,
+        addr: u64,
+        len: u64,
+        min_seq: Option<u32>,
+        max_seq: Option<u32>,
+        writes_only: bool,
+        limit: usize,
+    ) -> Vec<TraceQueryHit> {
         let Some(mmap) = self.ext_mmap.as_ref() else {
             return Vec::new();
         };
         let q_len = len.max(1);
-        let end_idx = at_seq
+        let end_idx = max_seq
             .map(|hi| self.ext_end_index_for_seq(hi))
             .unwrap_or(self.ext_count);
         let mut out = Vec::new();
@@ -746,8 +775,9 @@ impl TraceReader {
         while i < end_idx {
             let rec = read_packed::<ExtRecord>(mmap, i);
             let seq = rec.seq_low32;
+            let seq_ok = min_seq.is_none_or(|lo| seq >= lo);
             match ExtKind::from_u8(rec.kind) {
-                Some(ExtKind::MemWrite) => {
+                Some(ExtKind::MemWrite) if seq_ok => {
                     let sz = (rec.size_or_reg as u64).max(1);
                     if range_overlaps_u128(rec.addr, sz, addr, q_len) {
                         out.push(TraceQueryHit {
@@ -761,7 +791,7 @@ impl TraceReader {
                         });
                     }
                 }
-                Some(ExtKind::MemRead) if !writes_only => {
+                Some(ExtKind::MemRead) if seq_ok && !writes_only => {
                     let sz = (rec.size_or_reg as u64).max(1);
                     if range_overlaps_u128(rec.addr, sz, addr, q_len) {
                         out.push(TraceQueryHit {
@@ -786,27 +816,30 @@ impl TraceReader {
                             i += 1;
                         }
                     }
-                    let dst_hit = hlen > 0 && range_overlaps_u128(dst, hlen, addr, q_len);
-                    let src_hit =
-                        !writes_only && hlen > 0 && range_overlaps_u128(src, hlen, addr, q_len);
-                    if dst_hit || src_hit {
-                        let kind = match rec.size_or_reg {
-                            1 => "hle_memmove",
-                            2 => "hle_realloc_copy",
-                            _ => "hle_memcpy",
-                        };
-                        out.push(TraceQueryHit {
-                            seq_low32: seq,
-                            pc: rec.pc,
-                            addr: dst,
-                            size: hlen,
-                            kind,
-                            value: hlen,
-                            src,
-                        });
+                    if seq_ok {
+                        let dst_hit = hlen > 0 && range_overlaps_u128(dst, hlen, addr, q_len);
+                        let src_hit = !writes_only
+                            && hlen > 0
+                            && range_overlaps_u128(src, hlen, addr, q_len);
+                        if dst_hit || src_hit {
+                            let kind = match rec.size_or_reg {
+                                1 => "hle_memmove",
+                                2 => "hle_realloc_copy",
+                                _ => "hle_memcpy",
+                            };
+                            out.push(TraceQueryHit {
+                                seq_low32: seq,
+                                pc: rec.pc,
+                                addr: dst,
+                                size: hlen,
+                                kind,
+                                value: hlen,
+                                src,
+                            });
+                        }
                     }
                 }
-                Some(ExtKind::HleMemset) => {
+                Some(ExtKind::HleMemset) if seq_ok => {
                     let dst = rec.addr;
                     let hlen = rec.value;
                     if hlen > 0 && range_overlaps_u128(dst, hlen, addr, q_len) {

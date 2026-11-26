@@ -389,7 +389,7 @@ impl McpServer {
                             ));
                         }
                     }
-                    _ => {
+                    "dump" => {
                         let end = reader.len().min(skip.saturating_add(limit));
                         for idx in skip..end {
                             if let Some(rec) = reader.get(idx) {
@@ -418,6 +418,11 @@ impl McpServer {
                                 }
                             }
                         }
+                    }
+                    other => {
+                        return Err(anyhow!(
+                            "未知的 trace_inspect action `{other}`（支持 dump / search_val / search_addr / search_ascii / search_bytes）"
+                        ));
                     }
                 }
                 Ok(json!({
@@ -994,11 +999,9 @@ impl McpServer {
                 let idx_path = PathBuf::from(req_str(args, "idxPath")?);
                 let ext_path = resolve_ext_path(
                     &idx_path,
-                    args.get("extPath").and_then(Value::as_str),
+                    opt_str_strict(args, "extPath")?,
                 );
-                let mode = args
-                    .get("mode")
-                    .and_then(Value::as_str)
+                let mode = opt_str_strict(args, "mode")?
                     .unwrap_or("backward")
                     .to_ascii_lowercase();
                 let reg_opt = args.get("reg").filter(|v| !v.is_null());
@@ -1015,9 +1018,7 @@ impl McpServer {
                     crate::tracer::TaintSeed::Reg { reg_id: slot }
                 } else if let Some(av) = addr_opt {
                     let addr = parse_addr_val(Some(av))?;
-                    let len = opt_u64_strict(args, "len")?
-                        .unwrap_or(8)
-                        .clamp(1, 4096) as usize;
+                    let len = opt_u64_range(args, "len", 1, 4096)?.unwrap_or(8) as usize;
                     crate::tracer::TaintSeed::Mem { addr, len }
                 } else {
                     return Err(anyhow!("trace_taint 需要提供 addr 或 reg 参数"));
@@ -1027,17 +1028,9 @@ impl McpServer {
                     None => opt_u64_strict(args, "startIdx")?.map(|v| v as usize),
                 };
                 let max_insns = opt_u64_strict(args, "maxInsns")?.unwrap_or(0) as usize;
-                let max_steps = opt_u64_strict(args, "maxSteps")?
-                    .unwrap_or(200)
-                    .clamp(1, 2000) as usize;
-                let track_mem_index = args
-                    .get("trackMemIndex")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
-                let track_sp = args
-                    .get("trackSp")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
+                let max_steps = opt_u64_range(args, "maxSteps", 1, 2000)?.unwrap_or(200) as usize;
+                let track_mem_index = opt_bool_strict(args, "trackMemIndex")?.unwrap_or(true);
+                let track_sp = opt_bool_strict(args, "trackSp")?.unwrap_or(false);
                 let opts = crate::tracer::TaintOptions {
                     anchor_idx,
                     max_insns,
@@ -1089,12 +1082,11 @@ impl McpServer {
                 let idx_path = PathBuf::from(req_str(args, "idxPath")?);
                 let ext_path = resolve_ext_path(
                     &idx_path,
-                    args.get("extPath").and_then(Value::as_str),
+                    opt_str_strict(args, "extPath")?,
                 );
                 let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
-                let limit = opt_u64_strict(args, "limit")?
-                    .unwrap_or(100)
-                    .clamp(1, 1000) as usize;
+                let limit = opt_u64_range(args, "limit", 1, 1000)?.unwrap_or(100) as usize;
+                let min_seq = opt_u64_strict(args, "minSeq")?.map(|v| v.min(u32::MAX as u64) as u32);
                 let at_seq = opt_u64_strict(args, "at")?.map(|v| v.min(u32::MAX as u64) as u32);
                 let val_opt = args.get("value").filter(|v| !v.is_null());
                 let addr_opt = args.get("addr").filter(|v| !v.is_null());
@@ -1103,22 +1095,19 @@ impl McpServer {
                 }
                 let hits = if let Some(val_v) = val_opt {
                     let target = parse_addr_val(Some(val_v))?;
-                    let width_raw = match opt_u64_strict(args, "width")? {
+                    let width_raw = match opt_u64_range(args, "width", 1, 8)? {
                         Some(w) => Some(w),
-                        None => opt_u64_strict(args, "align")?,
+                        None => opt_u64_range(args, "align", 1, 8)?,
                     };
                     let width = width_raw
-                        .map(|w| w.clamp(1, 8) as u8)
+                        .map(|w| w as u8)
                         .unwrap_or_else(|| if target > u32::MAX as u64 { 8 } else { 4 });
-                    reader.query_writes_by_value(target, width, None, at_seq, limit)
+                    reader.query_writes_by_value(target, width, min_seq, at_seq, limit)
                 } else if let Some(addr_v) = addr_opt {
                     let addr = parse_addr_val(Some(addr_v))?;
-                    let len = opt_u64_strict(args, "len")?.unwrap_or(1).max(1);
-                    let writes_only = args
-                        .get("writesOnly")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false);
-                    reader.query_addr_history(addr, len, at_seq, writes_only, limit)
+                    let len = opt_u64_range(args, "len", 1, u64::MAX)?.unwrap_or(1);
+                    let writes_only = opt_bool_strict(args, "writesOnly")?.unwrap_or(false);
+                    reader.query_addr_history_in_range(addr, len, min_seq, at_seq, writes_only, limit)
                 } else {
                     return Err(anyhow!("trace_query 需要提供 value 或 addr 参数"));
                 };
@@ -1143,15 +1132,13 @@ impl McpServer {
                 let idx_b = PathBuf::from(req_str(args, "idxPathB")?);
                 let ext_a = resolve_ext_path(
                     &idx_a,
-                    args.get("extPathA").and_then(Value::as_str),
+                    opt_str_strict(args, "extPathA")?,
                 );
                 let ext_b = resolve_ext_path(
                     &idx_b,
-                    args.get("extPathB").and_then(Value::as_str),
+                    opt_str_strict(args, "extPathB")?,
                 );
-                let limit = opt_u64_strict(args, "limit")?
-                    .unwrap_or(64)
-                    .clamp(1, 500) as usize;
+                let limit = opt_u64_range(args, "limit", 1, 500)?.unwrap_or(64) as usize;
                 let ra = TraceReader::open(&idx_a, ext_a.as_deref())?;
                 let rb = TraceReader::open(&idx_b, ext_b.as_deref())?;
                 let summary = TraceReader::diff_traces(&ra, &rb, limit);
@@ -1181,12 +1168,7 @@ fn resolve_ext_path(idx_path: &Path, explicit: Option<&str>) -> Option<PathBuf> 
     if let Some(p) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
         return Some(PathBuf::from(p));
     }
-    let sibling = idx_path.with_extension("ext");
-    if sibling != idx_path && sibling.is_file() {
-        Some(sibling)
-    } else {
-        None
-    }
+    crate::tracer::resolve_sibling_ext_path(idx_path)
 }
 
 fn opt_u64_strict(args: &Value, key: &str) -> Result<Option<u64>> {
@@ -1196,6 +1178,36 @@ fn opt_u64_strict(args: &Value, key: &str) -> Result<Option<u64>> {
             .as_u64()
             .map(Some)
             .ok_or_else(|| anyhow!("参数 `{key}` 必须为非负整数")),
+    }
+}
+
+fn opt_u64_range(args: &Value, key: &str, min: u64, max: u64) -> Result<Option<u64>> {
+    let Some(v) = opt_u64_strict(args, key)? else {
+        return Ok(None);
+    };
+    if v < min || v > max {
+        return Err(anyhow!("参数 `{key}` 超出合法范围 [{min}, {max}]，实际收到 {v}"));
+    }
+    Ok(Some(v))
+}
+
+fn opt_bool_strict(args: &Value, key: &str) -> Result<Option<bool>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_bool()
+            .map(Some)
+            .ok_or_else(|| anyhow!("参数 `{key}` 必须为布尔值")),
+    }
+}
+
+fn opt_str_strict<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| anyhow!("参数 `{key}` 必须为字符串")),
     }
 }
 
@@ -1564,7 +1576,8 @@ fn tool_definitions() -> Value {
                     "searchPaths": { "type": "array", "items": { "type": "string" }, "description": "Optional additional library search paths" },
                     "device": { "type": "string", "description": "Optional device profile preset override" },
                     "realClock": { "type": "boolean", "description": "Optional real-clock override" },
-                    "net": { "type": ["boolean", "object"], "description": "Optional network policy override" }
+                    "net": { "type": ["boolean", "object"], "description": "Optional network policy override" },
+                    "freezeLayout": { "type": "boolean", "description": "Optional freezeLayout override (isolate host emu.mem.alloc() into [host-scratch])" }
                 }
             }
         },
@@ -1704,6 +1717,7 @@ fn tool_definitions() -> Value {
                     "len": { "type": "integer", "minimum": 1, "maximum": 4096, "description": "Memory byte length (default 8)" },
                     "reg": { "type": "string", "description": "Seed/target register name (e.g. 'x0', 'w8', 'v0', 'q1')" },
                     "atIdx": { "type": "integer", "minimum": 0, "description": "Anchor instruction index (start for forward, observation point for backward)" },
+                    "startIdx": { "type": "integer", "minimum": 0, "description": "Alias of atIdx for forward mode" },
                     "maxInsns": { "type": "integer", "minimum": 0, "description": "Optional max instructions to scan (0 = all)" },
                     "maxSteps": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Max propagation steps returned (default 200)" },
                     "trackMemIndex": { "type": "boolean", "description": "Track indexed load register dependencies such as S-Box lookups (default true)" },
@@ -1722,8 +1736,10 @@ fn tool_definitions() -> Value {
                     "extPath": { "type": "string" },
                     "value": { "description": "Find all writes producing this value (integer or '0x...' hex)" },
                     "width": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Value match byte width (1..8)" },
+                    "align": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Alias of width (1..8)" },
                     "addr": { "description": "Find read/write/HLE history touching [addr, addr+len)" },
                     "len": { "type": "integer", "minimum": 1, "description": "Byte length for addr query (default 1)" },
+                    "minSeq": { "type": "integer", "minimum": 0, "description": "Optional lower seq bound" },
                     "at": { "type": "integer", "minimum": 0, "description": "Upper seq bound" },
                     "writesOnly": { "type": "boolean", "description": "For addr query, return only writes & HLE mutations" },
                     "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Max hits returned (default 100)" }
