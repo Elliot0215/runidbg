@@ -2607,12 +2607,10 @@ where
                 tramp.rand_stub_warned = true;
                 tracing::warn!(
                     target: "runidbg::hle",
-                    "rand()/random() 当前使用确定性 PRNG 桩实现（xorshift64*，非真 glibc TYPE_3 状态机）；如需特定序列请用 emu.hook.importReplace(\"rand\", ...) 替换"
+                    "rand()/random() 当前使用独立确定性 PRNG 桩实现（xorshift64，与 /dev/urandom 隔离，非真 glibc TYPE_3 状态机）；如需特定序列请用 emu.hook.importReplace(\"rand\", ...) 替换"
                 );
             }
-            let mut b = [0u8; 4];
-            vfs.fill_random(&mut b);
-            (u32::from_le_bytes(b) & 0x7FFF_FFFF) as u64
+            vfs.next_libc_rand() as u64
         }
         HleBuiltin::Srand => {
             let (tramp, _, vfs) = get_state(uc.get_data_mut());
@@ -2620,10 +2618,10 @@ where
                 tramp.rand_stub_warned = true;
                 tracing::warn!(
                     target: "runidbg::hle",
-                    "srand()/srandom() 当前作用于确定性 PRNG 桩实现（xorshift64*，非真 glibc TYPE_3 状态机）；如需特定序列请用 emu.hook.importReplace(\"rand\", ...) 替换"
+                    "srand()/srandom() 当前作用于独立确定性 PRNG 桩实现（xorshift64，与 /dev/urandom 隔离，非真 glibc TYPE_3 状态机）；如需特定序列请用 emu.hook.importReplace(\"rand\", ...) 替换"
                 );
             }
-            vfs.seed_random((x0 as u32) as u64);
+            vfs.seed_libc_rand((x0 as u32) as u64);
             0
         }
         HleBuiltin::Arc4RandomBuf => {

@@ -232,3 +232,76 @@ fn test_determinism_and_golden_hle_heap_and_prng() {
         run1.rand_seq
     );
 }
+
+#[test]
+fn test_rng_streams_isolated_between_libc_rand_and_os_entropy() {
+    use runidbg_arm64_emu_tracer::backend::BackendWithData;
+    use runidbg_arm64_emu_tracer::TapeSelector;
+
+    // 验证：
+    // 1. 反复调用 srand()/rand() 绝不影响 OS 熵源（arc4random_buf / getrandom / /dev/urandom）；
+    // 2. 反复消费 OS 熵源绝不影响 libc rand() 序列；
+    // 3. .rtape 磁带保存与恢复完整保留两条独立随机流状态。
+    let mut emu_clean = AndroidEmulator::builder().hle_accel(true).build().unwrap();
+    let mut emu_noisy = AndroidEmulator::builder().hle_accel(true).build().unwrap();
+
+    // 在 noisy 实例中先大量扰动 libc_rand_state（srand + 64 次 rand）
+    {
+        let vfs = &mut emu_noisy.cpu_mut().get_data_mut().vfs;
+        vfs.seed_libc_rand(0xDEAD_BEEF);
+        for _ in 0..64 {
+            let _ = vfs.next_libc_rand();
+        }
+    }
+
+    // 两个实例的 OS 熵源输出必须 100% 一致！
+    let mut os_clean = [0u8; 32];
+    let mut os_noisy = [0u8; 32];
+    emu_clean.cpu_mut().get_data_mut().vfs.fill_random(&mut os_clean);
+    emu_noisy.cpu_mut().get_data_mut().vfs.fill_random(&mut os_noisy);
+    assert_eq!(
+        os_clean, os_noisy,
+        "srand()/rand() must NEVER perturb OS /dev/urandom/getrandom/arc4random stream"
+    );
+
+    // 反之：大量消费 OS 熵源绝不影响 libc rand() 序列！
+    let mut junk = [0u8; 256];
+    emu_clean.cpu_mut().get_data_mut().vfs.fill_random(&mut junk);
+    emu_clean.cpu_mut().get_data_mut().vfs.seed_libc_rand(0x1234_5678);
+    emu_noisy.cpu_mut().get_data_mut().vfs.seed_libc_rand(0x1234_5678);
+    emu_noisy.cpu_mut().get_data_mut().vfs.fill_random(&mut junk);
+    let r_clean: Vec<u32> = (0..8)
+        .map(|_| emu_clean.cpu_mut().get_data_mut().vfs.next_libc_rand())
+        .collect();
+    let r_noisy: Vec<u32> = (0..8)
+        .map(|_| emu_noisy.cpu_mut().get_data_mut().vfs.next_libc_rand())
+        .collect();
+    assert_eq!(
+        r_clean, r_noisy,
+        "OS entropy consumption must NEVER perturb libc rand() stream"
+    );
+
+    // .rtape 往返持久化同时保留两条独立流状态
+    let dir = std::env::temp_dir().join(format!("runidbg_rng_iso_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let tape = dir.join("rng2.rtape");
+    emu_clean.save_tape(&tape, "cp0").expect("save tape");
+    let (mut restored, _) = AndroidEmulator::from_tape_with_builder(
+        &tape,
+        &TapeSelector::Label("cp0".to_string()),
+        AndroidEmulator::builder(),
+    )
+    .expect("load tape");
+
+    let mut next_os_orig = [0u8; 16];
+    let mut next_os_rest = [0u8; 16];
+    emu_clean.cpu_mut().get_data_mut().vfs.fill_random(&mut next_os_orig);
+    restored.cpu_mut().get_data_mut().vfs.fill_random(&mut next_os_rest);
+    assert_eq!(next_os_orig, next_os_rest);
+
+    let next_rand_orig = emu_clean.cpu_mut().get_data_mut().vfs.next_libc_rand();
+    let next_rand_rest = restored.cpu_mut().get_data_mut().vfs.next_libc_rand();
+    assert_eq!(next_rand_orig, next_rand_rest);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

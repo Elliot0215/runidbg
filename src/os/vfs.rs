@@ -59,6 +59,8 @@ pub(crate) struct VfsTapeState {
     pub fds: Vec<(i32, OpenFile)>,
     pub next_fd: i32,
     pub rng_state: u64,
+    /// libc `rand()`/`random()`/`srand()`/`srandom()` 独立用户态 PRNG 状态（与 OS 熵源 `rng_state` 严格隔离）
+    pub libc_rand_state: u64,
     pub mono_clock_ns: u64,
     pub use_real_clock: bool,
     pub net: crate::os::net::NetTapeState,
@@ -90,8 +92,10 @@ pub struct VirtualFs {
     /// 进程 FD 表
     fds: BTreeMap<i32, OpenFile>,
     next_fd: i32,
-    /// 确定性伪随机数状态
+    /// OS 熵源确定性伪随机数状态（专供 `/dev/urandom`、`getrandom`、`arc4random*`，不受 `srand`/`rand` 干扰）
     rng_state: u64,
+    /// libc 用户态 PRNG 状态（专供 `rand`/`random`/`srand`/`srandom`，POSIX 默认初值 1）
+    libc_rand_state: u64,
     /// 虚拟单调时钟（纳秒），每次调用递增 1ms，防止时间差反调试
     pub mono_clock_ns: u64,
     /// 为 true 时直接读取宿主机真实时间（适用于需要当前 Unix 时间戳的实签场景）
@@ -181,6 +185,7 @@ impl VirtualFs {
             fds,
             next_fd: 3,
             rng_state: 0x2026_1119_CAFE_BABE,
+            libc_rand_state: 1,
             mono_clock_ns: 1_700_000_000_000_000_000,
             use_real_clock: false,
             diag: EnvDiag::new(),
@@ -246,6 +251,7 @@ impl VirtualFs {
             fds: self.fds.iter().map(|(&fd, f)| (fd, f.clone())).collect(),
             next_fd: self.next_fd,
             rng_state: self.rng_state,
+            libc_rand_state: self.libc_rand_state,
             mono_clock_ns: self.mono_clock_ns,
             use_real_clock: self.use_real_clock,
             net: self.net.export_tape_state(),
@@ -283,6 +289,11 @@ impl VirtualFs {
         self.fds = state.fds.into_iter().collect();
         self.next_fd = state.next_fd.max(3);
         self.rng_state = state.rng_state;
+        self.libc_rand_state = if state.libc_rand_state == 0 {
+            1
+        } else {
+            state.libc_rand_state
+        };
         self.mono_clock_ns = state.mono_clock_ns;
         self.use_real_clock = state.use_real_clock;
         self.net.restore_tape_state(state.net);
@@ -391,12 +402,31 @@ impl VirtualFs {
         res
     }
 
-    /// 重置确定性 PRNG 种子（供 `srand`/`srandom` HLE 调用）
-    pub fn seed_random(&mut self, seed: u64) {
-        self.rng_state = if seed == 0 { 1 } else { seed };
+    /// 重置 libc `rand()`/`random()` 用户态 PRNG 种子（与 `/dev/urandom`/`getrandom` 完全隔离）
+    pub fn seed_libc_rand(&mut self, seed: u64) {
+        self.libc_rand_state = if seed == 0 { 1 } else { seed };
     }
 
-    /// 生成确定性随机字节（供 `/dev/urandom` 与 `getrandom` Syscall 使用）
+    /// `seed_libc_rand` 的兼容别名
+    pub fn seed_random(&mut self, seed: u64) {
+        self.seed_libc_rand(seed);
+    }
+
+    /// 从独立的 libc 用户态 PRNG 流生成 31-bit 非负整数（供 `rand()`/`random()` HLE 使用，不影响 `/dev/urandom`）
+    pub fn next_libc_rand(&mut self) -> u32 {
+        let mut b = [0u8; 4];
+        for byte in &mut b {
+            let mut x = self.libc_rand_state;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.libc_rand_state = x;
+            *byte = (x & 0xFF) as u8;
+        }
+        u32::from_le_bytes(b) & 0x7FFF_FFFF
+    }
+
+    /// 生成确定性 OS 熵源随机字节（专供 `/dev/urandom`、`getrandom`、`arc4random*`，不受 `srand`/`rand` 影响）
     pub fn fill_random(&mut self, dst: &mut [u8]) {
         for byte in dst.iter_mut() {
             let mut x = self.rng_state;

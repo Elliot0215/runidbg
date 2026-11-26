@@ -1419,6 +1419,10 @@ fn encode_chunk_payload(out: &mut Vec<u8>, c: &TapeCheckpointChunk) -> EmuResult
             w.u64(v);
         }
     }
+    // 10. 可选尾部扩展块（魔数 "RNG2" = 0x524E_4732，完全向后兼容旧版 .rtape）：
+    //     持久化独立 libc `rand()`/`srand()` PRNG 状态，与 OS 熵源 `rng_state` 严格分离
+    w.u32(0x524E_4732);
+    w.u64(c.vfs.libc_rand_state);
     Ok(())
 }
 
@@ -1933,7 +1937,7 @@ fn decode_chunk_payload(r: &mut BinReader<'_>, is_delta: bool) -> EmuResult<Tape
     let mono_clock_ns = r.u64()?;
     let use_real_clock = r.bool()?;
     let net = decode_net_state(r)?;
-    let vfs = VfsTapeState {
+    let mut vfs = VfsTapeState {
         package_name: vfs_pkg,
         pid,
         ppid,
@@ -1947,6 +1951,7 @@ fn decode_chunk_payload(r: &mut BinReader<'_>, is_delta: bool) -> EmuResult<Tape
         fds,
         next_fd,
         rng_state,
+        libc_rand_state: 1,
         mono_clock_ns,
         use_real_clock,
         net,
@@ -1954,49 +1959,61 @@ fn decode_chunk_payload(r: &mut BinReader<'_>, is_delta: bool) -> EmuResult<Tape
 
     let mut host_scratch = None;
     let mut freeze_layout = None;
-    if r.remaining() > 0 {
+    let mut seen_scrt = false;
+    let mut seen_rng2 = false;
+    while r.remaining() > 0 {
         let tag = r.u32()?;
-        if tag != 0x5343_5254 {
-            return Err(EmuError::Backend(format!(
-                "无效的 checkpoint 尾部扩展块魔数: 0x{tag:08x}"
-            )));
+        match tag {
+            0x5343_5254 if !seen_scrt => {
+                seen_scrt = true;
+                let fl = r.bool()?;
+                let s_base = r.u64()?;
+                let s_size = r.u64()?;
+                let s_cursor = r.u64()?;
+                let s_in_use = r.u64()?;
+                let s_end = s_base.checked_add(s_size).ok_or_else(|| {
+                    EmuError::Backend("SCRT 尾部块 host_scratch base+size 溢出".into())
+                })?;
+                if s_base != crate::memory::HOST_SCRATCH_BASE
+                    || s_size != crate::memory::HOST_SCRATCH_SIZE
+                    || s_cursor < s_base
+                    || s_cursor > s_end
+                {
+                    return Err(EmuError::Backend(format!(
+                        "SCRT 尾部块 host_scratch 元数据越界: base=0x{s_base:x}, size=0x{s_size:x}, cursor=0x{s_cursor:x}"
+                    )));
+                }
+                let (sf_len, sf_cap) = r.read_count(16)?;
+                let mut s_free = Vec::with_capacity(sf_cap);
+                for _ in 0..sf_len {
+                    s_free.push((r.u64()?, r.u64()?));
+                }
+                let (sa_len, sa_cap) = r.read_count(16)?;
+                let mut s_alloc = Vec::with_capacity(sa_cap);
+                for _ in 0..sa_len {
+                    s_alloc.push((r.u64()?, r.u64()?));
+                }
+                host_scratch = Some(BumpAllocator::from_raw(crate::memory::BumpAllocatorRaw {
+                    base: s_base,
+                    size: s_size,
+                    cursor: s_cursor,
+                    free_blocks: s_free,
+                    allocated: s_alloc,
+                    in_use: s_in_use,
+                }));
+                freeze_layout = Some(fl);
+            }
+            0x524E_4732 if !seen_rng2 => {
+                seen_rng2 = true;
+                let lr = r.u64()?;
+                vfs.libc_rand_state = if lr == 0 { 1 } else { lr };
+            }
+            other => {
+                return Err(EmuError::Backend(format!(
+                    "无效或重复的 checkpoint 尾部扩展块魔数: 0x{other:08x}"
+                )));
+            }
         }
-        let fl = r.bool()?;
-        let s_base = r.u64()?;
-        let s_size = r.u64()?;
-        let s_cursor = r.u64()?;
-        let s_in_use = r.u64()?;
-        let s_end = s_base.checked_add(s_size).ok_or_else(|| {
-            EmuError::Backend("SCRT 尾部块 host_scratch base+size 溢出".into())
-        })?;
-        if s_base != crate::memory::HOST_SCRATCH_BASE
-            || s_size != crate::memory::HOST_SCRATCH_SIZE
-            || s_cursor < s_base
-            || s_cursor > s_end
-        {
-            return Err(EmuError::Backend(format!(
-                "SCRT 尾部块 host_scratch 元数据越界: base=0x{s_base:x}, size=0x{s_size:x}, cursor=0x{s_cursor:x}"
-            )));
-        }
-        let (sf_len, sf_cap) = r.read_count(16)?;
-        let mut s_free = Vec::with_capacity(sf_cap);
-        for _ in 0..sf_len {
-            s_free.push((r.u64()?, r.u64()?));
-        }
-        let (sa_len, sa_cap) = r.read_count(16)?;
-        let mut s_alloc = Vec::with_capacity(sa_cap);
-        for _ in 0..sa_len {
-            s_alloc.push((r.u64()?, r.u64()?));
-        }
-        host_scratch = Some(BumpAllocator::from_raw(crate::memory::BumpAllocatorRaw {
-            base: s_base,
-            size: s_size,
-            cursor: s_cursor,
-            free_blocks: s_free,
-            allocated: s_alloc,
-            in_use: s_in_use,
-        }));
-        freeze_layout = Some(fl);
     }
 
     Ok(TapeCheckpointChunk {
