@@ -244,6 +244,19 @@ const diff = Trace.diff("run_a.idx", "run_b.idx", 100);
 | `.rtape` 磁带与时间旅行 | `emu_save_tape` / `emu_load_tape` / `emu_seek_tape` / `tape_info` / `tt_record_start` / `tt_record_stop` / `tt_open` / `tt_seek` / `tt_reverse_watch` / `tt_mem_read` / `tt_close` | 跨后端磁带接力、二期时间旅行录制、任意指令跳转与反向内存写/读/访问观察点 |
 | 诊断 | `emu_diag_missing` / `emu_last_crash` | 获取 `EnvDiag` 缺失环境报告与最新崩溃现场 |
 
+客户端配置示例（Claude Desktop / Cursor / Codex stdio 模式）：
+
+```json
+{
+  "mcpServers": {
+    "runidbg": {
+      "command": "/path/to/runidbg-cli",
+      "args": ["mcp", "--cwd", "/path/to/workspace"]
+    }
+  }
+}
+```
+
 ---
 
 ## 6. GDB RSP 远程调试（含时间旅行反向调试）
@@ -283,4 +296,155 @@ let ret = emu.call_symbol(&module, "target_func", &[0, 0])?;
 let reader = TraceReader::open("trace.idx", Some(std::path::Path::new("trace.ext")))?;
 let bwd = reader.taint_backward(&TaintSeed::Mem { addr: 0x5000_6470, len: 8 }, &TaintOptions::default());
 let vm  = reader.analyze_vm(&VmAnalysisOptions::default());
+```
+
+---
+
+## 8. 源码构建、Feature 开关与多后端选型
+
+### 8.1 原生构建依赖
+
+因为默认 Feature 包含 `dynarmic`（ARM64 JIT 后端），从源码执行 `cargo build --release --bin runidbg-cli` 前请先安装对应平台的原生构建工具：
+
+- **macOS (Apple Silicon)**：`brew install pkgconf cmake ninja`
+  - 本机源码构建后若需启用 `hypervisor` 后端，须对产物进行 ad-hoc entitlement 签名（GitHub Release 产物已预签）：
+    ```bash
+    codesign --force --sign - --entitlements entitlements/hypervisor.plist target/release/runidbg-cli
+    ```
+- **Linux (`x86_64` / `aarch64`)**：`sudo apt-get install -y build-essential pkg-config cmake ninja-build clang libclang-dev`
+- **Windows (`x86_64` MSVC)**：安装 Visual Studio C++ Build Tools、`cmake`、`ninja` 与 LLVM（设置 `LIBCLANG_PATH`）
+
+### 8.2 Feature 开关
+
+| Feature | 默认启用 | 说明 |
+| --- | :---: | --- |
+| `js` | ✅ | QuickJS 脚本引擎（`rquickjs`） |
+| `rpc` | ✅ | 异步多核 HTTP / JSON-RPC 2.0 服务（`tokio`、`axum`、`async-channel`、`serde_json`） |
+| `mcp` | ✅ | MCP stdio / Streamable HTTP 服务端（36 个 AI 逆向工具） |
+| `apk` | ✅ | APK 一键解析与内存加载（`zip`） |
+| `ui` | ✅ | 内置暗黑 Web UI（Trace / 时间旅行驾驶舱 / RPC / EnvDiag） |
+| `dynarmic` | ✅ | 跨平台 Dynarmic ARM64 JIT 加速后端（**仅仿真模式**，构建需 `cmake` + `ninja`） |
+| `kvm` | ✅（Linux） | Linux ARM64 `/dev/kvm` 硬件虚拟化后端（**仅仿真模式**，仅在 Linux 编译） |
+| `hypervisor` | ✅（macOS） | macOS Apple Silicon `Hypervisor.framework` 后端（**仅仿真模式**，仅在 macOS 编译） |
+
+- **纯 Unicorn 最小核心构建**（零 JS / HTTP / ZIP / Dynarmic 依赖，仍保留 Unicorn 仿真、DeviceProfile、Tracer、EnvDiag 与 GDB Stub）：
+  ```bash
+  cargo build --no-default-features
+  ```
+
+### 8.3 多后端选型建议
+
+- **逆向分析 / 指令 Trace / GDB 调试 / 原生指令与内存 Hook** → 必须选择 **`unicorn`**（其余后端仅限仿真模式，调用上述接口会立即返回明确错误）。
+- **高吞吐算法计算 / 批量离线签名 / 多核 RPC 生产服务** → 优先选择 **`dynarmic`**（无签名限制、支持单进程无限多 Worker 并发）或硬件虚拟化 **`hypervisor`**（macOS Apple Silicon，需 `com.apple.security.hypervisor` 签名，单进程限 1 VM）/ **`kvm`**（Linux ARM64 `/dev/kvm`，支持单进程多 VM）。
+
+---
+
+## 9. 完整性能基准与 Java `unidbg` 对比
+
+### 9.1 测试口径与与 `unidbg` 实测数据
+
+> Apple Silicon（10 核 ARM64 macOS），JDK 21（`unidbg 0.9.9`）vs `runidbg-cli --release`。样本为同一份 ~2 MB stripped Android ARM64 安全签名 `.so`（含 `libc++_shared.so`），两边 100% 产出完全一致的有效签名结果。
+
+| 评测项 | Java `unidbg` | Rust `runidbg` | 提升 |
+| --- | ---: | ---: | :---: |
+| 环境初始化 + ELF 加载 | 1,666 ms | **40 ms** | **41.7×** |
+| `JNI_OnLoad` | 72 ms | **37 ms** | **1.9×** |
+| **总冷启动耗时** | 1,738 ms | **77 ms** | **22.6×** |
+| 进程内单核热态调用（50 次均值） | 3.80 ms (263.4 QPS) | **1.30 ms (769.2 QPS)** | **2.92×** |
+| HTTP RPC（1 worker，100/100 校验） | 254.7 QPS · 122.1 MB | **628.7 QPS · 21.7 MB** | **2.47× · 省 82% 内存** |
+| HTTP RPC（`--workers auto=10`，200/200 校验） | 254.7 QPS · 122.1 MB | **1,141.0 QPS · 127.5 MB** | **4.48× · 10 实例 ≈ 1 JVM** |
+| 全模块指令 Trace（`fast` mmap） | 0.149 M insns/s (1,851 ms) | **17.03 M insns/s (64 ms)** | **114×** |
+| 全模块指令 Trace（`reg_delta`） | 0.149 M insns/s | **5.14 M insns/s (212 ms)** | **34.5×** |
+| 全模块指令 Trace（`full` + 20.1 万内存/HLE） | 0.149 M insns/s | **4.68 M insns/s (233 ms)** | **31.4×** |
+
+### 9.2 多执行后端加速比（同一 `runidbg-cli` · 100% 比特级一致输出）
+
+> Apple Silicon M4（Unicorn / Dynarmic / Hypervisor.framework）与 Ubuntu 26.04 Linux 7.0 `aarch64`（M4 嵌套虚拟化 `/dev/kvm`）实测：
+
+| 场景 | Unicorn | Dynarmic (JIT) | Hypervisor (macOS M4) | KVM (Linux ARM64 嵌套) | 峰值加速 |
+| --- | ---: | ---: | ---: | ---: | :---: |
+| **ZSTD 256KB lv6 × 20 轮**（重纯算 / NEON） | 24,964 ms | 245 ms (`102×`) | **52 ms (`480×`)** | 105 ms (`192×`) | **480×** |
+| **ZSTD 26.4KB lv3 × 100 轮**（轻纯算 / 高频） | 493 ms | **10 ms (`49×`)** | 14 ms (`35×`) | 113 ms (`8.3×`) | **49×** |
+| **TikTok `libmetasec_ov.so` 10× 签名**（重 HLE/JNI） | 398 ms | 76 ms (`5.2×`) | **37 ms (`10.8×`)** | 623 ms（裸机 ~30–40 ms） | **10.8×** |
+
+### 9.3 与 Java `unidbg` 的客观对比
+
+| 维度 | `runidbg` | Java `unidbg` |
+| --- | --- | --- |
+| **运行性能与内存** | 原生 Rust + 四执行引擎，冷启动快 **22.6×**、纯算最高 **480×**、单实例内存仅 **1/5.6** | JVM + JNI/JNA 跨边界开销，冷启动 ~1.7 s，单实例 ~122 MB |
+| **Trace 与离线分析** | 零拷贝 mmap 双流（含 HLE 事件）、纯 Rust 字节级污点/因果切片、SIMD 扫描、Trace Diff、VM 助手、`.rtape` 时间旅行反向调试 | 热路径实时 Capstone 文本落盘（~0.15M/s），进阶分析需二次开发 |
+| **脚本与工程化** | 零编译 QuickJS + `runidbg.d.ts`、原生内置多核 RPC / `/metrics` / Web UI / 36 工具 MCP / `EnvDiag` | 需维护 Maven/JDK 工程并编译运行，服务端池化与 AI 集成需自行封装 |
+| **平台与架构** | **目前专注 Android ARM64（`aarch64`）**，暂不支持 ARM32 与 iOS | 支持 **Android ARM32 / ARM64 以及 iOS（Mach-O / ObjC）** |
+| **社区成熟度** | 项目较新，已验证 Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / MSSDK，长尾系统库持续完善中 | 多年社区沉淀，公开案例、教程与边缘系统类桩极其丰富 |
+
+---
+
+## 10. 系统架构与源码目录
+
+```mermaid
+flowchart TB
+    subgraph Entry["接入与协议层"]
+        CLI["runidbg-cli · run / serve / mcp / debug / tape / taint / diff / vm / ui"]
+        RPC["Async RPC (tokio + axum) · Batch / Metrics / Hot Reload"]
+        MCP["MCP Server (stdio / HTTP) · 36 Tools"]
+        GDB["GDB RSP Stub (Unicorn) · rs / rc / Reverse Watch"]
+    end
+
+    subgraph ScriptLayer["QuickJS 脚本与多核调度层"]
+        Pool["MPMC Worker Pool (--workers auto)"]
+        Session["JsSession + bootstrap.js + runidbg.d.ts"]
+        Bridge["Native Bridge · JNI Hook / Native Hook"]
+    end
+
+    subgraph Facade["高层门面与分析引擎"]
+        Emu["AndroidEmulator · 超时/指令预算 · 统一 SVC 循环"]
+        Snap[".rtape Time-Travel · 稀疏脏页 · 跨后端接力"]
+        Tracer["BinaryTracer + Taint + Diff + VM Analyzer"]
+        Diag["EnvDiag · 缺环境自动诊断"]
+    end
+
+    subgraph Runtime["Android ARM64 运行时底座"]
+        Loader["DynamicLinker + APK + DexIndex"]
+        HLE["TrampolineTable (110+ HLE)"]
+        JNI["JniVm (JNI 1.6)"]
+        OS["DeviceProfile + VirtualFs (Dual RNG) + Net + Syscall"]
+        Mem["MemoryManager (Coalescing Free-List) + mem_match (SIMD)"]
+    end
+
+    subgraph Backends["统一多执行后端层 (CpuBackend)"]
+        UC["Unicorn 2.1 (全功能)"]
+        DYN["Dynarmic JIT"]
+        KVM["Linux ARM64 KVM"]
+        HVF["macOS Hypervisor"]
+    end
+
+    CLI --> RPC & MCP & GDB & Session
+    RPC --> Pool --> Session
+    MCP --> Session
+    Session --> Bridge --> Emu
+    GDB --> Emu
+    Emu --> Snap & Tracer & Diag & Loader & HLE & JNI & OS
+    Loader & HLE & JNI & OS --> Mem
+    Mem --> UC & DYN & KVM & HVF
+    Tracer -. 仅 Unicorn .-> UC
+    GDB -. 仅 Unicorn .-> UC
+```
+
+```text
+src/
+├── emulator.rs                 # AndroidEmulator 门面与统一外部 SVC 陷阱循环
+├── backend/                    # CpuBackend / Dynarmic / KVM / Hypervisor.framework
+├── loader/                     # ELF 动态链接器、APK/DEX 加载与 HLE Trampoline
+├── os/                         # DeviceProfile、SVC 系统调用、VFS（隔离双流 RNG）、Socket/Net
+├── jni/                        # JNI 1.6 环境、对象表、LocalFrame、va_list 与 Hook
+├── memory.rs                   # VMA 虚拟内存与 Coalescing Free-List 堆分配器
+├── mem_match.rs                # 零依赖 SIMD 通配符扫描器与 4KB 页块影子内存
+├── snapshot.rs / tape.rs       # 内存快照与 .rtape 多检查点稀疏脏页格式
+├── timetravel.rs               # 时间旅行引擎（EventLogBus / 关键帧缓存 / 反向观察点）
+├── tracer/                     # mmap 双流 Tracer、全知查询/Diff、字节级污点切片、VM 分析器
+├── debug/gdbstub.rs            # ARM64 GDB RSP 远程调试服务端
+├── diag.rs / crash.rs          # EnvDiag 缺环境自动诊断与 Guest 崩溃现场反汇编报告
+├── ui/                         # 内置暗黑 Web UI（Trace / 时间旅行 / RPC / EnvDiag）
+├── script/                     # QuickJS 桥接、Hook、runidbg.d.ts、多核 RPC 与 36 工具 MCP
+└── bin/runidbg-cli.rs          # 统一命令行入口
 ```
