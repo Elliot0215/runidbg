@@ -137,9 +137,9 @@ xychart-beta
 | 维度 | `runidbg`（本项目） | Java `unidbg` |
 | --- | --- | --- |
 | **运行性能与内存** | ✅ 原生 Rust + **四执行引擎（Unicorn / Dynarmic / KVM / Hypervisor）**，冷启动快 **22.6×**、纯算硬件加速最高 **480×**、RPC 内存仅 **1/5.6**（21.7 MB vs 122.1 MB） | ⚠️ JVM + JNI/JNA 跨边界开销，冷启动 ~1.7s，单实例 ~122 MB |
-| **指令级 Trace** | ✅ 零拷贝 mmap 二进制双流 + 离线 `bad64` 解码，吞吐高 **31×–114×**，自带 `dump`/`search`/IDA/BN 导出 | ⚠️ 热路径实时 Capstone 文本反汇编落盘，吞吐 ~0.15 M/s，文本体积大 3.7× |
-| **脚本开发体验** | ✅ **零编译 QuickJS** + 完整 `runidbg.d.ts` 智能提示 + Frida 风格 Hook + `EnvDiag` 自动生成补环境 JS | ⚠️ 需配置 Maven/JDK 工程并编写/编译 Java 代码，迭代周期更长 |
-| **工程化与 AI 集成** | ✅ 原生内置多核异步 HTTP/JSON-RPC 2.0、Prometheus `/metrics`、热重载、**MCP 32 工具**、**`.rtape` 持久化磁带与时间旅行反向调试**、Host Socket 透传与抓包、GDB RSP、APK 加载 | ⚠️ 核心定位为 Java 库，RPC 服务池、监控、时间旅行与 AI Agent 接入需自行二次封装 |
+| **指令级 Trace** | ✅ 零拷贝 mmap 二进制双流（含 HLE `memcpy`/`memset`/`malloc`/`free` 事件）+ 离线 `bad64` 解码 + **字节级前向污点/反向因果切片** + **双跑 `diff`** + **全知内存值查询**，吞吐高 **31×–114×** | ⚠️ 热路径实时 Capstone 文本反汇编落盘，吞吐 ~0.15 M/s，文本体积大 3.7× |
+| **脚本开发体验** | ✅ **零编译 QuickJS** + 完整 `runidbg.d.ts` + `ctx.reg64()` 无损 BigInt + `hook.mem` Rust 侧值/宽度/PC 过滤 + `--freeze-layout` 宿主堆隔离 + `EnvDiag` 自动生成补环境 JS | ⚠️ 需配置 Maven/JDK 工程并编写/编译 Java 代码，迭代周期更长 |
+| **工程化与 AI 集成** | ✅ 原生内置多核异步 HTTP/JSON-RPC 2.0、Prometheus `/metrics`、热重载、**MCP 35 工具**、**`.rtape` 持久化磁带与时间旅行反向调试**、Host Socket 透传与抓包、GDB RSP、APK 加载 | ⚠️ 核心定位为 Java 库，RPC 服务池、监控、时间旅行与 AI Agent 接入需自行二次封装 |
 | **平台与架构支持** | ⚠️ **目前仅支持 Android ARM64（`aarch64`）**，暂不支持 ARM32 与 iOS | ✅ **支持 Android ARM32 / ARM64 以及 iOS（Mach-O / ObjC）** |
 | **成熟度与样本生态** | ⚠️ **项目较新**，已验证 Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / 真实 MSSDK 等，但冷门系统库与长尾样本覆盖仍在持续扩充 | ✅ **多年社区沉淀**，公开案例、教程、Android 系统类桩与边缘 syscall 覆盖非常成熟 |
 | **Java 字节码执行** | ⚠️ 无内置 ART/Dalvik 解释器，Java 侧回调依赖内置模型与 JS Hook 补全 | ⚠️ 同样不直接解释执行 DEX 字节码，依赖 `AbstractJni` 补环境 |
@@ -158,7 +158,7 @@ flowchart TB
     subgraph Entry["接入与协议层 (CLI / Script / Service / Debugger)"]
         CLI["runidbg-cli\nrun / serve / mcp / debug / tape / trace / ui"]
         RPC["Async RPC Server (tokio + axum)\nKeep-Alive · Batch · /metrics · Hot Reload"]
-        MCP["MCP Server (stdio / HTTP)\n32 Reverse-Engineering & Time-Travel Tools"]
+        MCP["MCP Server (stdio / HTTP)\n35 Reverse-Engineering, Taint & Time-Travel Tools"]
         GDB["GDB RSP Stub (TCP · 仅 Unicorn)\nIDA Pro · Binary Ninja · pwndbg · rs / rc / watch"]
     end
 
@@ -358,14 +358,21 @@ cargo run --release --bin runidbg-cli -- serve examples/scripts/rpc_demo.js \
 - `POST /admin/reload`：先校验后原子滚动热重载（需 `--allow-reload`）
 - `POST /eval`：动态执行 JS（需 `--allow-eval`）
 
-### 3. 离线二进制 Trace 分析与 IDA / Binary Ninja 导出
+### 3. 离线二进制 Trace 分析、污点溯源、双跑 Diff 与 IDA / Binary Ninja 导出
 
 ```bash
-# 查看指令反汇编、寄存器增量与关联内存 R/W（自动探测同级 .ext）
+# 查看指令反汇编、寄存器增量、访存 R/W 与 HLE memcpy/memset/malloc/free 事件（自动探测同级 .ext）
 runidbg-cli dump trace_full.idx --skip 0 --limit 50
 
 # 毫秒级检索指定寄存器值 / 访存地址 / PC
 runidbg-cli search trace_full.idx --val 0x03000001
+
+# 字节级离线污点追踪与反向因果切片（免疫栈帧/VM 寄存器堆地址复用，自动跨越 HLE memcpy 与 S-Box 查表）
+runidbg-cli taint trace_full.idx --mode backward --addr 0x50006470 --len 8 --base 0x40000000
+runidbg-cli taint trace_full.idx --mode forward  --addr 0x50001000 --len 16 --base 0x40000000
+
+# 双跑 Trace 差分：一键定位首次控制流分歧与首次寄存器/内存/HLE 数据分歧
+runidbg-cli diff run_a.idx run_b.idx --base 0x40000000 --limit 50
 
 # 导出 IDA Pro / Binary Ninja 执行覆盖率高亮脚本
 runidbg-cli export-ida trace_full.idx --base 0x40000000 --out ida_cov.py
@@ -433,7 +440,7 @@ runidbg-cli debug samples/libstatic-webp.so WebPGetDecoderVersion --listen 127.0
 ## 🧪 测试与校验
 
 ```bash
-# 全量测试（91/91 通过，覆盖四引擎一致性 / .rtape 磁带与时间旅行 / Web UI / Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / TikTok MSSDK / JS / RPC / MCP / GDB / APK / DeviceProfile）
+# 全量测试（99/99 通过，覆盖四引擎一致性 / 离线污点与反向切片 / HLE Trace 与双跑 Diff / .rtape 磁带与时间旅行 / Web UI / Cronet / Conscrypt / MMKV / SQLite / WebP / Zstd / TikTok MSSDK / JS / RPC / MCP / GDB / APK / DeviceProfile）
 cargo test --features ui
 
 # 全 feature 组合 Clippy 零警告校验

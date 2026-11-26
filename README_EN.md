@@ -137,9 +137,9 @@ xychart-beta
 | Dimension | `runidbg` (This Project) | Java `unidbg` |
 | --- | --- | --- |
 | **Performance & Footprint** | ✅ Pure Rust + **4 execution backends (Unicorn / Dynarmic / KVM / Hypervisor)**: **22.6×** faster cold start, up to **480×** HW compute speedup, **5.6×** lower single-worker RPC RAM (21.7 MB vs 122.1 MB) | ⚠️ JVM + JNI/JNA overhead (~1.7s cold start, ~122 MB per instance) |
-| **Instruction Tracing** | ✅ Zero-copy binary mmap + offline `bad64` decoding: **31×–114×** faster, 3.7× smaller, built-in `dump`/`search`/IDA/BN export | ⚠️ Online Capstone text formatting in hot path (~0.15 M insns/s, ~118 B/insn) |
-| **Scripting Ergonomics** | ✅ **Zero-compile QuickJS** + `runidbg.d.ts` IntelliSense + Frida-style hooks + `EnvDiag` auto-patch generator | ⚠️ Requires JDK/Maven project setup and Java compilation per iteration |
-| **Engineering & AI Integration** | ✅ Built-in async multi-core HTTP/JSON-RPC 2.0, Prometheus `/metrics`, hot reload, **32-tool MCP server**, **`.rtape` snapshots & time-travel reverse debugging**, Host Socket passthrough & packet capture, GDB RSP, APK loader | ⚠️ Primarily a Java library; RPC pooling, metrics, time-travel, and AI agent integration require custom wrappers |
+| **Instruction Tracing** | ✅ Zero-copy binary mmap (with HLE `memcpy`/`memset`/`malloc`/`free`) + offline `bad64` decoding + **byte-granular forward taint & backward causal slicing** + **dual-run `diff`** + **omniscient value/addr query** (**31×–114×** faster) | ⚠️ Online Capstone text formatting in hot path (~0.15 M insns/s, ~118 B/insn) |
+| **Scripting Ergonomics** | ✅ **Zero-compile QuickJS** + `runidbg.d.ts` + lossless `ctx.reg64()` BigInt + Rust-side `hook.mem` filters + `--freeze-layout` host/guest heap isolation + `EnvDiag` auto-patch generator | ⚠️ Requires JDK/Maven project setup and Java compilation per iteration |
+| **Engineering & AI Integration** | ✅ Built-in async multi-core HTTP/JSON-RPC 2.0, Prometheus `/metrics`, hot reload, **35-tool MCP server**, **`.rtape` snapshots & time-travel reverse debugging**, Host Socket passthrough & packet capture, GDB RSP, APK loader | ⚠️ Primarily a Java library; RPC pooling, metrics, time-travel, and AI agent integration require custom wrappers |
 | **Platform & Arch Support** | ⚠️ **Android ARM64 (`aarch64`) only** — no ARM32 or iOS support yet | ✅ **Supports Android ARM32 / ARM64 and iOS (Mach-O / ObjC)** |
 | **Maturity & Sample Ecosystem** | ⚠️ **Newer project** — verified on Cronet, Conscrypt, MMKV, SQLite, WebP, Zstd, and real MSSDK, but long-tail Android framework stubs & edge syscalls are still growing | ✅ **Years of community battle-testing** with extensive public examples, tutorials, and edge-case stubs |
 | **Java Bytecode Execution** | ⚠️ No built-in ART/Dalvik bytecode interpreter; Java callbacks rely on built-in models + JS hooks | ⚠️ Same — relies on `AbstractJni` stubs rather than executing DEX bytecode |
@@ -158,7 +158,7 @@ flowchart TB
     subgraph Entry["Entry & Protocol Layer (CLI / Script / Service / Debugger)"]
         CLI["runidbg-cli\nrun / serve / mcp / debug / tape / trace / ui"]
         RPC["Async RPC Server (tokio + axum)\nKeep-Alive · Batch · /metrics · Hot Reload"]
-        MCP["MCP Server (stdio / HTTP)\n32 Reverse-Engineering & Time-Travel Tools"]
+        MCP["MCP Server (stdio / HTTP)\n35 Reverse-Engineering, Taint & Time-Travel Tools"]
         GDB["GDB RSP Stub (TCP · Unicorn Only)\nIDA Pro · Binary Ninja · pwndbg · rs / rc / watch"]
     end
 

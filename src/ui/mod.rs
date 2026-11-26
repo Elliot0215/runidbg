@@ -263,9 +263,9 @@ async fn handle_dump(State(st): State<Arc<TraceUiState>>, uri: Uri) -> Response 
                 .collect();
             let mems: Vec<String> = if st.has_ext {
                 st.reader
-                    .mem_events_for(idx)
+                    .mem_and_hle_lines_for(idx)
                     .into_iter()
-                    .map(|e| BinaryTracer::format_ext_record(&e).trim().to_string())
+                    .map(|line| line.trim().to_string())
                     .collect()
             } else {
                 Vec::new()

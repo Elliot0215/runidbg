@@ -271,6 +271,19 @@ impl Default for JsNativeHookTable {
     }
 }
 
+/// `emu.hook.mem` 的 Rust 侧高速过滤与精度配置（未命中时在 Rust 侧直接短路，不进入 QuickJS）
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MemHookFilter {
+    /// 仅当读写值等于该 64-bit 数值时回调
+    pub value: Option<u64>,
+    /// 仅当访存宽度等于该字节数（1/2/4/8）时回调
+    pub size: Option<usize>,
+    /// 仅当触发指令 PC 落在 `[lo, hi]` 闭区间内时回调
+    pub pc_range: Option<(u64, u64)>,
+    /// 为 true 时以 64-bit `BigInt` 形式传递 `addr` 与 `value`（避免 > 2^53 精度丢失）
+    pub big_int: bool,
+}
+
 impl JsNativeHookTable {
     fn alloc_id(&mut self) -> usize {
         let id = self.next_id;
@@ -333,7 +346,9 @@ impl JsNativeHookTable {
         Ok(id)
     }
 
-    /// 注册内存读写 Watchpoint（`emu.hook.mem`）
+    /// 注册内存读写 Watchpoint（`emu.hook.mem`），返回 `(hook_id, is_unmapped)`
+    ///
+    /// 时序说明：Unicorn 的 `MEM_READ` 在读之前触发，`MEM_WRITE` 在写之前触发并传入待写入值 `value`。
     #[allow(clippy::too_many_arguments)]
     pub fn add_mem_hook(
         &mut self,
@@ -343,8 +358,9 @@ impl JsNativeHookTable {
         end: u64,
         read: bool,
         write: bool,
+        filter: MemHookFilter,
         callback: Persistent<Function<'static>>,
-    ) -> Result<usize> {
+    ) -> Result<(usize, bool)> {
         let hook_type = match (read, write) {
             (true, true) => HookType::MEM_READ | HookType::MEM_WRITE,
             (true, false) => HookType::MEM_READ,
@@ -352,11 +368,59 @@ impl JsNativeHookTable {
             (false, false) => bail!("mem hook 至少需要启用 read 或 write"),
         };
 
+        let is_unmapped = !uc.get_data().mem.has_any_mapped_page_in(begin, end);
+        if is_unmapped {
+            tracing::warn!(
+                target: "runidbg::hook",
+                begin = format_args!("0x{begin:x}"),
+                end = format_args!("0x{end:x}"),
+                "hook.mem 注册区间当前尚无已映射页（若后续 mmap 到该区间仍可生效，若地址过时则会静默不触发）"
+            );
+        }
+
         let cb_cell = Rc::new(RefCell::new(Some(callback)));
         let cb_ref = Rc::clone(&cb_cell);
 
         let uc_id = uc
             .add_mem_hook(hook_type, begin, end, move |uc, mem_type, addr, size, value| {
+                // Rust 侧零开销快速过滤：不命中直接短路，不进入 QuickJS
+                if let Some(exp_sz) = filter.size {
+                    if size != exp_sz {
+                        return true;
+                    }
+                }
+                if let Some((pc_lo, pc_hi)) = filter.pc_range {
+                    let cur_pc = uc.reg_read(RegisterARM64::PC).unwrap_or(0);
+                    if cur_pc < pc_lo || cur_pc > pc_hi {
+                        return true;
+                    }
+                }
+                let width_mask = match size {
+                    1 => 0xFFu64,
+                    2 => 0xFFFFu64,
+                    4 => 0xFFFF_FFFFu64,
+                    _ => u64::MAX,
+                };
+                // WRITE 使用按宽度截断后的待写值；READ（Unicorn 恒传 0）读取真实内存字节后再按宽度截断
+                let val_u64 = if matches!(mem_type, MemType::WRITE) {
+                    (value as u64) & width_mask
+                } else if matches!(mem_type, MemType::READ) {
+                    let mut buf = [0u8; 8];
+                    let n = size.min(8);
+                    if uc.mem_read(addr, &mut buf[..n]).is_ok() {
+                        u64::from_le_bytes(buf) & width_mask
+                    } else {
+                        0
+                    }
+                } else {
+                    (value as u64) & width_mask
+                };
+                if let Some(exp_val) = filter.value {
+                    if val_u64 != (exp_val & width_mask) {
+                        return true;
+                    }
+                }
+
                 let Some(raw_ctx) = current_js_ctx() else {
                     return true;
                 };
@@ -374,13 +438,37 @@ impl JsNativeHookTable {
                 let js_ctx = unsafe { Ctx::from_raw(raw_ctx) };
                 if let (Ok(func), Ok(cpu_ctx)) = (pfn.restore(&js_ctx), make_cpu_ctx(&js_ctx, emu_id))
                 {
-                    if let Err(err) = func.call::<_, Value<'_>>((
-                        cpu_ctx,
-                        access,
-                        addr as f64,
-                        size,
-                        value as f64,
-                    )) {
+                    let call_res = if filter.big_int {
+                        match (
+                            rquickjs::BigInt::from_u64(js_ctx.clone(), addr),
+                            rquickjs::BigInt::from_u64(js_ctx.clone(), val_u64),
+                            rquickjs::BigInt::from_u64(js_ctx.clone(), val_u64),
+                        ) {
+                            (Ok(addr_bi), Ok(val_bi), Ok(val_bi64)) => func.call::<_, Value<'_>>((
+                                cpu_ctx,
+                                access,
+                                addr_bi,
+                                size,
+                                val_bi,
+                                val_bi64,
+                            )),
+                            _ => Ok(Value::new_undefined(js_ctx.clone())),
+                        }
+                    } else {
+                        let val_bi = rquickjs::BigInt::from_u64(js_ctx.clone(), val_u64)
+                            .ok()
+                            .map(|b| b.into_value())
+                            .unwrap_or_else(|| Value::new_undefined(js_ctx.clone()));
+                        func.call::<_, Value<'_>>((
+                            cpu_ctx,
+                            access,
+                            addr as f64,
+                            size,
+                            val_u64 as f64,
+                            val_bi,
+                        ))
+                    };
+                    if let Err(err) = call_res {
                         eprintln!("[JS MEM HOOK ERROR] {access} @0x{addr:x}: {err}");
                     }
                 }
@@ -396,7 +484,7 @@ impl JsNativeHookTable {
                 callback: cb_cell,
             },
         );
-        Ok(id)
+        Ok((id, is_unmapped))
     }
 
     /// 注册函数替换 Hook（`emu.hook.replace`）：

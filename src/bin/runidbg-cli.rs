@@ -43,7 +43,7 @@ fn print_usage() {
          全局选项 (置于子命令之前):\n\
            [--log-level <trace|debug|info|warn|error>] [--log-format <compact|json>]\n\
          用法:\n\
-           runidbg-cli run <script.js> [-- <args...>]                                         运行 QuickJS 仿真脚本\n\
+           runidbg-cli run [--freeze-layout] <script.js> [-- <args...>]                       运行 QuickJS 仿真脚本（--freeze-layout 隔离宿主分配，稳定 guest 堆地址）\n\
            runidbg-cli serve <script.js> [--listen 127.0.0.1:8080] [--workers 1|auto]         启动异步 HTTP/JSON-RPC 2.0 服务\n\
                      [--max-queue 1024] [--timeout-ms 30000] [--max-insns 0]\n\
                      [--allow-reload] [--allow-eval] [-- <args...>]\n\
@@ -53,29 +53,65 @@ fn print_usage() {
            runidbg-cli tape info <file.rtape>                                                 查看 .rtape 磁带检查点、时间轴事件与压缩统计\n\
            runidbg-cli init-types [dir]                                                       生成 runidbg.d.ts 类型声明\n\
            runidbg-cli dump <trace.idx> [--ext <trace.ext>] [--base <hex>] [--skip N] [--limit N]\n\
-           runidbg-cli search <trace.idx> [--ext <trace.ext>] [--base <hex>] [--val <hex>] [--addr <hex>] [--pc <hex>]\n\
+           runidbg-cli search|find <trace.idx> [--ext <trace.ext>] [--base <hex>] [--val <hex>] [--addr <hex>] [--pc <hex>]\n\
                      [--ascii <text>] [--bytes <hex>] [--limit N]\n\
+           runidbg-cli diff <a.idx> <b.idx> [--ext-a <a.ext>] [--ext-b <b.ext>] [--base <hex>] [--limit N]\n\
+           runidbg-cli taint <trace.idx> [--ext <trace.ext>] [--mode <forward|backward>] (--addr <hex> [--len N] | --reg <x0>)\n\
+                     [--at <idx>] [--max-insns N] [--limit N] [--base <hex>] [--no-mem-index] [--track-sp]\n\
            runidbg-cli stats <trace.idx> [--base <hex>] [--top N]\n\
            runidbg-cli calltree <trace.idx> [--base <hex>] [--max-depth N] [--min-insns N]\n\
            runidbg-cli crypto-scan <trace.idx> [--ext <trace.ext>] [--base <hex>]\n\
            runidbg-cli ui <trace.idx|file.rtape> [--ext <trace.ext>] [--base <hex>] [--listen 127.0.0.1:8088] [--open]\n\
            runidbg-cli export-ida <trace.idx> --base <hex> [--out <script.py>]\n\
-           runidbg-cli export-bn  <trace.idx> --base <hex> [--out <script.py>]"
+           runidbg-cli export-bn  <trace.idx> --base <hex> [--out <script.py>]\n\
+         Trace 级别说明（JS `emu.trace.start({{ level, capacity }})`）:\n\
+           fast      仅记录 PC/Opcode（无 .ext）\n\
+           reg_delta 记录 PC/Opcode + 寄存器增量（默认，无内存 .ext）\n\
+           full      记录指令 + 寄存器增量 + 访存 R/W + HLE memcpy/memset/malloc/free（唯一产出 .ext，供 taint/search --addr/--bytes 使用）"
     );
 }
 
 #[cfg(feature = "js")]
 fn run_js_command(args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        bail!("用法: runidbg-cli run <script.js> [-- <args...>]");
+    let mut freeze_layout = false;
+    let mut script_path: Option<PathBuf> = None;
+    let mut script_args: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            script_args.extend_from_slice(&args[i + 1..]);
+            break;
+        }
+        if arg == "--freeze-layout" && script_path.is_none() {
+            freeze_layout = true;
+            i += 1;
+            continue;
+        }
+        if script_path.is_none() {
+            if arg.starts_with("--") {
+                bail!("run 未知选项: {arg}（支持 --freeze-layout）");
+            }
+            script_path = Some(PathBuf::from(arg));
+            i += 1;
+            continue;
+        }
+        if arg == "--freeze-layout" && script_args.is_empty() {
+            freeze_layout = true;
+            i += 1;
+            continue;
+        }
+        script_args.push(args[i].clone());
+        i += 1;
     }
-    let script_path = PathBuf::from(&args[0]);
-    let script_args: Vec<String> = if args.get(1).map(String::as_str) == Some("--") {
-        args[2..].to_vec()
-    } else {
-        args[1..].to_vec()
+    let Some(script_path) = script_path else {
+        bail!("用法: runidbg-cli run [--freeze-layout] <script.js> [-- <args...>]");
     };
-    runidbg_arm64_emu_tracer::script::JsRunner::run_file(&script_path, &script_args)?;
+    runidbg_arm64_emu_tracer::script::JsRunner::run_file_with_freeze_layout(
+        &script_path,
+        &script_args,
+        freeze_layout,
+    )?;
     Ok(())
 }
 
@@ -569,6 +605,202 @@ fn debug_gdb_command(args: &[String]) -> Result<()> {
     runidbg_arm64_emu_tracer::debug::GdbServer::serve(&mut emu, &listen_addr, start_pc, &[])
 }
 
+fn diff_command(args: &[String]) -> Result<()> {
+    if args.len() < 2 {
+        bail!("用法: runidbg-cli diff <a.idx> <b.idx> [--ext-a <a.ext>] [--ext-b <b.ext>] [--base <hex>] [--limit N]");
+    }
+    let a_idx = PathBuf::from(&args[0]);
+    let b_idx = PathBuf::from(&args[1]);
+    let mut a_ext: Option<PathBuf> = None;
+    let mut b_ext: Option<PathBuf> = None;
+    let mut base_addr: u64 = 0;
+    let mut limit: usize = 64;
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ext-a" => {
+                let v = take_flag_value(args, &mut i, "--ext-a")?;
+                a_ext = Some(PathBuf::from(v));
+            }
+            "--ext-b" => {
+                let v = take_flag_value(args, &mut i, "--ext-b")?;
+                b_ext = Some(PathBuf::from(v));
+            }
+            "--base" => {
+                let v = take_flag_value(args, &mut i, "--base")?;
+                base_addr = parse_u64_hex_or_dec(v)?;
+            }
+            "--limit" => {
+                let v = take_flag_value(args, &mut i, "--limit")?;
+                limit = v.parse::<usize>().context("无效的 --limit 值")?;
+                if limit == 0 {
+                    bail!("--limit 必须 >= 1");
+                }
+            }
+            other => bail!("diff 未知参数: {other}"),
+        }
+    }
+    if a_ext.is_none() {
+        let sib = a_idx.with_extension("ext");
+        if sib != a_idx && sib.is_file() {
+            a_ext = Some(sib);
+        }
+    }
+    if b_ext.is_none() {
+        let sib = b_idx.with_extension("ext");
+        if sib != b_idx && sib.is_file() {
+            b_ext = Some(sib);
+        }
+    }
+    let ra = TraceReader::open(&a_idx, a_ext.as_deref())?;
+    let rb = TraceReader::open(&b_idx, b_ext.as_deref())?;
+    let summary = TraceReader::diff_traces(&ra, &rb, limit);
+    let fmt_rel = |pc: u64| -> String {
+        if base_addr != 0 && pc >= base_addr {
+            format!(" [+0x{:x}]", pc - base_addr)
+        } else {
+            String::new()
+        }
+    };
+    println!(
+        "# 双跑 Trace Diff: A={} 条 vs B={} 条 | 公共前缀={} 条",
+        summary.total_a, summary.total_b, summary.common_prefix_insns
+    );
+    println!(
+        "# 首次控制流分歧: {:?} | 首次数据流分歧: {:?} | 输出差异: {} 条",
+        summary.first_control_divergence_idx,
+        summary.first_data_divergence_idx,
+        summary.diffs.len()
+    );
+    for d in &summary.diffs {
+        println!(
+            "  #{:06} [{:<7}] pcA=0x{:016x}{} pcB=0x{:016x}{} | {}",
+            d.idx,
+            d.kind,
+            d.pc_a,
+            fmt_rel(d.pc_a),
+            d.pc_b,
+            fmt_rel(d.pc_b),
+            d.detail
+        );
+    }
+    Ok(())
+}
+
+fn taint_command(args: &[String]) -> Result<()> {
+    if args.is_empty() {
+        bail!(
+            "用法: runidbg-cli taint <trace.idx> [--ext <trace.ext>] [--mode <forward|backward>] (--addr <hex> [--len N] | --reg <x0>) [--at <idx>] [--max-insns N] [--limit N] [--base <hex>] [--no-mem-index] [--track-sp]"
+        );
+    }
+    let idx_path = PathBuf::from(&args[0]);
+    let mut ext_path: Option<PathBuf> = None;
+    let mut mode = "backward".to_string();
+    let mut target_addr: Option<u64> = None;
+    let mut target_len: usize = 8;
+    let mut target_reg: Option<String> = None;
+    let mut anchor_idx: Option<usize> = None;
+    let mut max_insns: usize = 0;
+    let mut limit: usize = 256;
+    let mut base_addr: u64 = 0;
+    let mut track_mem_index = true;
+    let mut track_sp = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ext" => {
+                let v = take_flag_value(args, &mut i, "--ext")?;
+                ext_path = Some(PathBuf::from(v));
+            }
+            "--mode" => {
+                let v = take_flag_value(args, &mut i, "--mode")?;
+                mode = v.to_ascii_lowercase();
+            }
+            "--addr" => {
+                let v = take_flag_value(args, &mut i, "--addr")?;
+                target_addr = Some(parse_u64_hex_or_dec(v)?);
+            }
+            "--len" => {
+                let v = take_flag_value(args, &mut i, "--len")?;
+                target_len = v.parse::<usize>().context("无效的 --len 值")?;
+                if target_len == 0 {
+                    bail!("--len 必须 >= 1");
+                }
+            }
+            "--reg" => {
+                let v = take_flag_value(args, &mut i, "--reg")?;
+                target_reg = Some(v.to_string());
+            }
+            "--at" | "--start" => {
+                let flag = args[i].as_str();
+                let v = take_flag_value(args, &mut i, flag)?;
+                anchor_idx = Some(v.parse().context("无效的 --at 值")?);
+            }
+            "--max-insns" => {
+                let v = take_flag_value(args, &mut i, "--max-insns")?;
+                max_insns = v.parse().context("无效的 --max-insns 值")?;
+            }
+            "--limit" => {
+                let v = take_flag_value(args, &mut i, "--limit")?;
+                limit = v.parse().context("无效的 --limit 值")?;
+            }
+            "--base" => {
+                let v = take_flag_value(args, &mut i, "--base")?;
+                base_addr = parse_u64_hex_or_dec(v)?;
+            }
+            "--no-mem-index" => {
+                track_mem_index = false;
+                i += 1;
+            }
+            "--track-sp" => {
+                track_sp = true;
+                i += 1;
+            }
+            other => bail!("taint 未知参数: {other}"),
+        }
+    }
+
+    if target_reg.is_some() && target_addr.is_some() {
+        bail!("taint 的 --addr 与 --reg 互斥，请只提供其中一个");
+    }
+
+    let seed = if let Some(ref reg_name) = target_reg {
+        let slot = runidbg_arm64_emu_tracer::tracer::parse_reg_slot(reg_name)
+            .ok_or_else(|| anyhow::anyhow!("无效的寄存器名: {reg_name}"))?;
+        runidbg_arm64_emu_tracer::tracer::TaintSeed::Reg { reg_id: slot }
+    } else if let Some(addr) = target_addr {
+        runidbg_arm64_emu_tracer::tracer::TaintSeed::Mem {
+            addr,
+            len: target_len,
+        }
+    } else {
+        bail!("taint 必须提供 --addr <hex> 或 --reg <x0>");
+    };
+
+    if ext_path.is_none() {
+        let sib = idx_path.with_extension("ext");
+        if sib != idx_path && sib.is_file() {
+            ext_path = Some(sib);
+        }
+    }
+    let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+    let opts = runidbg_arm64_emu_tracer::tracer::TaintOptions {
+        anchor_idx,
+        max_insns,
+        max_steps: limit,
+        track_mem_index,
+        track_sp,
+    };
+    let report = match mode.as_str() {
+        "forward" | "fwd" => reader.taint_forward(&seed, &opts),
+        "backward" | "bwd" | "slice" => reader.taint_backward(&seed, &opts),
+        other => bail!("无效的 --mode `{other}`（支持 forward / backward）"),
+    };
+    print!("{}", report.format_summary(base_addr));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let raw_args: Vec<String> = env::args().collect();
     let mut log_level: Option<String> = None;
@@ -616,6 +848,8 @@ fn main() -> Result<()> {
         "mcp" => return mcp_command(&args[2..]),
         "debug" => return debug_gdb_command(&args[2..]),
         "tape" => return tape_command(&args[2..]),
+        "diff" => return diff_command(&args[2..]),
+        "taint" => return taint_command(&args[2..]),
         "ui" => return ui_command(&args[2..]),
         "init-types" => return init_types_command(&args[2..]),
         "-h" | "--help" | "help" => {
@@ -750,14 +984,14 @@ fn main() -> Result<()> {
                         println!("    [REG] {name} <- 0x{reg_val:016x}{hint}");
                     }
                     if ext_path.is_some() {
-                        for ext in reader.mem_events_for(idx) {
-                            println!("{}", BinaryTracer::format_ext_record(&ext));
+                        for line in reader.mem_and_hle_lines_for(idx) {
+                            println!("{line}");
                         }
                     }
                 }
             }
         }
-        "search" => {
+        "search" | "find" => {
             if let Some(target) = val_filter {
                 let reg_hits = reader.search_value_attributed(target);
                 println!("# 命中寄存器写入值 0x{target:016x}: {} 条", reg_hits.len());

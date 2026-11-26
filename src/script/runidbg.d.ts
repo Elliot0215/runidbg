@@ -76,13 +76,27 @@ interface EmuOptions {
   device?: DevicePresetName | DeviceProfileConfig;
   realClock?: boolean;
   net?: boolean | NetOptions;
+  /**
+   * 冻结 guest 堆布局（等同于 CLI `runidbg-cli run --freeze-layout`）：
+   * 开启后，`emu.mem.alloc()` 会自动改用独立的 `[host-scratch]` 区（0x6400_0000+），
+   * 不再占用 guest `malloc/calloc/realloc` 所在的 0x5000_0000 堆空间，
+   * 确保“先跑找地址、再挂 Hook 重跑”的两遍法 guest 堆地址 100% 稳定。
+   */
+  freezeLayout?: boolean;
 }
 
 interface TraceOptions {
   output?: string;
+  /**
+   * Trace 采集级别（默认 `"reg_delta"`）：
+   * - `"fast"`: 仅记录 PC 与指令码（不产出 `.ext`）
+   * - `"reg_delta"`: 记录指令 + 寄存器增量（默认，不记录访存）
+   * - `"full"`: 记录指令 + 寄存器增量 + 全量内存 R/W + HLE `memcpy/memset/malloc/free`（**仅 `"full"` 产出 `.ext` 供离线 `taint` / `query` / `reconstructMem` 使用**）
+   */
   level?: "fast" | "reg_delta" | "full";
   start?: number | bigint;
   end?: number | bigint;
+  /** 最大指令记录容量（默认 `262144`；若耗尽截断，`trace.stop()` 会输出告警且 `stats.truncated === true`） */
   capacity?: number;
 }
 
@@ -92,6 +106,8 @@ interface TraceStats {
   totalInsns: number;
   droppedInsns: number;
   droppedExt: number;
+  /** 若指令或扩展流发生缓冲区截断则为 `true` */
+  truncated: boolean;
 }
 
 interface RegisteredNativeInfo {
@@ -112,6 +128,8 @@ interface UnhandledJniInfo {
 
 interface HookHandle {
   readonly id: number;
+  /** 仅 `emu.hook.mem` 返回：若注册区间当前完全未映射，值为 `true`（Hook 仍已挂入，未来映射后生效；同时会输出 warn 日志） */
+  readonly unmapped?: boolean;
   detach(): boolean;
 }
 
@@ -123,6 +141,20 @@ interface CodeHookOptions {
 interface MemHookOptions {
   read?: boolean;
   write?: boolean;
+  /**
+   * Rust 侧值过滤：仅当读写值（按本次访问宽度截断后）等于 `value` 时才跨入 QuickJS 回调，
+   * 可大幅减少高频访存 Hook 的 JS 桥接开销。
+   */
+  value?: number | bigint;
+  /** Rust 侧访问宽度过滤（仅匹配指定字节宽度的访存，如 1 / 2 / 4 / 8） */
+  size?: number;
+  /** Rust 侧 PC 范围过滤 `[startPc, endPc]`（闭区间），仅当触发访存的指令 PC 落在该区间内才回调 */
+  pcRange?: [number | bigint, number | bigint];
+  /**
+   * 开启后，回调的第 3 个参数 `addr` 与第 5 个参数 `value` 直接以 `bigint` 传入（避免超过 2^53 的 64 位值精度丢失）。
+   * 无论是否开启，回调的第 6 个参数 `value64` 始终以 `bigint` 传入。
+   */
+  bigInt?: boolean;
 }
 
 interface CpuContext {
@@ -137,7 +169,10 @@ interface CpuContext {
   nzcv: number;
   retval: number;
   readonly mem: MemNamespace;
+  /** 读取寄存器为 JS number（注意：超过 2^53 的 64 位值会丢失低位精度，涉及大整数/哈希/位运算请改用 `reg64`） */
   reg(name: string): number;
+  /** 精确无损读取 64 位寄存器为 `bigint`（`regBigInt` 的简写别名） */
+  reg64(name: string): bigint;
   regBigInt(name: string): bigint;
   setReg(name: string, value: number | bigint): void;
   args(count?: number): number[];
@@ -151,6 +186,8 @@ interface AttachCallbacks {
 
 interface RegsNamespace {
   get(name: string): number;
+  /** 精确无损读取 64 位寄存器为 `bigint`（`getBigInt` 的简写别名） */
+  get64(name: string): bigint;
   getBigInt(name: string): bigint;
   set(name: string, value: number | bigint): void;
   dump(): Record<string, number>;
@@ -182,14 +219,62 @@ interface HookNamespace {
     fn: (ctx: CpuContext, pc: number, size: number) => void,
     options?: CodeHookOptions
   ): HookHandle;
+  /**
+   * 内存读写 Hook（**访存提交前**触发回调：
+   * - `read`: 在内存读返回给目标指令之前触发，`value` 尚未写入目标寄存器，如需读原始字节可用 `ctx.mem.readBytes(addr, size)`；
+   * - `write`: 在新值真正写入目标内存之前触发，`value` / `value64` 为**即将写入的新值**，`ctx.mem.readBytes(addr, size)` 读到的是**旧值**）。
+   * - 若注册地址区间当前尚未映射，不会静默丢弃：Hook 仍挂入（后续映射后自动触发），同时输出 warn 日志且返回的 `handle.unmapped === true`。
+   * - 回调第 6 参数 `value64` 始终为无损 64 位 `bigint`；传入 `options.bigInt = true` 时 `addr` 与 `value` 也会直接以 `bigint` 传入。
+   */
   mem(
     range: [number | bigint, number | bigint],
     options: MemHookOptions,
-    fn: (ctx: CpuContext, access: "read" | "write" | "other", addr: number, size: number, value: number) => void
+    fn: (
+      ctx: CpuContext,
+      access: "read" | "write" | "other",
+      addr: number | bigint,
+      size: number,
+      value: number | bigint,
+      value64: bigint
+    ) => void
   ): HookHandle;
   mem(
     range: [number | bigint, number | bigint],
-    fn: (ctx: CpuContext, access: "read" | "write" | "other", addr: number, size: number, value: number) => void
+    fn: (
+      ctx: CpuContext,
+      access: "read" | "write" | "other",
+      addr: number,
+      size: number,
+      value: number,
+      value64: bigint
+    ) => void
+  ): HookHandle;
+  /**
+   * Guest 侧地址区间读写监视（`emu.hook.mem` 的便捷别名，覆盖 guest `STR`/`STP`/`LDR`/`LDP` 指令）。
+   * - `mode`: `"w"`（默认，仅监视写入）| `"r"`（仅监视读取）| `"rw"`（读写均监视），或传 `MemHookOptions` 对象。
+   */
+  watch(
+    range: [number | bigint, number | bigint],
+    modeOrOpts: "w" | "r" | "rw" | (MemHookOptions & { mode?: "w" | "r" | "rw" }),
+    fn: (
+      ctx: CpuContext,
+      access: "read" | "write" | "other",
+      addr: number | bigint,
+      size: number,
+      value: number | bigint,
+      value64: bigint
+    ) => void
+  ): HookHandle;
+  watch(
+    range: [number | bigint, number | bigint],
+    fn: (
+      ctx: CpuContext,
+      access: "read" | "write" | "other",
+      addr: number,
+      size: number,
+      value: number,
+      value64: bigint
+    ) => void
   ): HookHandle;
   syscall(
     nrOrWildcard: number | "*",
@@ -365,8 +450,35 @@ interface JniNamespace {
   objectCount(): number;
 }
 
+interface HeapAllocInfo {
+  readonly seq: number;
+  readonly op: string;
+  readonly ptr: number;
+  readonly ptrHex: string;
+  readonly size: number;
+  readonly callerPc: number;
+  readonly callerPcHex: string;
+  readonly freed: boolean;
+}
+
+interface HeapLayoutInfo {
+  readonly frozen: boolean;
+  readonly heapBaseHex: string;
+  readonly heapUsed: number;
+  readonly heapHighWater: number;
+  readonly totalAllocs: number;
+  readonly allocations: HeapAllocInfo[];
+}
+
 interface MemNamespace {
+  /** 分配内存（当 `freezeLayout` 开启时自动分配在独立 `[host-scratch]` 区，不扰动 guest 堆布局） */
   alloc(size: number): number;
+  /** 强制在独立 `[host-scratch]` 区（0x6400_0000+）分配宿主临时缓冲，绝不影响 guest `malloc` 地址布局 */
+  allocScratch(size: number): number;
+  /** 动态切换是否将 `emu.mem.alloc()` 隔离到 `[host-scratch]` */
+  setFreezeLayout(freeze: boolean): void;
+  /** 查询当前堆布局指纹与关键 guest 分配点列表 */
+  heapLayout(limit?: number): HeapLayoutInfo;
   free(addr: number | bigint): boolean;
   heapUsed(): number;
   readBytes(addr: number | bigint, len: number): Uint8Array;
@@ -619,6 +731,8 @@ interface LoadTapeOptions {
   device?: DevicePresetName | DeviceProfileConfig;
   realClock?: boolean;
   net?: boolean | NetOptions;
+  /** 可选覆盖磁带恢复后的 `freezeLayout` 状态 */
+  freezeLayout?: boolean;
 }
 
 interface EmuHandle {
@@ -667,6 +781,163 @@ interface EmuHandle {
   seekTape(path: string, checkpoint?: number | string): TapeCheckpointInfo;
   /** 二期指令级时间旅行录制控制器（仅 Unicorn 后端可用） */
   readonly record: RecordNamespace;
+  /** 打印/查询当前 guest 堆布局指纹与关键分配点（`emu.mem.heapLayout()` 的便捷别名） */
+  heapLayout(limit?: number): HeapLayoutInfo;
+}
+
+interface TraceQueryOptions {
+  /** 按写入值查询（配合 `width` 1..8 字节） */
+  value?: number | bigint;
+  /** 值匹配字节宽度（默认 `value > 0xFFFFFFFF` 时为 8，否则为 4；范围 1..8） */
+  width?: number;
+  /** `width` 的别名 */
+  align?: number;
+  /** 按目标内存地址查询读写及 HLE 访问历史 */
+  addr?: number | bigint;
+  /** 按地址查询时的字节长度（默认 1） */
+  len?: number;
+  /** 按地址查询时是否仅返回写事件与 HLE 变更事件（默认 false） */
+  writesOnly?: boolean;
+  /** 仅返回序号 >= `minSeq` 的事件 */
+  minSeq?: number;
+  /** 仅返回序号 <= `maxSeq` 的事件 */
+  maxSeq?: number;
+  /** 仅返回序号 <= `at` 的事件（等同于 `maxSeq`） */
+  at?: number;
+  /** 返回最大条数（默认 200） */
+  limit?: number;
+}
+
+interface TraceQueryHit {
+  readonly seq: number;
+  readonly pc: number;
+  readonly pcHex: string;
+  readonly addr: number;
+  readonly addrHex: string;
+  readonly size: number;
+  readonly kind: string;
+  readonly value: number;
+  readonly valueHex: string;
+  /** 仅 `hle_memcpy` / `hle_memmove` / `hle_realloc_copy` 事件存在源地址 */
+  readonly src?: number;
+  readonly srcHex?: string;
+}
+
+interface TraceHleEvent {
+  readonly seq: number;
+  readonly op: string;
+  readonly pc: number;
+  readonly pcHex: string;
+  readonly dst: number;
+  readonly dstHex: string;
+  readonly src: number;
+  readonly srcHex: string;
+  readonly len: number;
+}
+
+interface TraceDiffEntry {
+  readonly idx: number;
+  readonly kind: "control" | "reg" | "mem" | "hle" | "length";
+  readonly pcA: number;
+  readonly pcAHex: string;
+  readonly pcB: number;
+  readonly pcBHex: string;
+  readonly detail: string;
+}
+
+interface TraceDiffSummary {
+  readonly totalA: number;
+  readonly totalB: number;
+  readonly commonPrefixInsns: number;
+  readonly firstControlDivergenceIdx: number | null;
+  readonly firstDataDivergenceIdx: number | null;
+  readonly diffs: TraceDiffEntry[];
+}
+
+interface TraceReconstructResult {
+  readonly addrHex: string;
+  readonly atSeq: number;
+  readonly knownBytes: number;
+  readonly hex: string;
+  readonly bytes: Uint8Array;
+}
+
+interface TraceTaintOptions {
+  /** 内存种子/目标起始地址（与 `reg` 二选一） */
+  addr?: number | bigint;
+  /** 内存种子/目标字节长度（默认 8） */
+  len?: number;
+  /** 寄存器种子/目标名（如 `"x0"`, `"w8"`, `"v0"`, `"q1"`；与 `addr` 二选一） */
+  reg?: string;
+  /** Forward 模式：起始指令下标（默认 0）；Backward 模式：目标观测点指令下标（默认末条指令） */
+  atIdx?: number;
+  /** `atIdx` 的前向语义别名 */
+  startIdx?: number;
+  /** 最大扫描指令数（0 表示扫描全部） */
+  maxInsns?: number;
+  /** 返回报告最多保留的步骤条数（默认 512） */
+  maxSteps?: number;
+  /** 是否追踪变址寄存器（如 S-Box 查表 `LDRB Wd, [Xtable, Xidx]` 中的 `Xidx`，默认 true） */
+  trackMemIndex?: boolean;
+  /** 是否追踪栈指针 `SP` 本身（默认 false） */
+  trackSp?: boolean;
+}
+
+interface TraceTaintStep {
+  readonly idx: number;
+  readonly seq: number;
+  readonly pc: number;
+  readonly pcHex: string;
+  readonly asm: string;
+  readonly kind: "load" | "store" | "alu" | "rmw" | "const" | "hle_copy" | "hle_clear" | "hle_ret";
+  readonly sources: string[];
+  readonly dests: string[];
+  readonly tagMaskHex: string;
+  readonly value?: number;
+  readonly valueHex?: string;
+}
+
+interface TraceTaintReport {
+  readonly mode: "forward" | "backward";
+  readonly seed: string;
+  readonly anchorIdx: number;
+  readonly scannedInsns: number;
+  readonly totalMatchingSteps: number;
+  readonly steps: TraceTaintStep[];
+  readonly taintedRegs: Array<{ readonly name: string; readonly tagMaskHex: string }>;
+  readonly taintedMemRanges: Array<{
+    readonly addr: number;
+    readonly addrHex: string;
+    readonly len: number;
+    readonly tagMaskHex: string;
+  }>;
+}
+
+interface TraceReaderHandle {
+  readonly totalInsns: number;
+  readonly totalExt: number;
+  /** 离线全知内存/值查询（内置替代手写 numpy 扫描 `.idx`/`.ext`） */
+  query(opts: TraceQueryOptions): TraceQueryHit[];
+  /** 值溯源便捷别名：查找所有写入过 `value` 的 guest 指令与 HLE 拷贝事件 */
+  findWrites(value: number | bigint, opts?: Omit<TraceQueryOptions, "value" | "addr">): TraceQueryHit[];
+  /** 地址溯源便捷别名：查找读写过 `addr` 的全部访存与 HLE 事件 */
+  findReads(addr: number | bigint, opts?: Omit<TraceQueryOptions, "value" | "addr">): TraceQueryHit[];
+  /** 读取 trace.ext 中的全部 HLE 事件（memcpy / memmove / memset / malloc / calloc / realloc / free） */
+  hleEvents(limit?: number): TraceHleEvent[];
+  /** 基于 trace.ext 写历史 + HLE 拷贝/填充事件重建指定 `atSeq`（省略则重建至末尾）时刻的内存区间内容 */
+  reconstructMem(addr: number | bigint, len: number, atSeq?: number): TraceReconstructResult;
+  /** 离线前向污点传播：从输入内存/寄存器出发，沿 ARM64 指令与 HLE memcpy 追踪污点流向（自动清除被覆写旧地址，免疫栈/VM 地址复用） */
+  taintForward(opts: TraceTaintOptions): TraceTaintReport;
+  /** 离线反向因果切片：从输出字节/寄存器倒推精确的指令与 HLE 计算链，直达输入起源 */
+  taintBackward(opts: TraceTaintOptions): TraceTaintReport;
+  close(): boolean;
+}
+
+declare namespace Trace {
+  /** 打开离线 `trace.idx`（自动关联同目录同名 `.ext`，或手动传 `extPath`） */
+  function open(idxPath: string, extPath?: string): TraceReaderHandle;
+  /** 双跑 Trace 差分：定位首次控制流分歧与首次寄存器/内存/HLE 数据分歧 */
+  function diff(idxA: string, idxB: string, maxDiffs?: number): TraceDiffSummary;
 }
 
 declare namespace Emu {

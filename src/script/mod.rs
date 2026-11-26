@@ -39,8 +39,11 @@ pub(super) struct EmuEntry {
 pub(super) struct ScriptHost {
     pub(super) emus: Vec<EmuEntry>,
     pub(super) time_travels: Vec<Option<crate::timetravel::TimeTravelPlayer>>,
+    pub(super) trace_readers: Vec<Option<crate::tracer::TraceReader>>,
     pub(super) script_dir_stack: Vec<PathBuf>,
     pub(super) module_cache: HashMap<PathBuf, Persistent<Value<'static>>>,
+    /// 本会话默认是否开启「冻结 Guest 堆布局」（由 `runidbg-cli run --freeze-layout` 按会话注入，避免进程全局串扰）
+    pub(super) default_freeze_layout: bool,
 }
 
 pub(super) type SharedHost = Rc<RefCell<ScriptHost>>;
@@ -63,13 +66,25 @@ pub struct JsSession {
 impl JsSession {
     /// 创建持久化 QuickJS 会话；`capture_logs = true` 时将 `console.log` 捕获到内存缓冲而非 `stdout`（MCP stdio 必备）
     pub fn new(cli_args: &[String], base_dir: &Path, capture_logs: bool) -> Result<Self> {
+        Self::new_with_freeze_layout(cli_args, base_dir, capture_logs, false)
+    }
+
+    /// 创建持久化 QuickJS 会话，并可指定会话级默认 `freezeLayout` 开关（无进程全局状态串扰）
+    pub fn new_with_freeze_layout(
+        cli_args: &[String],
+        base_dir: &Path,
+        capture_logs: bool,
+        default_freeze_layout: bool,
+    ) -> Result<Self> {
         let rt = Runtime::new().context("初始化 QuickJS Runtime 失败")?;
         let ctx = Context::full(&rt).context("初始化 QuickJS Context 失败")?;
         let host: SharedHost = Rc::new(RefCell::new(ScriptHost {
             emus: Vec::new(),
             time_travels: Vec::new(),
+            trace_readers: Vec::new(),
             script_dir_stack: vec![base_dir.to_path_buf()],
             module_cache: HashMap::new(),
+            default_freeze_layout,
         }));
         let log_sink: SharedLogSink = Rc::new(LogSink {
             capture: capture_logs,
@@ -240,6 +255,15 @@ impl JsRunner {
 
     /// 读取并执行 `.js` 脚本文件
     pub fn run_file(path: impl AsRef<Path>, cli_args: &[String]) -> Result<()> {
+        Self::run_file_with_freeze_layout(path, cli_args, false)
+    }
+
+    /// 读取并执行 `.js` 脚本文件，并注入会话级 `freezeLayout` 默认值（供 `runidbg-cli run --freeze-layout` 使用）
+    pub fn run_file_with_freeze_layout(
+        path: impl AsRef<Path>,
+        cli_args: &[String],
+        default_freeze_layout: bool,
+    ) -> Result<()> {
         let path = path.as_ref();
         let src = fs::read_to_string(path)
             .with_context(|| format!("读取脚本失败: {}", path.display()))?;
@@ -248,7 +272,13 @@ impl JsRunner {
             .filter(|p| !p.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        Self::run_source_with_base(&src, cli_args, &base_dir)
+        let session = JsSession::new_with_freeze_layout(
+            cli_args,
+            &base_dir,
+            false,
+            default_freeze_layout,
+        )?;
+        session.eval_source(&src)
     }
 }
 

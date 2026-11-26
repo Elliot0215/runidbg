@@ -241,22 +241,22 @@ fn parse_watch_kind(ctx: &Ctx<'_>, s: &str) -> rquickjs::Result<WatchKind> {
 }
 
 fn js_addr_to_u64_strict<'js>(ctx: &Ctx<'js>, v: &Value<'js>) -> rquickjs::Result<u64> {
-    if let Some(bi) = v.as_big_int() {
-        if let Ok(i) = bi.clone().to_i64() {
-            if i < 0 {
-                return Err(throw_err(ctx, "地址不能为负数"));
-            }
-            return Ok(i as u64);
+    if v.as_big_int().is_some() {
+        // QuickJS 的 BigInt::to_i64 会按 mod 2^64 符号回绕（导致 > i64::MAX 误判负数、>= 2^64 静默回绕），
+        // 直接经 JS String(v) 转为精确十进制字符串解析可无损覆盖完整 [0, u64::MAX] 并严格拒绝负数/越界。
+        let str_fn = ctx
+            .globals()
+            .get::<_, Function>("String")
+            .map_err(|_| throw_err(ctx, "无法解析 BigInt"))?;
+        let s: String = str_fn
+            .call((v.clone(),))
+            .map_err(|_| throw_err(ctx, "无法序列化 BigInt"))?;
+        if s.starts_with('-') {
+            return Err(throw_err(ctx, "地址/数值不能为负数"));
         }
-        // 处理 (i64::MAX, u64::MAX] 范围无符号 64 位 BigInt
-        if let Ok(str_fn) = ctx.globals().get::<_, Function>("String") {
-            if let Ok(s) = str_fn.call::<_, String>((v.clone(),)) {
-                if let Ok(u) = s.parse::<u64>() {
-                    return Ok(u);
-                }
-            }
-        }
-        return Err(throw_err(ctx, "BigInt 地址超出 u64 范围"));
+        return s
+            .parse::<u64>()
+            .map_err(|_| throw_err(ctx, "BigInt 地址/数值超出 u64 范围"));
     }
     if let Some(i) = v.as_int() {
         if i < 0 {
@@ -2339,15 +2339,127 @@ pub(super) fn register_native_bridge<'js>(
                 ctx.clone(),
                 move |ctx: Ctx<'_>, emu_id: usize, size: f64| -> rquickjs::Result<f64> {
                     with_uc(&ctx, &host, emu_id, |uc| {
-                        let addr = uc
-                            .get_data_mut()
-                            .mem
-                            .alloc_heap((size as u64).max(1))
-                            .map_err(|e| throw_err(&ctx, e))?;
+                        let req_sz = (size as u64).max(1);
+                        let frozen = uc.get_data().mem.is_layout_frozen();
+                        let addr = if frozen {
+                            let mut mem = std::mem::replace(
+                                &mut uc.get_data_mut().mem,
+                                crate::memory::MemoryManager::new(0, 0),
+                            );
+                            let res = mem.alloc_host_scratch(uc, req_sz);
+                            uc.get_data_mut().mem = mem;
+                            res.map_err(|e| throw_err(&ctx, e))?
+                        } else {
+                            uc.get_data_mut()
+                                .mem
+                                .alloc_heap(req_sz)
+                                .map_err(|e| throw_err(&ctx, e))?
+                        };
                         Ok(addr as f64)
                     })
                 },
             )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "memAllocScratch",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, size: f64| -> rquickjs::Result<f64> {
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        let req_sz = (size as u64).max(1);
+                        let mut mem = std::mem::replace(
+                            &mut uc.get_data_mut().mem,
+                            crate::memory::MemoryManager::new(0, 0),
+                        );
+                        let res = mem.alloc_host_scratch(uc, req_sz);
+                        uc.get_data_mut().mem = mem;
+                        let addr = res.map_err(|e| throw_err(&ctx, e))?;
+                        Ok(addr as f64)
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "memSetFreezeLayout",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, emu_id: usize, enabled: bool| -> rquickjs::Result<()> {
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        uc.get_data_mut().mem.set_freeze_layout(enabled);
+                        Ok(())
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "memHeapLayout",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, emu_id: usize, limit: f64| -> rquickjs::Result<Object<'js>> {
+                    let cap = if limit.is_finite() && limit > 0.0 {
+                        limit as usize
+                    } else {
+                        512
+                    };
+                    let (frozen, heap_base, heap_used, heap_hwm, total_allocs, items) =
+                        with_uc(&ctx, &host, emu_id, |uc| {
+                            let mem = &uc.get_data().mem;
+                            let log = mem.heap_alloc_log();
+                            let start = log.len().saturating_sub(cap);
+                            Ok((
+                                mem.is_layout_frozen(),
+                                mem.heap_ref().base(),
+                                mem.heap_ref().used(),
+                                mem.heap_ref().high_water_mark(),
+                                log.len(),
+                                log.iter().skip(start).cloned().collect::<Vec<_>>(),
+                            ))
+                        })?;
+                    let out = Object::new(ctx.clone())?;
+                    out.set("frozen", frozen)?;
+                    out.set("heapBaseHex", format!("0x{heap_base:016x}"))?;
+                    out.set("heapUsed", heap_used as f64)?;
+                    out.set("heapHighWater", heap_hwm as f64)?;
+                    out.set("totalAllocs", total_allocs as f64)?;
+                    let arr = Array::new(ctx.clone())?;
+                    for (i, rec) in items.iter().enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("seq", rec.seq as f64)?;
+                        o.set("op", rec.op)?;
+                        o.set("ptr", rec.ptr as f64)?;
+                        o.set("ptrHex", format!("0x{:016x}", rec.ptr))?;
+                        o.set("size", rec.size as f64)?;
+                        o.set("callerPc", rec.caller_pc as f64)?;
+                        o.set("callerPcHex", format!("0x{:016x}", rec.caller_pc))?;
+                        o.set("freed", rec.freed)?;
+                        arr.set(i, o)?;
+                    }
+                    out.set("allocations", arr)?;
+                    Ok(out)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "isDefaultFreezeLayout",
+            Function::new(ctx.clone(), move || {
+                host.try_borrow().map(|h| h.default_freeze_layout).unwrap_or(false)
+            })?,
         )?;
     }
 
@@ -3230,11 +3342,12 @@ pub(super) fn register_native_bridge<'js>(
                         } else {
                             format!("{output}.ext")
                         };
+                        let cap = capacity.max(1024);
                         BinaryTracer::new_dual_mmap(
                             &output,
                             &ext,
-                            capacity.max(1024),
-                            capacity.max(1024),
+                            cap,
+                            cap.saturating_mul(2),
                             level,
                         )
                         .map_err(|e| throw_err(&ctx, e))?
@@ -4475,29 +4588,525 @@ pub(super) fn register_native_bridge<'js>(
                 ctx.clone(),
                 move |ctx: Ctx<'js>,
                       emu_id: usize,
-                      begin: f64,
-                      end: f64,
-                      read: bool,
-                      write: bool,
+                      begin_val: Value<'js>,
+                      end_val: Value<'js>,
+                      opts: Object<'js>,
                       func: Function<'js>|
-                      -> rquickjs::Result<usize> {
+                      -> rquickjs::Result<Object<'js>> {
+                    let begin = js_addr_to_u64_strict(&ctx, &begin_val)?;
+                    let end = js_addr_to_u64_strict(&ctx, &end_val)?;
+                    if begin > end {
+                        return Err(throw_err(
+                            &ctx,
+                            format!("hook.mem 地址区间无效: begin(0x{begin:x}) > end(0x{end:x})"),
+                        ));
+                    }
+                    let read: bool = opts.get("read").unwrap_or(true);
+                    let write: bool = opts.get("write").unwrap_or(true);
+                    let big_int: bool = opts.get("bigInt").unwrap_or(false);
+                    let filter_val: Option<u64> = match opts.get::<_, Value<'js>>("value") {
+                        Ok(v) if !v.is_undefined() && !v.is_null() => {
+                            Some(js_addr_to_u64_strict(&ctx, &v)?)
+                        }
+                        _ => None,
+                    };
+                    let filter_size: Option<usize> = match opts.get::<_, Value<'js>>("size") {
+                        Ok(v) if !v.is_undefined() && !v.is_null() => {
+                            Some(js_addr_to_u64_strict(&ctx, &v)? as usize)
+                        }
+                        _ => None,
+                    };
+                    let filter_pc_range: Option<(u64, u64)> =
+                        match opts.get::<_, Value<'js>>("pcRange") {
+                            Ok(v) if !v.is_undefined() && !v.is_null() => {
+                                let arr = v.into_array().ok_or_else(|| {
+                                    throw_err(&ctx, "hook.mem pcRange 必须为 [lo, hi] 数组")
+                                })?;
+                                if arr.len() < 2 {
+                                    return Err(throw_err(
+                                        &ctx,
+                                        "hook.mem pcRange 必须包含至少 2 个元素 [lo, hi]",
+                                    ));
+                                }
+                                let lo_v: Value<'js> = arr.get(0)?;
+                                let hi_v: Value<'js> = arr.get(1)?;
+                                let pc_lo = js_addr_to_u64_strict(&ctx, &lo_v)?;
+                                let pc_hi = js_addr_to_u64_strict(&ctx, &hi_v)?;
+                                if pc_lo > pc_hi {
+                                    return Err(throw_err(
+                                        &ctx,
+                                        format!(
+                                            "hook.mem pcRange 无效: lo(0x{pc_lo:x}) > hi(0x{pc_hi:x})"
+                                        ),
+                                    ));
+                                }
+                                Some((pc_lo, pc_hi))
+                            }
+                            _ => None,
+                        };
+                    let filter = super::hooks::MemHookFilter {
+                        value: filter_val,
+                        size: filter_size,
+                        pc_range: filter_pc_range,
+                        big_int,
+                    };
                     let persistent = Persistent::save(&ctx, func);
                     let handles = get_emu_handles(&ctx, &handles_table, emu_id)?;
-                    with_unicorn_only(&ctx, &host, emu_id, "hook.mem", |uc| {
-                        handles
-                            .native_hooks
-                            .borrow_mut()
-                            .add_mem_hook(
-                                emu_id,
-                                uc,
-                                begin as u64,
-                                end as u64,
-                                read,
-                                write,
-                                persistent,
-                            )
-                            .map_err(|e| throw_err(&ctx, e))
-                    })
+                    let (id, unmapped) =
+                        with_unicorn_only(&ctx, &host, emu_id, "hook.mem", |uc| {
+                            handles
+                                .native_hooks
+                                .borrow_mut()
+                                .add_mem_hook(emu_id, uc, begin, end, read, write, filter, persistent)
+                                .map_err(|e| throw_err(&ctx, e))
+                        })?;
+                    let out = Object::new(ctx.clone())?;
+                    out.set("id", id)?;
+                    out.set("unmapped", unmapped)?;
+                    Ok(out)
+                },
+            )?,
+        )?;
+    }
+
+    // ---- 离线 Trace 查询与双跑差分（Trace.open / Trace.diff）----
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "traceOpen",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      idx_path: String,
+                      ext_opt: Option<String>|
+                      -> rquickjs::Result<Object<'js>> {
+                    let idx_p = std::path::PathBuf::from(&idx_path);
+                    let resolved_ext = if let Some(ep) = ext_opt {
+                        Some(std::path::PathBuf::from(ep))
+                    } else {
+                        let sib = idx_p.with_extension("ext");
+                        (sib != idx_p && sib.is_file()).then_some(sib)
+                    };
+                    let reader = crate::tracer::TraceReader::open(&idx_p, resolved_ext.as_deref())
+                        .map_err(|e| throw_err(&ctx, e))?;
+                    let total_insns = reader.len();
+                    let total_ext = reader.ext_len();
+                    let mut h = host
+                        .try_borrow_mut()
+                        .map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let trace_id = h.trace_readers.len();
+                    h.trace_readers.push(Some(reader));
+                    let out = Object::new(ctx.clone())?;
+                    out.set("traceId", trace_id)?;
+                    out.set("totalInsns", total_insns as f64)?;
+                    out.set("totalExt", total_ext as f64)?;
+                    Ok(out)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "traceClose",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'_>, trace_id: usize| -> rquickjs::Result<bool> {
+                    let mut h = host
+                        .try_borrow_mut()
+                        .map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    Ok(h.trace_readers
+                        .get_mut(trace_id)
+                        .and_then(Option::take)
+                        .is_some())
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "traceQuery",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, trace_id: usize, opts: Object<'js>| -> rquickjs::Result<Array<'js>> {
+                    let h = host.try_borrow().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let reader = h
+                        .trace_readers
+                        .get(trace_id)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| throw_err(&ctx, "无效或已关闭的 traceId"))?;
+                    let limit: usize = match opts.get::<_, f64>("limit") {
+                        Ok(v) if v.is_finite() && v > 0.0 => v as usize,
+                        _ => 200,
+                    };
+                    let parse_opt_seq = |key: &str| -> rquickjs::Result<Option<u32>> {
+                        match opts.get::<_, Value<'js>>(key) {
+                            Ok(v) if !v.is_undefined() && !v.is_null() => {
+                                let n = js_addr_to_u64_strict(&ctx, &v)?;
+                                Ok(Some(n.min(u32::MAX as u64) as u32))
+                            }
+                            _ => Ok(None),
+                        }
+                    };
+                    let at_seq = parse_opt_seq("at")?;
+                    let min_seq = parse_opt_seq("minSeq")?;
+                    let max_seq = parse_opt_seq("maxSeq")?;
+
+                    let val_opt = opts
+                        .get::<_, Value<'js>>("value")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null());
+                    let addr_opt = opts
+                        .get::<_, Value<'js>>("addr")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null());
+
+                    let hits = if let Some(v) = val_opt {
+                        let target = js_addr_to_u64_strict(&ctx, &v)?;
+                        let width = opts
+                            .get::<_, f64>("width")
+                            .ok()
+                            .filter(|w| w.is_finite())
+                            .or_else(|| {
+                                opts.get::<_, f64>("align")
+                                    .ok()
+                                    .filter(|w| w.is_finite())
+                            })
+                            .map(|w| (w.clamp(1.0, 8.0)) as u8)
+                            .unwrap_or_else(|| if target > u32::MAX as u64 { 8 } else { 4 });
+                        reader.query_writes_by_value(target, width, min_seq, max_seq.or(at_seq), limit)
+                    } else if let Some(av) = addr_opt {
+                        let addr = js_addr_to_u64_strict(&ctx, &av)?;
+                        let len = opts
+                            .get::<_, f64>("len")
+                            .ok()
+                            .filter(|l| l.is_finite() && *l >= 1.0)
+                            .map(|l| l as u64)
+                            .unwrap_or(1);
+                        let writes_only: bool = opts.get("writesOnly").unwrap_or(false);
+                        reader.query_addr_history(addr, len, at_seq.or(max_seq), writes_only, limit)
+                    } else {
+                        return Err(throw_err(&ctx, "trace.query 需要提供 value 或 addr 参数"));
+                    };
+
+                    let arr = Array::new(ctx.clone())?;
+                    for (i, hit) in hits.iter().enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("seq", hit.seq_low32 as f64)?;
+                        o.set("pc", hit.pc as f64)?;
+                        o.set("pcHex", format!("0x{:016x}", hit.pc))?;
+                        o.set("addr", hit.addr as f64)?;
+                        o.set("addrHex", format!("0x{:016x}", hit.addr))?;
+                        o.set("size", hit.size as f64)?;
+                        o.set("kind", hit.kind)?;
+                        o.set("value", hit.value as f64)?;
+                        o.set("valueHex", format!("0x{:x}", hit.value))?;
+                        if hit.src != 0 {
+                            o.set("src", hit.src as f64)?;
+                            o.set("srcHex", format!("0x{:016x}", hit.src))?;
+                        }
+                        arr.set(i, o)?;
+                    }
+                    Ok(arr)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "traceHleEvents",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, trace_id: usize, limit: f64| -> rquickjs::Result<Array<'js>> {
+                    let h = host.try_borrow().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let reader = h
+                        .trace_readers
+                        .get(trace_id)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| throw_err(&ctx, "无效或已关闭的 traceId"))?;
+                    let cap = if limit.is_finite() && limit > 0.0 { limit as usize } else { 500 };
+                    let evs = reader.hle_events();
+                    let arr = Array::new(ctx.clone())?;
+                    for (i, ev) in evs.into_iter().take(cap).enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("seq", ev.seq_low32 as f64)?;
+                        o.set("op", ev.op)?;
+                        o.set("dst", ev.dst as f64)?;
+                        o.set("dstHex", format!("0x{:016x}", ev.dst))?;
+                        o.set("src", ev.src as f64)?;
+                        o.set("srcHex", format!("0x{:016x}", ev.src))?;
+                        o.set("len", ev.len as f64)?;
+                        o.set("pc", ev.pc as f64)?;
+                        o.set("pcHex", format!("0x{:016x}", ev.pc))?;
+                        arr.set(i, o)?;
+                    }
+                    Ok(arr)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "traceReconstructMem",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      trace_id: usize,
+                      addr_val: Value<'js>,
+                      len: f64,
+                      at_seq_val: Value<'js>|
+                      -> rquickjs::Result<Object<'js>> {
+                    let addr = js_addr_to_u64_strict(&ctx, &addr_val)?;
+                    let byte_len = require_nonneg_int(&ctx, len, "len")?.clamp(1, 65536) as usize;
+                    let seq = if at_seq_val.is_undefined() || at_seq_val.is_null() {
+                        u32::MAX
+                    } else {
+                        js_addr_to_u64_strict(&ctx, &at_seq_val)?.min(u32::MAX as u64) as u32
+                    };
+                    let h = host.try_borrow().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let reader = h
+                        .trace_readers
+                        .get(trace_id)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| throw_err(&ctx, "无效或已关闭的 traceId"))?;
+                    let bytes = reader.reconstruct_mem_at(addr, byte_len, seq);
+                    let mut hex = String::with_capacity(byte_len * 2);
+                    let mut known = 0usize;
+                    let raw: Vec<u8> = bytes
+                        .iter()
+                        .map(|mb| match mb {
+                            Some(b) => {
+                                known += 1;
+                                hex.push_str(&format!("{b:02x}"));
+                                *b
+                            }
+                            None => {
+                                hex.push_str("??");
+                                0
+                            }
+                        })
+                        .collect();
+                    let out = Object::new(ctx.clone())?;
+                    out.set("addrHex", format!("0x{addr:016x}"))?;
+                    out.set("atSeq", seq as f64)?;
+                    out.set("knownBytes", known as f64)?;
+                    out.set("hex", hex)?;
+                    out.set("bytes", TypedArray::new(ctx.clone(), raw)?)?;
+                    Ok(out)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "traceTaint",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      trace_id: usize,
+                      mode: String,
+                      opts: Object<'js>|
+                      -> rquickjs::Result<Object<'js>> {
+                    let seed = if let Ok(reg_name) = opts.get::<_, String>("reg") {
+                        let slot = crate::tracer::parse_reg_slot(&reg_name).ok_or_else(|| {
+                            throw_err(&ctx, format!("无效的寄存器名: {reg_name}"))
+                        })?;
+                        crate::tracer::TaintSeed::Reg { reg_id: slot }
+                    } else if let Ok(av) = opts.get::<_, Value<'js>>("addr") {
+                        if av.is_undefined() || av.is_null() {
+                            return Err(throw_err(&ctx, "taint 需要提供 addr 或 reg 参数"));
+                        }
+                        let addr = js_addr_to_u64_strict(&ctx, &av)?;
+                        let len = opts
+                            .get::<_, f64>("len")
+                            .ok()
+                            .filter(|l| l.is_finite() && *l >= 1.0)
+                            .map(|l| (l as usize).clamp(1, 65536))
+                            .unwrap_or(8);
+                        crate::tracer::TaintSeed::Mem { addr, len }
+                    } else {
+                        return Err(throw_err(&ctx, "taint 需要提供 addr 或 reg 参数"));
+                    };
+
+                    let anchor_idx: Option<usize> = opts
+                        .get::<_, Value<'js>>("atIdx")
+                        .ok()
+                        .filter(|v| !v.is_undefined() && !v.is_null())
+                        .or_else(|| {
+                            opts.get::<_, Value<'js>>("startIdx")
+                                .ok()
+                                .filter(|v| !v.is_undefined() && !v.is_null())
+                        })
+                        .or_else(|| {
+                            opts.get::<_, Value<'js>>("at")
+                                .ok()
+                                .filter(|v| !v.is_undefined() && !v.is_null())
+                        })
+                        .map(|v| js_addr_to_u64_strict(&ctx, &v).map(|n| n as usize))
+                        .transpose()?;
+
+                    let max_insns = opts
+                        .get::<_, f64>("maxInsns")
+                        .ok()
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .map(|v| v as usize)
+                        .unwrap_or(0);
+                    let max_steps = opts
+                        .get::<_, f64>("maxSteps")
+                        .ok()
+                        .filter(|v| v.is_finite() && *v > 0.0)
+                        .map(|v| v as usize)
+                        .unwrap_or(512);
+                    let track_mem_index: bool = opts.get("trackMemIndex").unwrap_or(true);
+                    let track_sp: bool = opts.get("trackSp").unwrap_or(false);
+
+                    let taint_opts = crate::tracer::TaintOptions {
+                        anchor_idx,
+                        max_insns,
+                        max_steps,
+                        track_mem_index,
+                        track_sp,
+                    };
+
+                    let h = host.try_borrow().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let reader = h
+                        .trace_readers
+                        .get(trace_id)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| throw_err(&ctx, "无效或已关闭的 traceId"))?;
+
+                    let report = match mode.to_ascii_lowercase().as_str() {
+                        "forward" | "fwd" => reader.taint_forward(&seed, &taint_opts),
+                        "backward" | "bwd" | "slice" => reader.taint_backward(&seed, &taint_opts),
+                        other => {
+                            return Err(throw_err(
+                                &ctx,
+                                format!("无效的 taint mode `{other}`（支持 forward / backward）"),
+                            ));
+                        }
+                    };
+
+                    let out = Object::new(ctx.clone())?;
+                    out.set("mode", report.mode)?;
+                    out.set("seed", report.seed_desc)?;
+                    out.set("anchorIdx", report.anchor_idx as f64)?;
+                    out.set("scannedInsns", report.scanned_insns as f64)?;
+                    out.set("totalMatchingSteps", report.total_matching_steps as f64)?;
+
+                    let steps_arr = Array::new(ctx.clone())?;
+                    for (i, s) in report.steps.iter().enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("idx", s.idx as f64)?;
+                        o.set("seq", s.seq as f64)?;
+                        o.set("pc", s.pc as f64)?;
+                        o.set("pcHex", format!("0x{:016x}", s.pc))?;
+                        o.set("asm", s.asm.as_str())?;
+                        o.set("kind", s.kind)?;
+                        let src_arr = Array::new(ctx.clone())?;
+                        for (j, src) in s.sources.iter().enumerate() {
+                            src_arr.set(j, src.as_str())?;
+                        }
+                        o.set("sources", src_arr)?;
+                        let dst_arr = Array::new(ctx.clone())?;
+                        for (j, dst) in s.dests.iter().enumerate() {
+                            dst_arr.set(j, dst.as_str())?;
+                        }
+                        o.set("dests", dst_arr)?;
+                        o.set("tagMaskHex", format!("0x{:x}", s.tag_mask))?;
+                        if let Some(v) = s.value {
+                            o.set("value", v as f64)?;
+                            o.set("valueHex", format!("0x{v:x}"))?;
+                        }
+                        steps_arr.set(i, o)?;
+                    }
+                    out.set("steps", steps_arr)?;
+
+                    let regs_arr = Array::new(ctx.clone())?;
+                    for (i, (name, mask)) in report.tainted_regs.iter().enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("name", name.as_str())?;
+                        o.set("tagMaskHex", format!("0x{mask:x}"))?;
+                        regs_arr.set(i, o)?;
+                    }
+                    out.set("taintedRegs", regs_arr)?;
+
+                    let mem_arr = Array::new(ctx.clone())?;
+                    for (i, &(addr, len, mask)) in report.tainted_mem_ranges.iter().enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("addr", addr as f64)?;
+                        o.set("addrHex", format!("0x{addr:016x}"))?;
+                        o.set("len", len as f64)?;
+                        o.set("tagMaskHex", format!("0x{mask:x}"))?;
+                        mem_arr.set(i, o)?;
+                    }
+                    out.set("taintedMemRanges", mem_arr)?;
+                    Ok(out)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        native.set(
+            "traceDiff",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      idx_a: String,
+                      idx_b: String,
+                      max_diffs: f64|
+                      -> rquickjs::Result<Object<'js>> {
+                    let pa = std::path::PathBuf::from(&idx_a);
+                    let pb = std::path::PathBuf::from(&idx_b);
+                    let ea = pa.with_extension("ext");
+                    let eb = pb.with_extension("ext");
+                    let ra = crate::tracer::TraceReader::open(&pa, (ea != pa && ea.is_file()).then_some(ea.as_path()))
+                        .map_err(|e| throw_err(&ctx, e))?;
+                    let rb = crate::tracer::TraceReader::open(&pb, (eb != pb && eb.is_file()).then_some(eb.as_path()))
+                        .map_err(|e| throw_err(&ctx, e))?;
+                    let cap = if max_diffs.is_finite() && max_diffs > 0.0 {
+                        max_diffs as usize
+                    } else {
+                        100
+                    };
+                    let sum = crate::tracer::TraceReader::diff_traces(&ra, &rb, cap);
+                    let out = Object::new(ctx.clone())?;
+                    out.set("totalA", sum.total_a as f64)?;
+                    out.set("totalB", sum.total_b as f64)?;
+                    out.set("commonPrefixInsns", sum.common_prefix_insns as f64)?;
+                    if let Some(i) = sum.first_control_divergence_idx {
+                        out.set("firstControlDivergenceIdx", i as f64)?;
+                    } else {
+                        out.set("firstControlDivergenceIdx", Value::new_null(ctx.clone()))?;
+                    }
+                    if let Some(i) = sum.first_data_divergence_idx {
+                        out.set("firstDataDivergenceIdx", i as f64)?;
+                    } else {
+                        out.set("firstDataDivergenceIdx", Value::new_null(ctx.clone()))?;
+                    }
+                    let arr = Array::new(ctx.clone())?;
+                    for (i, d) in sum.diffs.iter().enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("idx", d.idx as f64)?;
+                        o.set("kind", d.kind)?;
+                        o.set("pcA", d.pc_a as f64)?;
+                        o.set("pcAHex", format!("0x{:016x}", d.pc_a))?;
+                        o.set("pcB", d.pc_b as f64)?;
+                        o.set("pcBHex", format!("0x{:016x}", d.pc_b))?;
+                        o.set("detail", d.detail.as_str())?;
+                        arr.set(i, o)?;
+                    }
+                    out.set("diffs", arr)?;
+                    Ok(out)
                 },
             )?,
         )?;

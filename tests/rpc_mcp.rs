@@ -435,9 +435,12 @@ fn test_mcp_server_protocol_and_tools() {
         .expect("tools/list response");
     let list: Value = serde_json::from_str(&list_raw).unwrap();
     let tools = list["result"]["tools"].as_array().expect("tools array");
-    assert_eq!(tools.len(), 32);
+    assert_eq!(tools.len(), 35);
     assert!(tools.iter().any(|t| t["name"] == "trace_calltree"));
     assert!(tools.iter().any(|t| t["name"] == "trace_crypto_scan"));
+    assert!(tools.iter().any(|t| t["name"] == "trace_taint"));
+    assert!(tools.iter().any(|t| t["name"] == "trace_query"));
+    assert!(tools.iter().any(|t| t["name"] == "trace_diff"));
     assert!(tools.iter().any(|t| t["name"] == "emu_save_tape"));
     assert!(tools.iter().any(|t| t["name"] == "emu_load_tape"));
     assert!(tools.iter().any(|t| t["name"] == "emu_seek_tape"));

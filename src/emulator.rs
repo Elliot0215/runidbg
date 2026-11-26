@@ -72,6 +72,15 @@ fn attach_builtin_code_hooks(uc: &mut Unicorn<'static, EmuState>) -> EmuResult<(
                 return;
             }
             dispatch_trampoline_slot(uc, addr, &mut |s| (&mut s.trampolines, &mut s.mem, &mut s.vfs));
+            let (evs, len) = uc.get_data_mut().trampolines.drain_hle_events();
+            if len > 0 {
+                let tracer = &mut uc.get_data_mut().tracer;
+                if tracer.is_active() {
+                    for ev in evs.into_iter().take(len).flatten() {
+                        tracer.record_hle_event(ev);
+                    }
+                }
+            }
         },
     )?;
     let jni_id = uc.add_code_hook(
@@ -738,6 +747,8 @@ impl AndroidEmulator {
                         dispatch_trampoline_slot(&mut self.engine, slot_addr, &mut |s| {
                             (&mut s.trampolines, &mut s.mem, &mut s.vfs)
                         });
+                        // 非 Unicorn 后端无 Trace Hook，立即清空 pending_hle_events 防止槽位累积
+                        let _ = self.engine.get_data_mut().trampolines.drain_hle_events();
                         if self.engine.get_data().manual_stop || self.engine.is_stop_requested() {
                             return self.engine.reg_read(RegisterARM64::X0);
                         }
@@ -818,6 +829,23 @@ impl AndroidEmulator {
         }
     }
 
+    /// 注册一个内置 HLE 跳板符号并返回其可调用地址（适用于无 ELF 重定位的裸代码片段测试与定制 Harness）
+    pub fn register_hle_builtin(
+        &mut self,
+        name: &str,
+        action: crate::loader::trampoline::HleBuiltin,
+    ) -> EmuResult<u64> {
+        let mut mem = std::mem::replace(
+            &mut self.engine.get_data_mut().mem,
+            MemoryManager::new(0, 0),
+        );
+        let mut trampolines = std::mem::take(&mut self.engine.get_data_mut().trampolines);
+        let res = trampolines.register(&mut self.engine, &mut mem, name, action);
+        self.engine.get_data_mut().mem = mem;
+        self.engine.get_data_mut().trampolines = trampolines;
+        res
+    }
+
     /// 挂载指令级（及 `Full` 模式下的内存级）Trace Hook（仅 Unicorn 后端支持）
     pub fn attach_tracer(&mut self, begin: u64, end: u64) -> EmuResult<()> {
         if !self.backend_kind().supports_trace() {
@@ -827,6 +855,7 @@ impl AndroidEmulator {
             )));
         }
         let uc = self.engine.as_unicorn_mut().expect("Unicorn backend");
+        uc.get_data_mut().tracer.set_active(true);
         if self.trace_code_hook.is_none() {
             let h = attach_code_hook(uc, begin, end, |s| &mut s.tracer)?;
             self.trace_code_hook = Some(h);
@@ -866,7 +895,9 @@ impl AndroidEmulator {
                 let _ = uc.remove_hook(mh);
             }
         }
-        self.engine.get_data_mut().tracer.finalize()
+        let tracer = &mut self.engine.get_data_mut().tracer;
+        tracer.set_active(false);
+        tracer.finalize()
     }
 
     /// 捕获完整 CPU + 可写内存 + 模拟堆分配器 + JNI 引用表快照（供批量回放或常驻重置）
@@ -905,6 +936,8 @@ impl AndroidEmulator {
             heap: data.mem.heap_ref().clone(),
             brk_cursor: data.mem.brk_cursor(),
             mmap_cursor: data.mem.mmap_cursor(),
+            host_scratch: Some(data.mem.host_scratch_ref().clone()),
+            freeze_layout: Some(data.mem.is_layout_frozen()),
             nonzero_pages,
             linker: self.linker.export_tape_state(),
             trampolines: data.trampolines.export_tape_state(),
@@ -920,6 +953,8 @@ impl AndroidEmulator {
         let target_heap = state.heap;
         let brk_cursor = state.brk_cursor;
         let mmap_cursor = state.mmap_cursor;
+        let target_host_scratch = state.host_scratch;
+        let target_freeze_layout = state.freeze_layout;
         let regs = state.regs;
         let cpu_layout = state.cpu_layout;
         let linker_state = state.linker;
@@ -945,6 +980,8 @@ impl AndroidEmulator {
                 target_heap,
                 brk_cursor,
                 mmap_cursor,
+                target_host_scratch,
+                target_freeze_layout,
             )?;
             // 3. 跨后端跳板重写：RET_MAGIC + HLE 槽位 + JNI 槽位
             CpuContext::rewrite_ret_magic(&mut self.engine, &mem)?;

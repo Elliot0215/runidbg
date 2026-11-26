@@ -9,8 +9,8 @@ use unicorn_engine::{RegisterARM64, UcHookId, Unicorn};
 
 use crate::error::EmuResult;
 use crate::tracer::record::{
-    decode_trace_record, format_ext_record, ExtKind, ExtRecord, TraceFilter, TraceLevel,
-    TraceRecord, TraceStats,
+    decode_trace_record, format_ext_record, ExtKind, ExtRecord, HleOpEvent, TraceFilter,
+    TraceLevel, TraceRecord, TraceStats,
 };
 
 /// 追踪的 32 个核心 64 位寄存器列表：X0..X30 + SP
@@ -78,6 +78,8 @@ pub struct BinaryTracer {
     ext_sink: ExtSink,
     level: TraceLevel,
     filter: TraceFilter,
+    /// Tracer 当前是否已通过 `attach_tracer` 激活（未激活时 HLE/内存 Hook 严禁写入）
+    active: bool,
     /// 上一条指令执行前的寄存器快照，用于 O(1) 计算增量变化
     prev_regs: [u64; 32],
     /// 是否已完成首次快照初始化
@@ -107,6 +109,7 @@ impl BinaryTracer {
             ext_sink,
             level,
             filter: TraceFilter::new(),
+            active: false,
             prev_regs: [0u64; 32],
             initialized: false,
             last_seq_low32: 0,
@@ -129,6 +132,7 @@ impl BinaryTracer {
             ext_sink: ExtSink::Disabled,
             level: TraceLevel::RegDelta,
             filter: TraceFilter::new(),
+            active: false,
             prev_regs: [0u64; 32],
             initialized: false,
             last_seq_low32: 0,
@@ -165,12 +169,36 @@ impl BinaryTracer {
             },
             level,
             filter: TraceFilter::new(),
+            active: false,
             prev_regs: [0u64; 32],
             initialized: false,
             last_seq_low32: 0,
             last_pc: 0,
             stats: TraceStats::default(),
         })
+    }
+
+    #[inline]
+    pub const fn is_active(&self) -> bool {
+        self.active
+    }
+
+    #[inline]
+    pub fn set_active(&mut self, active: bool) {
+        self.active = active;
+    }
+
+    #[inline]
+    fn ext_remaining_capacity(&self) -> usize {
+        match &self.ext_sink {
+            ExtSink::Disabled => 0,
+            ExtSink::Memory(buf) => buf.capacity().saturating_sub(buf.len()),
+            ExtSink::Mmap {
+                max_records,
+                written,
+                ..
+            } => max_records.saturating_sub(*written),
+        }
     }
 
     #[inline]
@@ -349,6 +377,79 @@ impl BinaryTracer {
         }
     }
 
+    /// 记录 HLE 跳板内存/分配事件到 `trace.ext`（未激活、`Disabled` 或尚无已记录指令时零开销短路）
+    #[inline]
+    pub fn record_hle_event(&mut self, ev: HleOpEvent) {
+        if !self.active
+            || matches!(self.ext_sink, ExtSink::Disabled)
+            || self.stats.recorded_insns == 0
+        {
+            return;
+        }
+        let seq = self.last_seq_low32;
+        match ev.kind {
+            ExtKind::HleMemcpy => {
+                // 原子保证 HleMemcpy + HleMeta 成对落盘，避免仅写半条留下孤儿记录
+                if self.ext_remaining_capacity() < 2 {
+                    self.stats.dropped_ext += 2;
+                    return;
+                }
+                self.push_ext(ExtRecord {
+                    seq_low32: seq,
+                    kind: ExtKind::HleMemcpy as u8,
+                    size_or_reg: ev.subop_or_byte,
+                    _pad: [0; 2],
+                    addr: ev.dst,
+                    value: ev.src,
+                    pc: ev.caller_pc,
+                });
+                self.push_ext(ExtRecord {
+                    seq_low32: seq,
+                    kind: ExtKind::HleMeta as u8,
+                    size_or_reg: ev.subop_or_byte,
+                    _pad: [0; 2],
+                    addr: ev.dst,
+                    value: ev.len,
+                    pc: ev.caller_pc,
+                });
+            }
+            ExtKind::HleMemset => {
+                self.push_ext(ExtRecord {
+                    seq_low32: seq,
+                    kind: ExtKind::HleMemset as u8,
+                    size_or_reg: ev.subop_or_byte,
+                    _pad: [ev.aux_subop, 0],
+                    addr: ev.dst,
+                    value: ev.len,
+                    pc: ev.caller_pc,
+                });
+            }
+            ExtKind::HleMalloc => {
+                self.push_ext(ExtRecord {
+                    seq_low32: seq,
+                    kind: ExtKind::HleMalloc as u8,
+                    size_or_reg: ev.subop_or_byte,
+                    _pad: [0; 2],
+                    addr: ev.dst,
+                    value: ev.len,
+                    pc: ev.caller_pc,
+                });
+            }
+            ExtKind::HleFree => {
+                self.push_ext(ExtRecord {
+                    seq_low32: seq,
+                    kind: ExtKind::HleFree as u8,
+                    size_or_reg: 0,
+                    _pad: [0; 2],
+                    addr: ev.dst,
+                    value: 0,
+                    pc: ev.caller_pc,
+                });
+            }
+            _ => {}
+        }
+    }
+
     /// 若使用 mmap 后端，主动刷新脏页到磁盘
     pub fn flush(&self) -> EmuResult<()> {
         if let TraceSink::Mmap { mmap, .. } = &self.sink {
@@ -362,6 +463,16 @@ impl BinaryTracer {
 
     /// 刷盘、解除内存映射并将 `.idx` / `.ext` 文件精确截断至实际写入字节数（消除尾部零填充）
     pub fn finalize(&mut self) -> EmuResult<()> {
+        if self.stats.dropped_insns > 0 || self.stats.dropped_ext > 0 {
+            tracing::warn!(
+                target: "runidbg::trace",
+                recorded_insns = self.stats.recorded_insns,
+                dropped_insns = self.stats.dropped_insns,
+                recorded_ext = self.stats.recorded_ext,
+                dropped_ext = self.stats.dropped_ext,
+                "Trace 缓冲区容量耗尽并发生截断！请增大 trace.start({{ capacity }}) 后重抓"
+            );
+        }
         self.flush()?;
         if matches!(self.sink, TraceSink::Mmap { .. }) {
             let old = std::mem::replace(&mut self.sink, TraceSink::Memory(Vec::new()));
@@ -450,6 +561,7 @@ pub fn attach_code_hook<'a, D, F>(
 where
     F: FnMut(&mut D) -> &mut BinaryTracer + 'a,
 {
+    get_tracer(uc.get_data_mut()).set_active(true);
     let hook_id = uc.add_code_hook(begin, end, move |uc, addr, size| {
         let level = {
             let tracer = get_tracer(uc.get_data_mut());
@@ -494,28 +606,44 @@ pub fn attach_mem_trace_hook<'a, D, F>(
 where
     F: FnMut(&mut D) -> &mut BinaryTracer + 'a,
 {
+    get_tracer(uc.get_data_mut()).set_active(true);
     let hook_id = uc.add_mem_hook(
         HookType::MEM_READ | HookType::MEM_WRITE,
         begin,
         end,
         move |uc, mem_type, addr, size, value| {
+            let cur_pc = uc.reg_read(RegisterARM64::PC).unwrap_or(0);
+            {
+                let tracer = get_tracer(uc.get_data_mut());
+                if !tracer.is_active()
+                    || tracer.level() != TraceLevel::Full
+                    || tracer.stats.recorded_insns == 0
+                    || cur_pc != tracer.last_pc
+                {
+                    return true;
+                }
+            }
             let is_write = matches!(mem_type, MemType::WRITE);
+            let mask = match size {
+                1 => 0xFFu64,
+                2 => 0xFFFFu64,
+                4 => 0xFFFF_FFFFu64,
+                _ => u64::MAX,
+            };
             let actual_val = if is_write {
-                value as u64
+                (value as u64) & mask
             } else {
                 let mut buf = [0u8; 8];
                 let n = size.min(8);
                 if uc.mem_read(addr, &mut buf[..n]).is_ok() {
-                    u64::from_le_bytes(buf)
+                    u64::from_le_bytes(buf) & mask
                 } else {
                     0
                 }
             };
 
             let tracer = get_tracer(uc.get_data_mut());
-            if tracer.level() == TraceLevel::Full {
-                tracer.record_mem_access(is_write, addr, size, actual_val);
-            }
+            tracer.record_mem_access(is_write, addr, size, actual_val);
             true
         },
     )?;

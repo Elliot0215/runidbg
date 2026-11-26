@@ -237,6 +237,8 @@ pub(crate) struct TapeFullState {
     pub heap: BumpAllocator,
     pub brk_cursor: u64,
     pub mmap_cursor: u64,
+    pub host_scratch: Option<BumpAllocator>,
+    pub freeze_layout: Option<bool>,
     /// 仅存非零 4KB 页（空页稀疏省略）
     pub nonzero_pages: BTreeMap<u64, [u8; 4096]>,
     pub linker: LinkerTapeState,
@@ -262,6 +264,8 @@ struct TapeCheckpointChunk {
     heap: BumpAllocator,
     brk_cursor: u64,
     mmap_cursor: u64,
+    host_scratch: Option<BumpAllocator>,
+    freeze_layout: Option<bool>,
     linker: LinkerTapeState,
     trampolines: TrampolineTapeState,
     jni: JniTapeState,
@@ -312,6 +316,8 @@ impl Tape {
             heap: state.heap,
             brk_cursor: state.brk_cursor,
             mmap_cursor: state.mmap_cursor,
+            host_scratch: state.host_scratch,
+            freeze_layout: state.freeze_layout,
             linker: state.linker,
             trampolines: state.trampolines,
             jni: state.jni,
@@ -461,6 +467,8 @@ impl Tape {
             heap: next.heap,
             brk_cursor: next.brk_cursor,
             mmap_cursor: next.mmap_cursor,
+            host_scratch: next.host_scratch,
+            freeze_layout: next.freeze_layout,
             linker: next.linker,
             trampolines: next.trampolines,
             jni: next.jni,
@@ -539,6 +547,8 @@ impl Tape {
             heap: target.heap.clone(),
             brk_cursor: target.brk_cursor,
             mmap_cursor: target.mmap_cursor,
+            host_scratch: target.host_scratch.clone(),
+            freeze_layout: target.freeze_layout,
             nonzero_pages,
             linker: target.linker.clone(),
             trampolines: target.trampolines.clone(),
@@ -1385,6 +1395,28 @@ fn encode_chunk_payload(out: &mut Vec<u8>, c: &TapeCheckpointChunk) -> EmuResult
     w.u64(c.vfs.mono_clock_ns);
     w.bool(c.vfs.use_real_clock);
     encode_net_state(&mut w, &c.vfs.net)?;
+
+    // 9. 可选尾部扩展块（魔数 "SCRT" = 0x5343_5254，完全向后兼容旧版 .rtape）：
+    //    持久化 [host-scratch] 隔离分配器元数据与 freeze_layout 标志，防止倒带/恢复后 UAF 或 UnmappedMemory
+    if let Some(ref hs) = c.host_scratch {
+        w.u32(0x5343_5254);
+        w.bool(c.freeze_layout.unwrap_or(false));
+        let raw = hs.export_raw();
+        w.u64(raw.base);
+        w.u64(raw.size);
+        w.u64(raw.cursor);
+        w.u64(raw.in_use);
+        w.len_u32(raw.free_blocks.len())?;
+        for (k, v) in raw.free_blocks {
+            w.u64(k);
+            w.u64(v);
+        }
+        w.len_u32(raw.allocated.len())?;
+        for (k, v) in raw.allocated {
+            w.u64(k);
+            w.u64(v);
+        }
+    }
     Ok(())
 }
 
@@ -1914,6 +1946,38 @@ fn decode_chunk_payload(r: &mut BinReader<'_>, is_delta: bool) -> EmuResult<Tape
         net,
     };
 
+    let mut host_scratch = None;
+    let mut freeze_layout = None;
+    if r.remaining() >= 4 {
+        let tag = r.u32()?;
+        if tag == 0x5343_5254 {
+            let fl = r.bool()?;
+            let s_base = r.u64()?;
+            let s_size = r.u64()?;
+            let s_cursor = r.u64()?;
+            let s_in_use = r.u64()?;
+            let (sf_len, sf_cap) = r.read_count(16)?;
+            let mut s_free = Vec::with_capacity(sf_cap);
+            for _ in 0..sf_len {
+                s_free.push((r.u64()?, r.u64()?));
+            }
+            let (sa_len, sa_cap) = r.read_count(16)?;
+            let mut s_alloc = Vec::with_capacity(sa_cap);
+            for _ in 0..sa_len {
+                s_alloc.push((r.u64()?, r.u64()?));
+            }
+            host_scratch = Some(BumpAllocator::from_raw(crate::memory::BumpAllocatorRaw {
+                base: s_base,
+                size: s_size,
+                cursor: s_cursor,
+                free_blocks: s_free,
+                allocated: s_alloc,
+                in_use: s_in_use,
+            }));
+            freeze_layout = Some(fl);
+        }
+    }
+
     Ok(TapeCheckpointChunk {
         meta,
         is_delta,
@@ -1926,6 +1990,8 @@ fn decode_chunk_payload(r: &mut BinReader<'_>, is_delta: bool) -> EmuResult<Tape
         heap,
         brk_cursor,
         mmap_cursor,
+        host_scratch,
+        freeze_layout,
         linker,
         trampolines,
         jni,

@@ -150,6 +150,9 @@
     regBigInt(name) {
       return __native.regGetBigInt(this._emuId, String(name));
     },
+    reg64(name) {
+      return __native.regGetBigInt(this._emuId, String(name));
+    },
     setReg(name, val) {
       __native.regSet(this._emuId, String(name), val);
     },
@@ -262,6 +265,15 @@
         alloc(size) {
           return __native.memAlloc(emuId, Number(size));
         },
+        allocScratch(size) {
+          return __native.memAllocScratch(emuId, Number(size));
+        },
+        setFreezeLayout(enabled) {
+          __native.memSetFreezeLayout(emuId, Boolean(enabled));
+        },
+        heapLayout(limit = 512) {
+          return __native.memHeapLayout(emuId, Number(limit));
+        },
         readBytes(addr, len) {
           return __native.memReadBytes(emuId, toAddr(addr), Number(len));
         },
@@ -316,6 +328,11 @@
       emuMemMap.set(emuId, memNs);
       if (opts.device !== undefined) {
         __native.vfsSetDevice(emuId, opts.device);
+      }
+      if (opts.freezeLayout !== undefined) {
+        __native.memSetFreezeLayout(emuId, Boolean(opts.freezeLayout));
+      } else if (__native.isDefaultFreezeLayout()) {
+        __native.memSetFreezeLayout(emuId, true);
       }
       if (opts.realClock !== undefined) {
         __native.vfsUseRealClock(emuId, Boolean(opts.realClock));
@@ -425,6 +442,9 @@
           getBigInt(name) {
             return __native.regGetBigInt(emuId, String(name));
           },
+          get64(name) {
+            return __native.regGetBigInt(emuId, String(name));
+          },
           set(name, val) {
             __native.regSet(emuId, String(name), val);
           },
@@ -506,19 +526,67 @@
             if (typeof optsOrFn === "function") {
               opts = { read: true, write: true };
               fn = optsOrFn;
-            } else {
-              opts = optsOrFn || {};
+            } else if (optsOrFn === undefined || optsOrFn === null) {
+              opts = { read: true, write: true };
               fn = maybeFn;
+            } else if (typeof optsOrFn === "object" && !Array.isArray(optsOrFn)) {
+              opts = optsOrFn;
+              fn = maybeFn;
+            } else {
+              throw new TypeError("hook.mem options must be an object or callback function");
             }
             if (typeof fn !== "function") {
               throw new TypeError("hook.mem expects a callback function");
             }
-            const read = opts.read !== undefined ? Boolean(opts.read) : false;
-            const write = opts.write !== undefined ? Boolean(opts.write) : false;
-            const r = !read && !write ? true : read;
-            const w = !read && !write ? true : write;
-            const id = __native.hookMem(emuId, toAddr(range[0]), toAddr(range[1]), r, w, fn);
-            return makeHookHandle(emuId, id);
+            const bothOmitted = opts.read === undefined && opts.write === undefined;
+            const r = bothOmitted ? true : Boolean(opts.read);
+            const w = bothOmitted ? true : Boolean(opts.write);
+            const res = __native.hookMem(
+              emuId,
+              range[0],
+              range[1],
+              {
+                read: r,
+                write: w,
+                value: opts.value,
+                size: opts.size,
+                pcRange: opts.pcRange,
+                bigInt: Boolean(opts.bigInt),
+              },
+              fn
+            );
+            const handle = makeHookHandle(emuId, res.id);
+            handle.unmapped = Boolean(res.unmapped);
+            return handle;
+          },
+          watch(range, modeOrOpts, fn) {
+            let opts;
+            let cb = fn;
+            if (typeof modeOrOpts === "function") {
+              opts = { read: false, write: true };
+              cb = modeOrOpts;
+            } else if (typeof modeOrOpts === "string") {
+              const m = modeOrOpts.trim().toLowerCase();
+              if (m === "w" || m === "write") {
+                opts = { read: false, write: true };
+              } else if (m === "r" || m === "read") {
+                opts = { read: true, write: false };
+              } else if (m === "rw" || m === "wr" || m === "access" || m === "a") {
+                opts = { read: true, write: true };
+              } else {
+                throw new TypeError("hook.watch mode must be 'w' | 'r' | 'rw', got " + modeOrOpts);
+              }
+            } else if (modeOrOpts && typeof modeOrOpts === "object") {
+              opts = Object.assign({ read: false, write: true }, modeOrOpts);
+              if (typeof modeOrOpts.mode === "string") {
+                const m = modeOrOpts.mode.trim().toLowerCase();
+                opts.read = m.includes("r") || m === "access" || m === "a";
+                opts.write = m.includes("w") || m === "access" || m === "a";
+              }
+            } else {
+              opts = { read: false, write: true };
+            }
+            return this.mem(range, opts, cb);
           },
           syscall(nrOrWildcard, fn) {
             if (typeof fn !== "function") {
@@ -830,11 +898,18 @@
             const level = traceOpts.level ? String(traceOpts.level) : "reg_delta";
             const start = traceOpts.start !== undefined ? toAddr(traceOpts.start) : 0;
             const end = traceOpts.end !== undefined ? toAddr(traceOpts.end) : -1;
-            const capacity = traceOpts.capacity !== undefined ? Number(traceOpts.capacity) : 65536;
+            const capacity = traceOpts.capacity !== undefined ? Number(traceOpts.capacity) : 262144;
             __native.traceStart(emuId, output, level, start, end, capacity);
           },
           stop() {
-            return __native.traceStop(emuId);
+            const stats = __native.traceStop(emuId);
+            stats.truncated = Boolean(stats.droppedInsns > 0 || stats.droppedExt > 0);
+            if (stats.truncated) {
+              console.warn(
+                `[runidbg::trace] Trace 发生截断: recorded=${stats.records}, droppedInsns=${stats.droppedInsns}, droppedExt=${stats.droppedExt}（请调大 trace.start({ capacity })）`
+              );
+            }
+            return stats;
           },
         },
         snapshot() {
@@ -865,6 +940,9 @@
           );
           currentTapeCheckpoint = info;
           return info;
+        },
+        heapLayout(limit = 512) {
+          return __native.memHeapLayout(emuId, Number(limit));
         },
         record: {
           start(opts = {}) {
@@ -1027,6 +1105,55 @@
     openTimeTravel(path) {
       const info = __native.ttOpen(String(path));
       return buildTimeTravelHandle(info);
+    },
+  };
+
+  global.Trace = {
+    open(idxPath, extPath) {
+      const info = __native.traceOpen(
+        String(idxPath),
+        extPath !== undefined && extPath !== null ? String(extPath) : null
+      );
+      const traceId = info.traceId;
+      return {
+        totalInsns: info.totalInsns,
+        totalExt: info.totalExt,
+        query(opts) {
+          return __native.traceQuery(traceId, opts || {});
+        },
+        findWrites(value, opts = {}) {
+          return __native.traceQuery(traceId, Object.assign({}, opts || {}, { value }));
+        },
+        findReads(addr, opts = {}) {
+          return __native.traceQuery(
+            traceId,
+            Object.assign({}, opts || {}, { addr, writesOnly: false })
+          );
+        },
+        hleEvents(limit = 500) {
+          return __native.traceHleEvents(traceId, Number(limit));
+        },
+        reconstructMem(addr, len, atSeq) {
+          return __native.traceReconstructMem(
+            traceId,
+            addr,
+            Number(len),
+            atSeq !== undefined && atSeq !== null ? atSeq : null
+          );
+        },
+        taintForward(opts) {
+          return __native.traceTaint(traceId, "forward", opts || {});
+        },
+        taintBackward(opts) {
+          return __native.traceTaint(traceId, "backward", opts || {});
+        },
+        close() {
+          return __native.traceClose(traceId);
+        },
+      };
+    },
+    diff(idxA, idxB, maxDiffs = 100) {
+      return __native.traceDiff(String(idxA), String(idxB), Number(maxDiffs));
     },
   };
 })(globalThis);

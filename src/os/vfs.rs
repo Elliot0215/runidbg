@@ -391,6 +391,11 @@ impl VirtualFs {
         res
     }
 
+    /// 重置确定性 PRNG 种子（供 `srand`/`srandom` HLE 调用）
+    pub fn seed_random(&mut self, seed: u64) {
+        self.rng_state = if seed == 0 { 1 } else { seed };
+    }
+
     /// 生成确定性随机字节（供 `/dev/urandom` 与 `getrandom` Syscall 使用）
     pub fn fill_random(&mut self, dst: &mut [u8]) {
         for byte in dst.iter_mut() {

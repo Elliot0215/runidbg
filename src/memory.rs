@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use unicorn_engine::unicorn_const::Prot;
 use crate::backend::CpuBackend;
 
@@ -10,6 +10,21 @@ pub const PAGE_SIZE: u64 = 0x1000;
 /// 匿名 mmap 默认分配区间（与 HEAP_BASE 错开，位于 0x5800_0000..0x6000_0000）
 pub const MMAP_BASE: u64 = 0x5800_0000;
 pub const MMAP_LIMIT: u64 = 0x6000_0000;
+/// 宿主脚本/探测缓冲隔离区（64MB，位于 0x6400_0000..0x6800_0000，惰性映射，开启 `freezeLayout` 或调用 `allocScratch` 时使用，零干扰 guest `[heap]`）
+pub const HOST_SCRATCH_BASE: u64 = 0x6400_0000;
+pub const HOST_SCRATCH_SIZE: u64 = 0x0400_0000;
+const MAX_HEAP_ALLOC_LOG: usize = 65_536;
+
+/// Guest 堆分配历史条目（供 `emu.mem.heapLayout()` 诊断跨跑堆布局漂移）
+#[derive(Debug, Clone)]
+pub struct HeapAllocRecord {
+    pub seq: u64,
+    pub ptr: u64,
+    pub size: u64,
+    pub caller_pc: u64,
+    pub op: &'static str,
+    pub freed: bool,
+}
 
 /// 堆块头部魔数与大小（16 字节对齐，供 HLE malloc/realloc/free 记录块元数据）
 const HEAP_BLOCK_MAGIC: u64 = 0x4845_4150_424C_4B31; // "HEAPBLK1"
@@ -227,12 +242,17 @@ pub(crate) struct BumpAllocatorRaw {
     pub in_use: u64,
 }
 
-/// 模拟堆元数据快照（供 `EmuSnapshot` 完整保存与恢复堆状态）
+/// 模拟堆元数据快照（供 `EmuSnapshot` 完整保存与恢复堆状态，含 `[host-scratch]` 隔离区）
 #[derive(Debug, Clone)]
 pub struct HeapSnapshot {
     pub heap: BumpAllocator,
     pub brk_cursor: u64,
     pub mmap_cursor: u64,
+    pub host_scratch: BumpAllocator,
+    pub host_scratch_mapped_end: u64,
+    pub freeze_layout: bool,
+    pub heap_alloc_log: VecDeque<HeapAllocRecord>,
+    pub next_alloc_seq: u64,
 }
 
 /// 模拟器 MMU 内存管理器
@@ -248,6 +268,16 @@ pub struct MemoryManager {
     brk_cursor: u64,
     /// 匿名 `mmap` 下一个分配游标
     mmap_cursor: u64,
+    /// 宿主侧探测/临时缓冲隔离分配器（`HOST_SCRATCH_BASE`，不扰动 guest `[heap]`）
+    host_scratch: BumpAllocator,
+    host_scratch_mapped_end: u64,
+    /// 是否冻结 guest 堆布局（为 true 时，宿主 `emu.mem.alloc` 自动路由至 `host_scratch`）
+    freeze_layout: bool,
+    /// Guest HLE 堆分配/释放记录（O(1) 环形淘汰，供 `heapLayout()` 指纹排查）
+    heap_alloc_log: VecDeque<HeapAllocRecord>,
+    /// 活跃分配地址到 `heap_alloc_log` 首条 seq 偏移索引（`ptr -> seq`，用于 O(1) `record_heap_free`）
+    active_heap_allocs: HashMap<u64, u64>,
+    next_alloc_seq: u64,
     /// 虚拟内存布局变更代际（每次 map/mmap/munmap/mprotect/restore_from_tape 递增，供微快照校验）
     layout_epoch: u64,
 }
@@ -262,6 +292,12 @@ impl MemoryManager {
             heap: BumpAllocator::new(aligned_base, aligned_size),
             brk_cursor: aligned_base,
             mmap_cursor: MMAP_BASE,
+            host_scratch: BumpAllocator::new(HOST_SCRATCH_BASE, HOST_SCRATCH_SIZE),
+            host_scratch_mapped_end: HOST_SCRATCH_BASE,
+            freeze_layout: false,
+            heap_alloc_log: VecDeque::new(),
+            active_heap_allocs: HashMap::new(),
+            next_alloc_seq: 1,
             layout_epoch: 0,
         }
     }
@@ -593,12 +629,100 @@ impl MemoryManager {
         self.heap.alloc(size, align)
     }
 
-    /// 释放由 `alloc_heap` / `alloc_heap_aligned` 分配的原始堆块
+    /// 释放由 `alloc_heap` / `alloc_heap_aligned` 或 `alloc_host_scratch` 分配的原始堆块
     pub fn free_heap(&mut self, ptr: u64) -> bool {
         if ptr == 0 {
             return false;
         }
+        if (HOST_SCRATCH_BASE..HOST_SCRATCH_BASE + HOST_SCRATCH_SIZE).contains(&ptr) {
+            return self.host_scratch.free(ptr);
+        }
         self.heap.free(ptr)
+    }
+
+    /// 开关「冻结 Guest 堆布局」模式（开启后宿主 `emu.mem.alloc` 自动分配到独立 `[host-scratch]` 区，绝不偏移 guest `malloc` 地址）
+    pub fn set_freeze_layout(&mut self, enabled: bool) {
+        self.freeze_layout = enabled;
+    }
+
+    #[inline]
+    pub const fn is_layout_frozen(&self) -> bool {
+        self.freeze_layout
+    }
+
+    /// 从独立 `[host-scratch]` 隔离区分配宿主/探测脚本专用缓冲（惰性按 64KB 步进映射，完全不干扰 guest `[heap]`）
+    pub fn alloc_host_scratch<B: CpuBackend + ?Sized>(
+        &mut self,
+        uc: &mut B,
+        size: u64,
+    ) -> EmuResult<u64> {
+        let ptr = self.host_scratch.alloc(size.max(1), 16)?;
+        let needed_end = align_up(ptr.saturating_add(size.max(1)), PAGE_SIZE * 16)
+            .min(HOST_SCRATCH_BASE + HOST_SCRATCH_SIZE);
+        if needed_end > self.host_scratch_mapped_end {
+            let map_start = self.host_scratch_mapped_end;
+            let map_len = needed_end - map_start;
+            self.map_labeled(
+                uc,
+                map_start,
+                map_len,
+                Prot::READ | Prot::WRITE,
+                "[host-scratch]",
+                0,
+            )?;
+            self.host_scratch_mapped_end = needed_end;
+        }
+        Ok(ptr)
+    }
+
+    /// 记录一次 guest HLE 堆分配（O(1) 环形队列，供 `heapLayout()` 诊断跨跑地址漂移）
+    pub fn record_heap_alloc(&mut self, ptr: u64, size: u64, caller_pc: u64, op: &'static str) {
+        let seq = self.next_alloc_seq;
+        self.next_alloc_seq = self.next_alloc_seq.wrapping_add(1);
+        if self.heap_alloc_log.len() >= MAX_HEAP_ALLOC_LOG {
+            if let Some(evicted) = self.heap_alloc_log.pop_front() {
+                if self.active_heap_allocs.get(&evicted.ptr) == Some(&evicted.seq) {
+                    self.active_heap_allocs.remove(&evicted.ptr);
+                }
+            }
+        }
+        self.heap_alloc_log.push_back(HeapAllocRecord {
+            seq,
+            ptr,
+            size,
+            caller_pc,
+            op,
+            freed: false,
+        });
+        self.active_heap_allocs.insert(ptr, seq);
+    }
+
+    /// O(1) 标记对应堆块已释放
+    pub fn record_heap_free(&mut self, ptr: u64, _caller_pc: u64) {
+        if let Some(seq) = self.active_heap_allocs.remove(&ptr) {
+            if let Some(first) = self.heap_alloc_log.front() {
+                let offset = seq.wrapping_sub(first.seq) as usize;
+                if let Some(rec) = self.heap_alloc_log.get_mut(offset) {
+                    if rec.seq == seq && rec.ptr == ptr {
+                        rec.freed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn heap_alloc_log(&self) -> &VecDeque<HeapAllocRecord> {
+        &self.heap_alloc_log
+    }
+
+    /// 检查 `[begin, end]` 区间内是否存在至少 1 个已映射 4KB 页（供 `hook.mem` 未映射告警使用）
+    pub fn has_any_mapped_page_in(&self, begin: u64, end: u64) -> bool {
+        let start_page = align_down(begin, PAGE_SIZE);
+        let end_page = align_down(end.max(begin), PAGE_SIZE);
+        self.mapped_pages
+            .range(start_page..=end_page)
+            .next()
+            .is_some()
     }
 
     /// 带块头元数据的 HLE `malloc`（支持 `realloc` 读取原块大小，并可被 `hle_free` 回收复用）
@@ -610,10 +734,13 @@ impl MemoryManager {
         Ok(raw_addr + HEAP_HEADER_SIZE)
     }
 
-    /// 释放由 `hle_malloc` / `hle_calloc` / `hle_realloc`（或原始 `alloc_heap`）分配的块
+    /// 释放由 `hle_malloc` / `hle_calloc` / `hle_realloc` / `alloc_host_scratch`（或原始 `alloc_heap`）分配的块
     pub fn hle_free(&mut self, ptr: u64) -> bool {
         if ptr == 0 {
             return false;
+        }
+        if (HOST_SCRATCH_BASE..HOST_SCRATCH_BASE + HOST_SCRATCH_SIZE).contains(&ptr) {
+            return self.host_scratch.free(ptr);
         }
         if ptr >= self.heap.base() + HEAP_HEADER_SIZE
             && self.heap.free(ptr - HEAP_HEADER_SIZE)
@@ -667,20 +794,43 @@ impl MemoryManager {
         Ok(new_ptr)
     }
 
-    /// 捕获模拟堆元数据快照（含空闲链表与已分配块表）
+    /// 捕获模拟堆元数据快照（含空闲链表、已分配块表、`[host-scratch]` 与分配日志）
     pub fn heap_snapshot(&self) -> HeapSnapshot {
         HeapSnapshot {
             heap: self.heap.clone(),
             brk_cursor: self.brk_cursor,
             mmap_cursor: self.mmap_cursor,
+            host_scratch: self.host_scratch.clone(),
+            host_scratch_mapped_end: self.host_scratch_mapped_end,
+            freeze_layout: self.freeze_layout,
+            heap_alloc_log: self.heap_alloc_log.clone(),
+            next_alloc_seq: self.next_alloc_seq,
         }
     }
 
-    /// 恢复模拟堆元数据快照
+    /// 恢复模拟堆元数据快照（保留后端已映射上界防止重复 `map_labeled` 提权 RWX）
     pub fn restore_heap_snapshot(&mut self, snap: &HeapSnapshot) {
         self.heap = snap.heap.clone();
         self.brk_cursor = snap.brk_cursor;
         self.mmap_cursor = snap.mmap_cursor;
+        self.host_scratch = snap.host_scratch.clone();
+        // EmuSnapshot::restore 不会 munmap 快照后新增映射页，保留较大上界避免后续重复映射提权
+        self.host_scratch_mapped_end = self
+            .host_scratch_mapped_end
+            .max(snap.host_scratch_mapped_end);
+        self.freeze_layout = snap.freeze_layout;
+        self.heap_alloc_log = snap.heap_alloc_log.clone();
+        self.next_alloc_seq = snap.next_alloc_seq;
+        self.active_heap_allocs.clear();
+        for rec in &self.heap_alloc_log {
+            if !rec.freed {
+                self.active_heap_allocs.insert(rec.ptr, rec.seq);
+            }
+        }
+    }
+
+    pub(crate) fn host_scratch_ref(&self) -> &BumpAllocator {
+        &self.host_scratch
     }
 
     #[inline]
@@ -712,6 +862,7 @@ impl MemoryManager {
     /// 按 `.rtape` 磁带目标状态同步全部 VMA 映射、4KB 内存页与堆分配器元数据
     ///
     /// 支持首次恢复与运行中任意检查点快进/倒带（仅卸载多余页、映射新增页、写回差异/非零页并清零空页）。
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn restore_from_tape<B: CpuBackend + ?Sized>(
         &mut self,
         uc: &mut B,
@@ -720,6 +871,8 @@ impl MemoryManager {
         target_heap: BumpAllocator,
         brk_cursor: u64,
         mmap_cursor: u64,
+        target_host_scratch: Option<BumpAllocator>,
+        target_freeze_layout: Option<bool>,
     ) -> EmuResult<()> {
         const MIN_GUEST_VA: u64 = 0x1_0000;
         const MAX_GUEST_VA: u64 = 0x0001_0000_0000_0000;
@@ -854,6 +1007,31 @@ impl MemoryManager {
         self.heap = target_heap;
         self.brk_cursor = brk_cursor;
         self.mmap_cursor = mmap_cursor;
+
+        // 依据目标已映射页重新精确计算 `[host-scratch]` 的连续映射上界（防倒带后跳映射崩溃或提权 RWX）
+        let mut scratch_mapped_end = HOST_SCRATCH_BASE;
+        let scratch_limit = HOST_SCRATCH_BASE + HOST_SCRATCH_SIZE;
+        while scratch_mapped_end < scratch_limit && self.mapped_pages.contains(&scratch_mapped_end)
+        {
+            scratch_mapped_end += PAGE_SIZE;
+        }
+        self.host_scratch_mapped_end = scratch_mapped_end;
+        if let Some(hs) = target_host_scratch {
+            self.host_scratch = hs;
+        } else {
+            // 兼容旧版未含 SCRT 尾部块的磁带：若已存在 [host-scratch] 页，将游标推进到映射上界以防 UAF 覆写
+            let mut hs = BumpAllocator::new(HOST_SCRATCH_BASE, HOST_SCRATCH_SIZE);
+            if scratch_mapped_end > HOST_SCRATCH_BASE {
+                let _ = hs.alloc(scratch_mapped_end - HOST_SCRATCH_BASE, 16);
+            }
+            self.host_scratch = hs;
+        }
+        if let Some(fl) = target_freeze_layout {
+            self.freeze_layout = fl;
+        }
+        self.heap_alloc_log.clear();
+        self.active_heap_allocs.clear();
+        self.next_alloc_seq = 1;
         self.layout_epoch = self.layout_epoch.wrapping_add(1);
         Ok(())
     }

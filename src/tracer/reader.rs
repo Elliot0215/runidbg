@@ -7,7 +7,7 @@ use std::ptr;
 use memmap2::Mmap;
 
 use crate::error::EmuResult;
-use crate::tracer::record::{ExtKind, ExtRecord, TraceRecord};
+use crate::tracer::record::{format_ext_record, ExtKind, ExtRecord, HleTraceEvent, TraceRecord};
 
 /// 内存写入字节流匹配命中项
 #[derive(Debug, Clone)]
@@ -16,6 +16,39 @@ pub struct MemPatternHit {
     pub pc: u64,
     pub addr: u64,
     pub matched_len: usize,
+}
+
+/// 离线全知查询命中项（供 `TraceReader::query_*` / JS `Trace.open().query(...)` 使用）
+#[derive(Debug, Clone)]
+pub struct TraceQueryHit {
+    pub seq_low32: u32,
+    pub pc: u64,
+    pub addr: u64,
+    pub size: u64,
+    pub kind: &'static str,
+    pub value: u64,
+    pub src: u64,
+}
+
+/// 双跑 Trace 差分条目（供 `runidbg-cli diff a.idx b.idx` 与 JS/MCP 使用）
+#[derive(Debug, Clone)]
+pub struct TraceDiffEntry {
+    pub idx: usize,
+    pub kind: &'static str,
+    pub pc_a: u64,
+    pub pc_b: u64,
+    pub detail: String,
+}
+
+/// 双跑 Trace 差分汇总结果
+#[derive(Debug, Clone)]
+pub struct TraceDiffSummary {
+    pub total_a: usize,
+    pub total_b: usize,
+    pub common_prefix_insns: usize,
+    pub first_control_divergence_idx: Option<usize>,
+    pub first_data_divergence_idx: Option<usize>,
+    pub diffs: Vec<TraceDiffEntry>,
 }
 
 /// 基于 `BL`/`BLR`/`RET` 构建的时间轴调用树节点
@@ -207,7 +240,7 @@ impl TraceReader {
         out
     }
 
-    /// 获取指令 `idx` 自身产生的内存读写事件（过滤掉 `RegDeltaExtra`）
+    /// 获取指令 `idx` 自身产生的内存读写事件（过滤掉 `RegDeltaExtra` 与 HLE 伴随记录）
     pub fn mem_events_for(&self, idx: usize) -> Vec<ExtRecord> {
         let Some(rec) = self.get(idx) else {
             return Vec::new();
@@ -216,6 +249,132 @@ impl TraceReader {
             .into_iter()
             .filter(|e| e.kind == ExtKind::MemRead as u8 || e.kind == ExtKind::MemWrite as u8)
             .collect()
+    }
+
+    /// 解码一组连续 `ExtRecord` 中的全部 HLE 内存/分配事件（严格校验 `HleMemcpy + HleMeta` 的 `seq` 与 `addr` 配对）
+    fn decode_hle_slice(recs: &[ExtRecord]) -> Vec<HleTraceEvent> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < recs.len() {
+            let rec = recs[i];
+            let seq = rec.seq_low32;
+            let pc = rec.pc;
+            let addr = rec.addr;
+            let val = rec.value;
+            let sr = rec.size_or_reg;
+            match ExtKind::from_u8(rec.kind) {
+                Some(ExtKind::HleMemcpy) => {
+                    let op = match sr {
+                        1 => "memmove",
+                        2 => "realloc_copy",
+                        _ => "memcpy",
+                    };
+                    let mut len = 0u64;
+                    if i + 1 < recs.len() && is_matching_hle_meta(rec, recs[i + 1]) {
+                        len = recs[i + 1].value;
+                        i += 1;
+                    }
+                    out.push(HleTraceEvent {
+                        seq_low32: seq,
+                        op,
+                        dst: addr,
+                        src: val,
+                        len,
+                        pc,
+                    });
+                }
+                Some(ExtKind::HleMemset) => {
+                    let op = match rec._pad[0] {
+                        1 => "bzero",
+                        2 => "calloc_zero",
+                        _ => "memset",
+                    };
+                    out.push(HleTraceEvent {
+                        seq_low32: seq,
+                        op,
+                        dst: addr,
+                        src: sr as u64,
+                        len: val,
+                        pc,
+                    });
+                }
+                Some(ExtKind::HleMalloc) => {
+                    let op = match sr {
+                        1 => "calloc",
+                        2 => "realloc",
+                        3 => "posix_memalign",
+                        _ => "malloc",
+                    };
+                    out.push(HleTraceEvent {
+                        seq_low32: seq,
+                        op,
+                        dst: addr,
+                        src: 0,
+                        len: val,
+                        pc,
+                    });
+                }
+                Some(ExtKind::HleFree) => {
+                    out.push(HleTraceEvent {
+                        seq_low32: seq,
+                        op: "free",
+                        dst: addr,
+                        src: 0,
+                        len: 0,
+                        pc,
+                    });
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// 枚举 `trace.ext` 中全部结构化 HLE 内存/分配事件（`memcpy`/`memmove`/`memset`/`malloc`/`free`）
+    pub fn hle_events(&self) -> Vec<HleTraceEvent> {
+        let Some(mmap) = self.ext_mmap.as_ref() else {
+            return Vec::new();
+        };
+        let mut raw = Vec::new();
+        for i in 0..self.ext_count {
+            let rec = read_packed::<ExtRecord>(mmap, i);
+            if matches!(
+                ExtKind::from_u8(rec.kind),
+                Some(
+                    ExtKind::HleMemcpy
+                        | ExtKind::HleMemset
+                        | ExtKind::HleMalloc
+                        | ExtKind::HleFree
+                        | ExtKind::HleMeta
+                )
+            ) {
+                raw.push(rec);
+            }
+        }
+        Self::decode_hle_slice(&raw)
+    }
+
+    /// 获取指令 `idx` 关联的全部 HLE 内存/分配事件
+    pub fn hle_events_for(&self, idx: usize) -> Vec<HleTraceEvent> {
+        let Some(rec) = self.get(idx) else {
+            return Vec::new();
+        };
+        let exts = self.ext_for_seq(rec.seq_low32);
+        Self::decode_hle_slice(&exts)
+    }
+
+    /// 获取指令 `idx` 关联的全部格式化扩展行（含 `[MEM R/W]` 与合并后的 `[HLE ...]`）
+    pub fn mem_and_hle_lines_for(&self, idx: usize) -> Vec<String> {
+        let mut lines: Vec<String> = self
+            .mem_events_for(idx)
+            .into_iter()
+            .map(|e| format_ext_record(&e))
+            .collect();
+        for h in self.hle_events_for(idx) {
+            lines.push(h.format_line());
+        }
+        lines
     }
 
     /// 搜索主索引寄存器值匹配的指令记录（原始未偏移接口，保留兼容性）
@@ -285,51 +444,141 @@ impl TraceReader {
         hits
     }
 
-    /// 搜索扩展流中访问了目标内存地址的事件
+    /// 返回第一个 `seq_low32 > at_seq`（或回绕纪元边界）的扩展流上界索引
+    fn ext_end_index_for_seq(&self, at_seq: u32) -> usize {
+        let Some(mmap) = self.ext_mmap.as_ref() else {
+            return 0;
+        };
+        if self.ext_count == 0 {
+            return 0;
+        }
+        if self.ext_monotonic {
+            let mut lo = 0usize;
+            let mut hi = self.ext_count;
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let s = read_packed::<ExtRecord>(mmap, mid).seq_low32;
+                if s <= at_seq {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            return lo;
+        }
+        // 非单调（32 位 seq 回绕）：停在回绕发生前首次超过 at_seq 的位置，防止未来纪元混入
+        let mut prev_seq = read_packed::<ExtRecord>(mmap, 0).seq_low32;
+        for i in 0..self.ext_count {
+            let seq = read_packed::<ExtRecord>(mmap, i).seq_low32;
+            if i > 0 && seq < prev_seq {
+                // 已发生 2^32 回绕，说明之前纪元全在 at_seq 之前或已结束
+                return i;
+            }
+            if seq > at_seq {
+                return i;
+            }
+            prev_seq = seq;
+        }
+        self.ext_count
+    }
+
+    /// 搜索扩展流中访问了目标内存地址的事件（同时覆盖 Guest 指令访存与 HLE 区间拷贝/填充/分配）
     pub fn search_mem_addr(&self, target_addr: u64) -> Vec<ExtRecord> {
         let Some(mmap) = self.ext_mmap.as_ref() else {
             return Vec::new();
         };
         let mut hits = Vec::new();
-        for i in 0..self.ext_count {
+        let mut i = 0usize;
+        while i < self.ext_count {
             let rec = read_packed::<ExtRecord>(mmap, i);
-            if (rec.kind == ExtKind::MemRead as u8 || rec.kind == ExtKind::MemWrite as u8)
-                && rec.addr == target_addr
-            {
-                hits.push(rec);
+            match ExtKind::from_u8(rec.kind) {
+                Some(ExtKind::MemRead) | Some(ExtKind::MemWrite) => {
+                    let sz = (rec.size_or_reg as u64).max(1);
+                    if range_overlaps_u128(rec.addr, sz, target_addr, 1) {
+                        hits.push(rec);
+                    }
+                }
+                Some(ExtKind::HleMemcpy) => {
+                    let dst = rec.addr;
+                    let src = rec.value;
+                    let len = if i + 1 < self.ext_count {
+                        let next = read_packed::<ExtRecord>(mmap, i + 1);
+                        if is_matching_hle_meta(rec, next) {
+                            i += 1;
+                            next.value
+                        } else {
+                            0
+                        }
+                    } else {
+                        0
+                    };
+                    let in_dst = len > 0 && range_overlaps_u128(dst, len, target_addr, 1);
+                    let in_src = len > 0 && range_overlaps_u128(src, len, target_addr, 1);
+                    if in_dst || in_src || target_addr == dst || target_addr == src {
+                        hits.push(rec);
+                    }
+                }
+                Some(ExtKind::HleMemset) | Some(ExtKind::HleMalloc) => {
+                    let dst = rec.addr;
+                    let len = rec.value;
+                    if target_addr == dst
+                        || (len > 0 && range_overlaps_u128(dst, len, target_addr, 1))
+                    {
+                        hits.push(rec);
+                    }
+                }
+                Some(ExtKind::HleFree) if rec.addr == target_addr => {
+                    hits.push(rec);
+                }
+                _ => {}
             }
+            i += 1;
         }
         hits
     }
 
-    /// 回放 `.ext` 中的 `MemWrite` 字节流，搜索连续内存写入拼出的目标字节序列（如 ASCII 字符串或签名头字节）
+    /// 回放 `.ext` 中的 `MemWrite` 与 HLE `memcpy`/`memset` 字节流，搜索连续内存写入拼出的目标字节序列
     pub fn search_mem_bytes(&self, pattern: &[u8]) -> Vec<MemPatternHit> {
+        self.search_mem_bytes_bounded(pattern, None, None, 0)
+    }
+
+    /// 带 `min_seq` / `max_seq` / `limit` 提前终止的字节流匹配（避免大块 memset 场景全量回放爆内存）
+    fn search_mem_bytes_bounded(
+        &self,
+        pattern: &[u8],
+        min_seq: Option<u32>,
+        max_seq: Option<u32>,
+        limit: usize,
+    ) -> Vec<MemPatternHit> {
         if pattern.is_empty() {
             return Vec::new();
         }
         let Some(mmap) = self.ext_mmap.as_ref() else {
             return Vec::new();
         };
+        let end_idx = max_seq
+            .map(|hi| self.ext_end_index_for_seq(hi))
+            .unwrap_or(self.ext_count);
         let pat_len = pattern.len();
         let mut mem: HashMap<u64, u8> = HashMap::new();
         let mut hits = Vec::new();
         let mut last_hit_addr_seq: Option<(u64, u32)> = None;
 
-        for i in 0..self.ext_count {
-            let rec = read_packed::<ExtRecord>(mmap, i);
-            if rec.kind != ExtKind::MemWrite as u8 {
-                continue;
+        let check_window = |mem: &HashMap<u64, u8>,
+                            start_addr: u64,
+                            write_len: usize,
+                            seq: u32,
+                            pc: u64,
+                            hits: &mut Vec<MemPatternHit>,
+                            last: &mut Option<(u64, u32)>|
+         -> bool {
+            if let Some(lo) = min_seq {
+                if seq < lo {
+                    return false;
+                }
             }
-            let sz = (rec.size_or_reg as usize).clamp(1, 8);
-            let addr = rec.addr;
-            let bytes = rec.value.to_le_bytes();
-            for (off, &b) in bytes.iter().take(sz).enumerate() {
-                mem.insert(addr.wrapping_add(off as u64), b);
-            }
-
-            // 检查所有可能被本次写入补齐的起始地址 [addr - pat_len + 1 ..= addr + sz - 1]
-            let start_lo = addr.saturating_sub((pat_len - 1) as u64);
-            let start_hi = addr.wrapping_add((sz - 1) as u64);
+            let start_lo = start_addr.saturating_sub((pat_len - 1) as u64);
+            let start_hi = start_addr.saturating_add((write_len.saturating_sub(1)) as u64);
             let mut candidate = start_lo;
             while candidate <= start_hi {
                 let mut matched = true;
@@ -339,17 +588,16 @@ impl TraceReader {
                         break;
                     }
                 }
-                if matched {
-                    let seq = rec.seq_low32;
-                    let pc = rec.pc;
-                    if last_hit_addr_seq != Some((candidate, seq)) {
-                        hits.push(MemPatternHit {
-                            seq_low32: seq,
-                            pc,
-                            addr: candidate,
-                            matched_len: pat_len,
-                        });
-                        last_hit_addr_seq = Some((candidate, seq));
+                if matched && *last != Some((candidate, seq)) {
+                    hits.push(MemPatternHit {
+                        seq_low32: seq,
+                        pc,
+                        addr: candidate,
+                        matched_len: pat_len,
+                    });
+                    *last = Some((candidate, seq));
+                    if limit > 0 && hits.len() >= limit {
+                        return true;
                     }
                 }
                 match candidate.checked_add(1) {
@@ -357,8 +605,501 @@ impl TraceReader {
                     None => break,
                 }
             }
+            false
+        };
+
+        let mut i = 0usize;
+        while i < end_idx {
+            let rec = read_packed::<ExtRecord>(mmap, i);
+            match ExtKind::from_u8(rec.kind) {
+                Some(ExtKind::MemWrite) => {
+                    let sz = (rec.size_or_reg as usize).clamp(1, 8);
+                    let addr = rec.addr;
+                    let bytes = rec.value.to_le_bytes();
+                    for (off, &b) in bytes.iter().take(sz).enumerate() {
+                        mem.insert(addr.wrapping_add(off as u64), b);
+                    }
+                    if check_window(
+                        &mem,
+                        addr,
+                        sz,
+                        rec.seq_low32,
+                        rec.pc,
+                        &mut hits,
+                        &mut last_hit_addr_seq,
+                    ) {
+                        break;
+                    }
+                }
+                Some(ExtKind::HleMemcpy) => {
+                    let dst = rec.addr;
+                    let src = rec.value;
+                    let mut len = 0usize;
+                    if i + 1 < end_idx {
+                        let next = read_packed::<ExtRecord>(mmap, i + 1);
+                        if is_matching_hle_meta(rec, next) {
+                            len = (next.value as usize).min(1 << 20);
+                            i += 1;
+                        }
+                    }
+                    if len > 0 {
+                        let mut copied = Vec::with_capacity(len);
+                        for off in 0..len {
+                            copied.push(mem.get(&src.wrapping_add(off as u64)).copied());
+                        }
+                        for (off, mb) in copied.into_iter().enumerate() {
+                            if let Some(b) = mb {
+                                mem.insert(dst.wrapping_add(off as u64), b);
+                            } else {
+                                mem.remove(&dst.wrapping_add(off as u64));
+                            }
+                        }
+                        if check_window(
+                            &mem,
+                            dst,
+                            len,
+                            rec.seq_low32,
+                            rec.pc,
+                            &mut hits,
+                            &mut last_hit_addr_seq,
+                        ) {
+                            break;
+                        }
+                    }
+                }
+                Some(ExtKind::HleMemset) => {
+                    let dst = rec.addr;
+                    let fill = rec.size_or_reg;
+                    let len = (rec.value as usize).min(1 << 20);
+                    if len > 0 {
+                        for off in 0..len {
+                            mem.insert(dst.wrapping_add(off as u64), fill);
+                        }
+                        if check_window(
+                            &mem,
+                            dst,
+                            len,
+                            rec.seq_low32,
+                            rec.pc,
+                            &mut hits,
+                            &mut last_hit_addr_seq,
+                        ) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
         }
         hits
+    }
+
+    /// Omniscient 按值查询写入事件（支持按宽度 1..=8 小端匹配直接写或拼字节写，带 `min_seq`/`max_seq`/`limit` 提前终止）
+    pub fn query_writes_by_value(
+        &self,
+        value: u64,
+        width: u8,
+        min_seq: Option<u32>,
+        max_seq: Option<u32>,
+        limit: usize,
+    ) -> Vec<TraceQueryHit> {
+        let w = width.clamp(1, 8) as usize;
+        let masked_val = if w == 8 {
+            value
+        } else {
+            value & ((1u64 << (w * 8)) - 1)
+        };
+        let pat = &masked_val.to_le_bytes()[..w];
+        let hits = self.search_mem_bytes_bounded(pat, min_seq, max_seq, limit);
+        hits.into_iter()
+            .map(|h| TraceQueryHit {
+                seq_low32: h.seq_low32,
+                pc: h.pc,
+                addr: h.addr,
+                size: w as u64,
+                kind: "write",
+                value: masked_val,
+                src: 0,
+            })
+            .collect()
+    }
+
+    /// Omniscient 地址历史查询：列出访问 `[addr, addr+len)` 的全部事件（支持 `at_seq` 截断上限与 `u64::MAX` 安全区间比较）
+    pub fn query_addr_history(
+        &self,
+        addr: u64,
+        len: u64,
+        at_seq: Option<u32>,
+        writes_only: bool,
+        limit: usize,
+    ) -> Vec<TraceQueryHit> {
+        let Some(mmap) = self.ext_mmap.as_ref() else {
+            return Vec::new();
+        };
+        let q_len = len.max(1);
+        let end_idx = at_seq
+            .map(|hi| self.ext_end_index_for_seq(hi))
+            .unwrap_or(self.ext_count);
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < end_idx {
+            let rec = read_packed::<ExtRecord>(mmap, i);
+            let seq = rec.seq_low32;
+            match ExtKind::from_u8(rec.kind) {
+                Some(ExtKind::MemWrite) => {
+                    let sz = (rec.size_or_reg as u64).max(1);
+                    if range_overlaps_u128(rec.addr, sz, addr, q_len) {
+                        out.push(TraceQueryHit {
+                            seq_low32: seq,
+                            pc: rec.pc,
+                            addr: rec.addr,
+                            size: sz,
+                            kind: "write",
+                            value: rec.value,
+                            src: 0,
+                        });
+                    }
+                }
+                Some(ExtKind::MemRead) if !writes_only => {
+                    let sz = (rec.size_or_reg as u64).max(1);
+                    if range_overlaps_u128(rec.addr, sz, addr, q_len) {
+                        out.push(TraceQueryHit {
+                            seq_low32: seq,
+                            pc: rec.pc,
+                            addr: rec.addr,
+                            size: sz,
+                            kind: "read",
+                            value: rec.value,
+                            src: 0,
+                        });
+                    }
+                }
+                Some(ExtKind::HleMemcpy) => {
+                    let dst = rec.addr;
+                    let src = rec.value;
+                    let mut hlen = 0u64;
+                    if i + 1 < end_idx {
+                        let next = read_packed::<ExtRecord>(mmap, i + 1);
+                        if is_matching_hle_meta(rec, next) {
+                            hlen = next.value;
+                            i += 1;
+                        }
+                    }
+                    let dst_hit = hlen > 0 && range_overlaps_u128(dst, hlen, addr, q_len);
+                    let src_hit =
+                        !writes_only && hlen > 0 && range_overlaps_u128(src, hlen, addr, q_len);
+                    if dst_hit || src_hit {
+                        let kind = match rec.size_or_reg {
+                            1 => "hle_memmove",
+                            2 => "hle_realloc_copy",
+                            _ => "hle_memcpy",
+                        };
+                        out.push(TraceQueryHit {
+                            seq_low32: seq,
+                            pc: rec.pc,
+                            addr: dst,
+                            size: hlen,
+                            kind,
+                            value: hlen,
+                            src,
+                        });
+                    }
+                }
+                Some(ExtKind::HleMemset) => {
+                    let dst = rec.addr;
+                    let hlen = rec.value;
+                    if hlen > 0 && range_overlaps_u128(dst, hlen, addr, q_len) {
+                        let kind = match rec._pad[0] {
+                            1 => "hle_bzero",
+                            2 => "hle_calloc_zero",
+                            _ => "hle_memset",
+                        };
+                        out.push(TraceQueryHit {
+                            seq_low32: seq,
+                            pc: rec.pc,
+                            addr: dst,
+                            size: hlen,
+                            kind,
+                            value: rec.size_or_reg as u64,
+                            src: 0,
+                        });
+                    }
+                }
+                _ => {}
+            }
+            if limit > 0 && out.len() >= limit {
+                break;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// 重建任意时刻 `at_seq` 时内存区间 `[addr, addr + len)` 的最近写入字节快照（逆向 O(len) 内存、无 1MiB 截断、全部槽位解出即早停）
+    pub fn reconstruct_mem_at(&self, addr: u64, len: usize, at_seq: u32) -> Vec<Option<u8>> {
+        let mut out = vec![None; len];
+        let Some(mmap) = self.ext_mmap.as_ref() else {
+            return out;
+        };
+        if len == 0 {
+            return out;
+        }
+        let end_idx = self.ext_end_index_for_seq(at_seq);
+        if end_idx == 0 {
+            return out;
+        }
+        // 每个目标字节槽位当前追寻的物理地址（None 表示已解出具体字节值或超出 u64 边界）
+        let mut cur_addr: Vec<Option<u64>> = (0..len)
+            .map(|off| addr.checked_add(off as u64))
+            .collect();
+        let mut remaining = cur_addr.iter().filter(|a| a.is_some()).count();
+
+        let mut i = end_idx;
+        while i > 0 && remaining > 0 {
+            i -= 1;
+            let rec = read_packed::<ExtRecord>(mmap, i);
+            match ExtKind::from_u8(rec.kind) {
+                Some(ExtKind::MemWrite) => {
+                    let sz = (rec.size_or_reg as usize).clamp(1, 8) as u64;
+                    let w_start = rec.addr as u128;
+                    let w_end = w_start + sz as u128;
+                    let bytes = rec.value.to_le_bytes();
+                    for (slot, slot_addr) in cur_addr.iter_mut().enumerate() {
+                        if let Some(a) = *slot_addr {
+                            let a128 = a as u128;
+                            if a128 >= w_start && a128 < w_end {
+                                let off = (a128 - w_start) as usize;
+                                out[slot] = Some(bytes[off]);
+                                *slot_addr = None;
+                                remaining -= 1;
+                            }
+                        }
+                    }
+                }
+                Some(ExtKind::HleMemset) => {
+                    let hlen = rec.value;
+                    if hlen > 0 {
+                        let d_start = rec.addr as u128;
+                        let d_end = d_start + hlen as u128;
+                        let fill = rec.size_or_reg;
+                        for (slot, slot_addr) in cur_addr.iter_mut().enumerate() {
+                            if let Some(a) = *slot_addr {
+                                let a128 = a as u128;
+                                if a128 >= d_start && a128 < d_end {
+                                    out[slot] = Some(fill);
+                                    *slot_addr = None;
+                                    remaining -= 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                Some(ExtKind::HleMeta) => {
+                    // 逆向扫描遇到 HleMeta 时与前一条 HleMemcpy 精确配对
+                    if i > 0 {
+                        let prev = read_packed::<ExtRecord>(mmap, i - 1);
+                        if prev.kind == ExtKind::HleMemcpy as u8
+                            && is_matching_hle_meta(prev, rec)
+                        {
+                            i -= 1;
+                            let hlen = rec.value;
+                            if hlen > 0 {
+                                let d_start = prev.addr as u128;
+                                let d_end = d_start + hlen as u128;
+                                let s_start = prev.value;
+                                for slot_addr in cur_addr.iter_mut() {
+                                    if let Some(a) = *slot_addr {
+                                        let a128 = a as u128;
+                                        if a128 >= d_start && a128 < d_end {
+                                            let off = (a128 - d_start) as u64;
+                                            *slot_addr = s_start.checked_add(off);
+                                            if slot_addr.is_none() {
+                                                remaining -= 1;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// 双跑 Trace 差分对比（`runidbg-cli diff a.idx b.idx`）：
+    /// 定位首次控制流分叉（PC/Opcode/长度）与同 PC 寄存器/内存写/HLE 事件差异
+    pub fn diff_traces(a: &TraceReader, b: &TraceReader, max_diffs: usize) -> TraceDiffSummary {
+        let min_len = a.len().min(b.len());
+        let cap = if max_diffs == 0 { 100 } else { max_diffs };
+        let mut diffs = Vec::new();
+        let mut common_prefix_insns = 0usize;
+        let mut prefix_broken = false;
+        let mut first_control_divergence_idx = None;
+        let mut first_data_divergence_idx = None;
+
+        for idx in 0..min_len {
+            let ra = read_packed::<TraceRecord>(&a.idx_mmap, idx);
+            let rb = read_packed::<TraceRecord>(&b.idx_mmap, idx);
+            let pc_a = ra.pc;
+            let pc_b = rb.pc;
+            let op_a = ra.opcode;
+            let op_b = rb.opcode;
+
+            if pc_a != pc_b || op_a != op_b {
+                first_control_divergence_idx = Some(idx);
+                if diffs.len() < cap {
+                    let detail = if pc_a != pc_b {
+                        format!("PC diverged: 0x{pc_a:016x} vs 0x{pc_b:016x}")
+                    } else {
+                        format!("opcode diverged @ 0x{pc_a:016x}: 0x{op_a:08x} vs 0x{op_b:08x}")
+                    };
+                    diffs.push(TraceDiffEntry {
+                        idx,
+                        kind: "control",
+                        pc_a,
+                        pc_b,
+                        detail,
+                    });
+                }
+                // 控制流一旦分叉，后续下标已失步，立即停止避免噪音洪泛
+                break;
+            }
+
+            let mut step_diverged = false;
+
+            // 1. 仅在双方均存在 idx + 1 记录时比对寄存器增量，避免不等长末尾误报
+            if idx + 1 < min_len {
+                let reg_a = a.reg_deltas_for(idx);
+                let reg_b = b.reg_deltas_for(idx);
+                if reg_a != reg_b {
+                    step_diverged = true;
+                    if first_data_divergence_idx.is_none() {
+                        first_data_divergence_idx = Some(idx);
+                    }
+                    if diffs.len() < cap {
+                        let fmt = |v: &[(u8, u64)]| -> String {
+                            v.iter()
+                                .map(|(r, val)| {
+                                    if *r == 31 {
+                                        format!("SP=0x{val:x}")
+                                    } else {
+                                        format!("X{r}=0x{val:x}")
+                                    }
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        };
+                        diffs.push(TraceDiffEntry {
+                            idx,
+                            kind: "reg",
+                            pc_a,
+                            pc_b,
+                            detail: format!("reg delta: [{}] vs [{}]", fmt(&reg_a), fmt(&reg_b)),
+                        });
+                    }
+                }
+            }
+
+            // 2. 比对同 PC 内存写入事件差异
+            let mw_a: Vec<(u64, u8, u64)> = a
+                .mem_events_for(idx)
+                .into_iter()
+                .filter(|e| e.kind == ExtKind::MemWrite as u8)
+                .map(|e| (e.addr, e.size_or_reg, e.value))
+                .collect();
+            let mw_b: Vec<(u64, u8, u64)> = b
+                .mem_events_for(idx)
+                .into_iter()
+                .filter(|e| e.kind == ExtKind::MemWrite as u8)
+                .map(|e| (e.addr, e.size_or_reg, e.value))
+                .collect();
+            if mw_a != mw_b {
+                step_diverged = true;
+                if first_data_divergence_idx.is_none() {
+                    first_data_divergence_idx = Some(idx);
+                }
+                if diffs.len() < cap {
+                    let fmt_mw = |v: &[(u64, u8, u64)]| -> String {
+                        v.iter()
+                            .map(|(ad, sz, val)| format!("0x{ad:x}({sz}B)=0x{val:x}"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    };
+                    diffs.push(TraceDiffEntry {
+                        idx,
+                        kind: "mem",
+                        pc_a,
+                        pc_b,
+                        detail: format!("mem write: [{}] vs [{}]", fmt_mw(&mw_a), fmt_mw(&mw_b)),
+                    });
+                }
+            }
+
+            // 3. 比对同 PC HLE 事件差异
+            let hle_a: Vec<(&'static str, u64, u64, u64)> = a
+                .hle_events_for(idx)
+                .into_iter()
+                .map(|e| (e.op, e.dst, e.src, e.len))
+                .collect();
+            let hle_b: Vec<(&'static str, u64, u64, u64)> = b
+                .hle_events_for(idx)
+                .into_iter()
+                .map(|e| (e.op, e.dst, e.src, e.len))
+                .collect();
+            if hle_a != hle_b {
+                step_diverged = true;
+                if first_data_divergence_idx.is_none() {
+                    first_data_divergence_idx = Some(idx);
+                }
+                if diffs.len() < cap {
+                    diffs.push(TraceDiffEntry {
+                        idx,
+                        kind: "hle",
+                        pc_a,
+                        pc_b,
+                        detail: format!("HLE events: {hle_a:?} vs {hle_b:?}"),
+                    });
+                }
+            }
+
+            if step_diverged {
+                prefix_broken = true;
+            } else if !prefix_broken {
+                common_prefix_insns += 1;
+            }
+        }
+
+        // 若前缀控制流未分叉但长度不同，补充一条 length 截断差异
+        if first_control_divergence_idx.is_none() && a.len() != b.len() {
+            let pc_a = a.get(min_len).map(|r| r.pc).unwrap_or(0);
+            let pc_b = b.get(min_len).map(|r| r.pc).unwrap_or(0);
+            if diffs.len() < cap {
+                diffs.push(TraceDiffEntry {
+                    idx: min_len,
+                    kind: "length",
+                    pc_a,
+                    pc_b,
+                    detail: format!(
+                        "trace length diverged: A={} insns vs B={} insns",
+                        a.len(),
+                        b.len()
+                    ),
+                });
+            }
+        }
+
+        TraceDiffSummary {
+            total_a: a.len(),
+            total_b: b.len(),
+            common_prefix_insns,
+            first_control_divergence_idx,
+            first_data_divergence_idx,
+            diffs,
+        }
     }
 
     /// 构建基于 `BL` / `BLR` / `RET` 的时间轴调用树（自动忽略未落入 Trace 过滤范围的外部调用）
@@ -691,6 +1432,24 @@ impl TraceReader {
         }
         offsets
     }
+}
+
+#[inline]
+fn is_matching_hle_meta(rec: ExtRecord, next: ExtRecord) -> bool {
+    let rec_seq = rec.seq_low32;
+    let next_seq = next.seq_low32;
+    let rec_addr = rec.addr;
+    let next_addr = next.addr;
+    next.kind == ExtKind::HleMeta as u8 && next_seq == rec_seq && next_addr == rec_addr
+}
+
+#[inline]
+fn range_overlaps_u128(a_start: u64, a_len: u64, b_start: u64, b_len: u64) -> bool {
+    let a0 = a_start as u128;
+    let a1 = a0 + a_len as u128;
+    let b0 = b_start as u128;
+    let b1 = b0 + b_len as u128;
+    a0 < b1 && b0 < a1
 }
 
 #[inline]

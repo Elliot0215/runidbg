@@ -19,6 +19,16 @@ pub enum ExtKind {
     MemWrite = 2,
     /// 单条指令触发多个寄存器变化时（如 `LDP`/`STP`），除主寄存器外的其余变化
     RegDeltaExtra = 3,
+    /// HLE 块拷贝事件（`memcpy`/`memmove`/`realloc` 拷贝）：`addr=dst`, `value=src`, `pc=caller_pc`, `size_or_reg=subop`；紧随一条 `HleMeta` 记录 `value=len`
+    HleMemcpy = 4,
+    /// HLE 块填充事件（`memset`/`bzero`/`calloc` 清零）：`addr=dst`, `value=len`, `pc=caller_pc`, `size_or_reg=fill_byte`, `_pad[0]=subop`
+    HleMemset = 5,
+    /// HLE 堆分配事件（`malloc`/`calloc`/`realloc`/`posix_memalign`）：`addr=ptr`, `value=size`, `pc=caller_pc`, `size_or_reg=subop`
+    HleMalloc = 6,
+    /// HLE 堆释放事件（`free`）：`addr=ptr`, `value=0`, `pc=caller_pc`
+    HleFree = 7,
+    /// 紧随 `HleMemcpy` 的配套长度记录：`addr=dst`, `value=len`, `pc=caller_pc`
+    HleMeta = 8,
 }
 
 impl ExtKind {
@@ -27,7 +37,65 @@ impl ExtKind {
             1 => Some(Self::MemRead),
             2 => Some(Self::MemWrite),
             3 => Some(Self::RegDeltaExtra),
+            4 => Some(Self::HleMemcpy),
+            5 => Some(Self::HleMemset),
+            6 => Some(Self::HleMalloc),
+            7 => Some(Self::HleFree),
+            8 => Some(Self::HleMeta),
             _ => None,
+        }
+    }
+}
+
+/// 内存态零分配 HLE 事件载荷（由 `TrampolineTable` 产生，供 `BinaryTracer` 写入 `.ext`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HleOpEvent {
+    pub kind: ExtKind,
+    /// 子操作码或填充字节（`HleMemset` 时存放填充字节，其余存 subop）
+    pub subop_or_byte: u8,
+    /// `HleMemset` 时存放子操作码（0=memset, 1=bzero, 2=calloc_zero）
+    pub aux_subop: u8,
+    pub dst: u64,
+    pub src: u64,
+    pub len: u64,
+    pub caller_pc: u64,
+}
+
+/// 解码后的结构化 HLE 扩展事件（供 `TraceReader`、CLI、JS、MCP 与离线污点引擎使用）
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HleTraceEvent {
+    pub seq_low32: u32,
+    pub op: &'static str,
+    pub dst: u64,
+    /// `memcpy`/`memmove`/`realloc_copy` 为源地址；`memset` 为填充字节；`malloc`/`free` 为 0
+    pub src: u64,
+    pub len: u64,
+    pub pc: u64,
+}
+
+impl HleTraceEvent {
+    pub fn format_line(&self) -> String {
+        match self.op {
+            "memcpy" | "memmove" | "realloc_copy" => format!(
+                "    [HLE {}] dst=0x{:016x} src=0x{:016x} len={} caller=0x{:016x}",
+                self.op, self.dst, self.src, self.len, self.pc
+            ),
+            "memset" | "bzero" | "calloc_zero" => format!(
+                "    [HLE {}] dst=0x{:016x} byte=0x{:02x} len={} caller=0x{:016x}",
+                self.op, self.dst, self.src & 0xFF, self.len, self.pc
+            ),
+            "malloc" | "calloc" | "realloc" | "posix_memalign" => format!(
+                "    [HLE {}] ptr=0x{:016x} size={} caller=0x{:016x}",
+                self.op, self.dst, self.len, self.pc
+            ),
+            "free" => format!(
+                "    [HLE free] ptr=0x{:016x} caller=0x{:016x}",
+                self.dst, self.pc
+            ),
+            other => format!(
+                "    [HLE {}] dst=0x{:016x} src=0x{:016x} len={} caller=0x{:016x}",
+                other, self.dst, self.src, self.len, self.pc
+            ),
         }
     }
 }
@@ -193,6 +261,37 @@ pub fn format_ext_record(ext: &ExtRecord) -> String {
             let name = format_reg_name(size_or_reg);
             let hint = format_ascii_hint(value, 8).unwrap_or_default();
             format!("    [REG] {name} <- 0x{value:016x}{hint}")
+        }
+        Some(ExtKind::HleMemcpy) => {
+            let op = match size_or_reg {
+                1 => "memmove",
+                2 => "realloc_copy",
+                _ => "memcpy",
+            };
+            format!("    [HLE {op}] dst=0x{addr:016x} src=0x{value:016x}")
+        }
+        Some(ExtKind::HleMemset) => {
+            let op = match ext._pad[0] {
+                1 => "bzero",
+                2 => "calloc_zero",
+                _ => "memset",
+            };
+            format!("    [HLE {op}] dst=0x{addr:016x} byte=0x{size_or_reg:02x} len={value}")
+        }
+        Some(ExtKind::HleMalloc) => {
+            let op = match size_or_reg {
+                1 => "calloc",
+                2 => "realloc",
+                3 => "posix_memalign",
+                _ => "malloc",
+            };
+            format!("    [HLE {op}] ptr=0x{addr:016x} size={value}")
+        }
+        Some(ExtKind::HleFree) => {
+            format!("    [HLE free] ptr=0x{addr:016x}")
+        }
+        Some(ExtKind::HleMeta) => {
+            format!("    [HLE len] dst=0x{addr:016x} len={value}")
         }
         None => format!("    [EXT?] kind={} val=0x{value:016x}", ext.kind),
     }

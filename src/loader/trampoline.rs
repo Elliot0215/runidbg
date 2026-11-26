@@ -102,6 +102,7 @@ pub enum HleBuiltin {
     Arc4Random,
     Arc4RandomBuf,
     Rand,
+    Srand,
     Getpid,
     Gettid,
     Getuid,
@@ -320,6 +321,7 @@ impl HleBuiltin {
             "arc4random" => Some(Self::Arc4Random),
             "arc4random_buf" => Some(Self::Arc4RandomBuf),
             "rand" | "random" => Some(Self::Rand),
+            "srand" | "srandom" => Some(Self::Srand),
             "getpid" => Some(Self::Getpid),
             "gettid" => Some(Self::Gettid),
             "getuid" | "geteuid" | "getgid" | "getegid" => Some(Self::Getuid),
@@ -501,7 +503,6 @@ impl HleBuiltin {
             | "fsync"
             | "fdatasync"
             | "getenv"
-            | "srand"
             | "alarm"
             | "prctl"
             | "eglGetProcAddress"
@@ -625,6 +626,11 @@ pub struct TrampolineTable {
     unimplemented_hits: HashMap<String, u64>,
     pub errno_addr: u64,
     initialized: bool,
+    /// 最近一次 HLE 跳板产生的内存/分配追踪事件（最多 3 条，如 `realloc` = `malloc` + `memcpy` + `free`），供 `BinaryTracer` 零分配消费
+    pending_hle_events: [Option<crate::tracer::HleOpEvent>; 3],
+    pending_hle_len: usize,
+    /// 是否已输出过 `rand()/srand()` 确定性桩告警（每个实例仅提示一次，避免刷屏）
+    rand_stub_warned: bool,
 }
 
 impl Default for TrampolineTable {
@@ -675,7 +681,27 @@ impl TrampolineTable {
             unimplemented_hits: HashMap::new(),
             errno_addr: crate::cpu::TLS_BASE + 0x100,
             initialized: false,
+            pending_hle_events: [None, None, None],
+            pending_hle_len: 0,
+            rand_stub_warned: false,
         }
+    }
+
+    #[inline]
+    pub(crate) fn push_hle_event(&mut self, ev: crate::tracer::HleOpEvent) {
+        if self.pending_hle_len < self.pending_hle_events.len() {
+            self.pending_hle_events[self.pending_hle_len] = Some(ev);
+            self.pending_hle_len += 1;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn drain_hle_events(&mut self) -> ([Option<crate::tracer::HleOpEvent>; 3], usize) {
+        let out = self.pending_hle_events;
+        let len = self.pending_hle_len;
+        self.pending_hle_events = [None, None, None];
+        self.pending_hle_len = 0;
+        (out, len)
     }
 
     /// 同步已加载 ELF 模块元数据（供 `dlopen`/`dlsym`/`dladdr`/`dl_iterate_phdr` 查询）
@@ -1585,6 +1611,17 @@ where
     let x3 = uc.reg_read(RegisterARM64::X3).unwrap_or(0);
     let x4 = uc.reg_read(RegisterARM64::X4).unwrap_or(0);
     let x5 = uc.reg_read(RegisterARM64::X5).unwrap_or(0);
+    let lr = uc.reg_read(RegisterARM64::LR).unwrap_or(0);
+    let caller_pc = if lr == crate::cpu::RET_MAGIC_ADDR || lr < 4 {
+        0
+    } else {
+        lr - 4
+    };
+    // 防御性清空上次可能未消费的 HLE 事件（避免独立调用 dispatch_trampoline_slot 时累积）
+    {
+        let (tramp, _, _) = get_state(uc.get_data_mut());
+        let _ = tramp.drain_hle_events();
+    }
 
     let ret: u64 = match builtin {
         HleBuiltin::Malloc => {
@@ -1596,7 +1633,19 @@ where
             if raw != 0 {
                 let _ = uc.mem_write(raw, &0x4845_4150_424C_4B31u64.to_le_bytes());
                 let _ = uc.mem_write(raw + 8, &alloc_sz.to_le_bytes());
-                raw + 16
+                let ptr = raw + 16;
+                let (tramp, mem, _) = get_state(uc.get_data_mut());
+                mem.record_heap_alloc(ptr, alloc_sz, caller_pc, "malloc");
+                tramp.push_hle_event(crate::tracer::HleOpEvent {
+                    kind: crate::tracer::ExtKind::HleMalloc,
+                    subop_or_byte: 0,
+                    aux_subop: 0,
+                    dst: ptr,
+                    src: 0,
+                    len: alloc_sz,
+                    caller_pc,
+                });
+                ptr
             } else {
                 0
             }
@@ -1612,39 +1661,116 @@ where
                 let _ = uc.mem_write(raw + 8, &total.to_le_bytes());
                 let zeros = vec![0u8; total as usize];
                 let _ = uc.mem_write(raw + 16, &zeros);
-                raw + 16
+                let ptr = raw + 16;
+                let (tramp, mem, _) = get_state(uc.get_data_mut());
+                mem.record_heap_alloc(ptr, total, caller_pc, "calloc");
+                tramp.push_hle_event(crate::tracer::HleOpEvent {
+                    kind: crate::tracer::ExtKind::HleMalloc,
+                    subop_or_byte: 1,
+                    aux_subop: 0,
+                    dst: ptr,
+                    src: 0,
+                    len: total,
+                    caller_pc,
+                });
+                tramp.push_hle_event(crate::tracer::HleOpEvent {
+                    kind: crate::tracer::ExtKind::HleMemset,
+                    subop_or_byte: 0,
+                    aux_subop: 2,
+                    dst: ptr,
+                    src: 0,
+                    len: total,
+                    caller_pc,
+                });
+                ptr
             } else {
                 0
             }
         }
         HleBuiltin::Realloc => {
             let old_ptr = x0;
-            let new_size = x1.max(1);
-            let raw = {
-                let (_, mem, _) = get_state(uc.get_data_mut());
-                mem.alloc_heap(16 + new_size).unwrap_or(0)
-            };
-            if raw != 0 {
-                let _ = uc.mem_write(raw, &0x4845_4150_424C_4B31u64.to_le_bytes());
-                let _ = uc.mem_write(raw + 8, &new_size.to_le_bytes());
-                let new_ptr = raw + 16;
-                if old_ptr >= 16 {
-                    let mut hdr = [0u8; 16];
-                    if uc.mem_read(old_ptr - 16, &mut hdr).is_ok() {
-                        let magic = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
-                        let old_sz = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
-                        if magic == 0x4845_4150_424C_4B31 {
-                            let copy_len = old_sz.min(new_size) as usize;
-                            let mut data = vec![0u8; copy_len];
-                            if uc.mem_read(old_ptr, &mut data).is_ok() {
-                                let _ = uc.mem_write(new_ptr, &data);
+            if x1 == 0 {
+                if old_ptr != 0 {
+                    let (tramp, mem, _) = get_state(uc.get_data_mut());
+                    mem.hle_free(old_ptr);
+                    mem.record_heap_free(old_ptr, caller_pc);
+                    tramp.push_hle_event(crate::tracer::HleOpEvent {
+                        kind: crate::tracer::ExtKind::HleFree,
+                        subop_or_byte: 0,
+                        aux_subop: 0,
+                        dst: old_ptr,
+                        src: 0,
+                        len: 0,
+                        caller_pc,
+                    });
+                }
+                0
+            } else {
+                let new_size = x1;
+                let raw = {
+                    let (_, mem, _) = get_state(uc.get_data_mut());
+                    mem.alloc_heap(16 + new_size).unwrap_or(0)
+                };
+                if raw != 0 {
+                    let _ = uc.mem_write(raw, &0x4845_4150_424C_4B31u64.to_le_bytes());
+                    let _ = uc.mem_write(raw + 8, &new_size.to_le_bytes());
+                    let new_ptr = raw + 16;
+                    let mut copied_len = 0u64;
+                    if old_ptr >= 16 {
+                        let mut hdr = [0u8; 16];
+                        if uc.mem_read(old_ptr - 16, &mut hdr).is_ok() {
+                            let magic = u64::from_le_bytes(hdr[0..8].try_into().unwrap());
+                            let old_sz = u64::from_le_bytes(hdr[8..16].try_into().unwrap());
+                            if magic == 0x4845_4150_424C_4B31 {
+                                let copy_len = old_sz.min(new_size) as usize;
+                                let mut data = vec![0u8; copy_len];
+                                if uc.mem_read(old_ptr, &mut data).is_ok()
+                                    && uc.mem_write(new_ptr, &data).is_ok()
+                                {
+                                    copied_len = copy_len as u64;
+                                }
                             }
                         }
                     }
+                    let (tramp, mem, _) = get_state(uc.get_data_mut());
+                    mem.record_heap_alloc(new_ptr, new_size, caller_pc, "realloc");
+                    tramp.push_hle_event(crate::tracer::HleOpEvent {
+                        kind: crate::tracer::ExtKind::HleMalloc,
+                        subop_or_byte: 2,
+                        aux_subop: 0,
+                        dst: new_ptr,
+                        src: old_ptr,
+                        len: new_size,
+                        caller_pc,
+                    });
+                    if copied_len > 0 {
+                        tramp.push_hle_event(crate::tracer::HleOpEvent {
+                            kind: crate::tracer::ExtKind::HleMemcpy,
+                            subop_or_byte: 2,
+                            aux_subop: 0,
+                            dst: new_ptr,
+                            src: old_ptr,
+                            len: copied_len,
+                            caller_pc,
+                        });
+                    }
+                    if old_ptr != 0 {
+                        mem.hle_free(old_ptr);
+                        mem.record_heap_free(old_ptr, caller_pc);
+                        tramp.push_hle_event(crate::tracer::HleOpEvent {
+                            kind: crate::tracer::ExtKind::HleFree,
+                            subop_or_byte: 0,
+                            aux_subop: 0,
+                            dst: old_ptr,
+                            src: 0,
+                            len: 0,
+                            caller_pc,
+                        });
+                    }
+                    new_ptr
+                } else {
+                    0
                 }
-                new_ptr
-            } else {
-                0
             }
         }
         HleBuiltin::PosixMemalign => {
@@ -1660,6 +1786,17 @@ where
                 let _ = uc.mem_write(aligned - 16, &0x4845_4150_424C_4B31u64.to_le_bytes());
                 let _ = uc.mem_write(aligned - 8, &alloc_sz.to_le_bytes());
                 let _ = uc.mem_write(x0, &aligned.to_le_bytes());
+                let (tramp, mem, _) = get_state(uc.get_data_mut());
+                mem.record_heap_alloc(aligned, alloc_sz, caller_pc, "posix_memalign");
+                tramp.push_hle_event(crate::tracer::HleOpEvent {
+                    kind: crate::tracer::ExtKind::HleMalloc,
+                    subop_or_byte: 3,
+                    aux_subop: 0,
+                    dst: aligned,
+                    src: 0,
+                    len: alloc_sz,
+                    caller_pc,
+                });
                 0
             } else {
                 12 // ENOMEM
@@ -1667,8 +1804,18 @@ where
         }
         HleBuiltin::Free => {
             if x0 != 0 {
-                let (_, mem, _) = get_state(uc.get_data_mut());
+                let (tramp, mem, _) = get_state(uc.get_data_mut());
                 mem.hle_free(x0);
+                mem.record_heap_free(x0, caller_pc);
+                tramp.push_hle_event(crate::tracer::HleOpEvent {
+                    kind: crate::tracer::ExtKind::HleFree,
+                    subop_or_byte: 0,
+                    aux_subop: 0,
+                    dst: x0,
+                    src: 0,
+                    len: 0,
+                    caller_pc,
+                });
             }
             0
         }
@@ -1677,8 +1824,22 @@ where
             let len = x2 as usize;
             if len > 0 {
                 let mut buf = vec![0u8; len];
-                if uc.mem_read(x1, &mut buf).is_ok() {
-                    let _ = uc.mem_write(x0, &buf);
+                if uc.mem_read(x1, &mut buf).is_ok() && uc.mem_write(x0, &buf).is_ok() {
+                    let subop = if matches!(builtin, HleBuiltin::Memmove) {
+                        1
+                    } else {
+                        0
+                    };
+                    let (tramp, _, _) = get_state(uc.get_data_mut());
+                    tramp.push_hle_event(crate::tracer::HleOpEvent {
+                        kind: crate::tracer::ExtKind::HleMemcpy,
+                        subop_or_byte: subop,
+                        aux_subop: 0,
+                        dst: x0,
+                        src: x1,
+                        len: x2,
+                        caller_pc,
+                    });
                 }
             }
             x0
@@ -1686,8 +1847,20 @@ where
         HleBuiltin::Memset => {
             let len = x2 as usize;
             if len > 0 {
-                let buf = vec![(x1 & 0xFF) as u8; len];
-                let _ = uc.mem_write(x0, &buf);
+                let byte = (x1 & 0xFF) as u8;
+                let buf = vec![byte; len];
+                if uc.mem_write(x0, &buf).is_ok() {
+                    let (tramp, _, _) = get_state(uc.get_data_mut());
+                    tramp.push_hle_event(crate::tracer::HleOpEvent {
+                        kind: crate::tracer::ExtKind::HleMemset,
+                        subop_or_byte: byte,
+                        aux_subop: 0,
+                        dst: x0,
+                        src: byte as u64,
+                        len: x2,
+                        caller_pc,
+                    });
+                }
             }
             x0
         }
@@ -1695,7 +1868,18 @@ where
             let len = x1 as usize;
             if len > 0 {
                 let buf = vec![0u8; len];
-                let _ = uc.mem_write(x0, &buf);
+                if uc.mem_write(x0, &buf).is_ok() {
+                    let (tramp, _, _) = get_state(uc.get_data_mut());
+                    tramp.push_hle_event(crate::tracer::HleOpEvent {
+                        kind: crate::tracer::ExtKind::HleMemset,
+                        subop_or_byte: 0,
+                        aux_subop: 1,
+                        dst: x0,
+                        src: 0,
+                        len: x1,
+                        caller_pc,
+                    });
+                }
             }
             0
         }
@@ -1851,15 +2035,28 @@ where
         HleBuiltin::Strdup => {
             let mut bytes = read_guest_cstr_bytes(uc, x0, 1024 * 1024);
             bytes.push(0);
+            let alloc_sz = bytes.len() as u64;
             let raw = {
                 let (_, mem, _) = get_state(uc.get_data_mut());
-                mem.alloc_heap(16 + bytes.len() as u64).unwrap_or(0)
+                mem.alloc_heap(16 + alloc_sz).unwrap_or(0)
             };
             if raw != 0 {
                 let _ = uc.mem_write(raw, &0x4845_4150_424C_4B31u64.to_le_bytes());
-                let _ = uc.mem_write(raw + 8, &(bytes.len() as u64).to_le_bytes());
+                let _ = uc.mem_write(raw + 8, &alloc_sz.to_le_bytes());
                 let _ = uc.mem_write(raw + 16, &bytes);
-                raw + 16
+                let ptr = raw + 16;
+                let (tramp, mem, _) = get_state(uc.get_data_mut());
+                mem.record_heap_alloc(ptr, alloc_sz, caller_pc, "strdup");
+                tramp.push_hle_event(crate::tracer::HleOpEvent {
+                    kind: crate::tracer::ExtKind::HleMalloc,
+                    subop_or_byte: 0,
+                    aux_subop: 0,
+                    dst: ptr,
+                    src: 0,
+                    len: alloc_sz,
+                    caller_pc,
+                });
+                ptr
             } else {
                 0
             }
@@ -1924,15 +2121,27 @@ where
             let formatted = format_guest_printf(uc, &fmt, 2);
             let mut out = formatted.as_bytes().to_vec();
             out.push(0);
+            let alloc_sz = out.len() as u64;
             let ptr = {
                 let (_, mem, _) = get_state(uc.get_data_mut());
-                mem.alloc_heap(out.len() as u64).unwrap_or(0)
+                mem.alloc_heap(alloc_sz).unwrap_or(0)
             };
             if ptr != 0 {
                 let _ = uc.mem_write(ptr, &out);
                 if x0 != 0 {
                     let _ = uc.mem_write(x0, &ptr.to_le_bytes());
                 }
+                let (tramp, mem, _) = get_state(uc.get_data_mut());
+                mem.record_heap_alloc(ptr, alloc_sz, caller_pc, "asprintf");
+                tramp.push_hle_event(crate::tracer::HleOpEvent {
+                    kind: crate::tracer::ExtKind::HleMalloc,
+                    subop_or_byte: 0,
+                    aux_subop: 0,
+                    dst: ptr,
+                    src: 0,
+                    len: alloc_sz,
+                    caller_pc,
+                });
                 formatted.len() as u64
             } else {
                 (-1i64) as u64
@@ -1944,15 +2153,27 @@ where
             let formatted = format_guest_vprintf(uc, &fmt, x2);
             let mut out = formatted.as_bytes().to_vec();
             out.push(0);
+            let alloc_sz = out.len() as u64;
             let ptr = {
                 let (_, mem, _) = get_state(uc.get_data_mut());
-                mem.alloc_heap(out.len() as u64).unwrap_or(0)
+                mem.alloc_heap(alloc_sz).unwrap_or(0)
             };
             if ptr != 0 {
                 let _ = uc.mem_write(ptr, &out);
                 if x0 != 0 {
                     let _ = uc.mem_write(x0, &ptr.to_le_bytes());
                 }
+                let (tramp, mem, _) = get_state(uc.get_data_mut());
+                mem.record_heap_alloc(ptr, alloc_sz, caller_pc, "vasprintf");
+                tramp.push_hle_event(crate::tracer::HleOpEvent {
+                    kind: crate::tracer::ExtKind::HleMalloc,
+                    subop_or_byte: 0,
+                    aux_subop: 0,
+                    dst: ptr,
+                    src: 0,
+                    len: alloc_sz,
+                    caller_pc,
+                });
                 formatted.len() as u64
             } else {
                 (-1i64) as u64
@@ -2370,10 +2591,29 @@ where
             u32::from_le_bytes(b) as u64
         }
         HleBuiltin::Rand => {
-            let (_, _, vfs) = get_state(uc.get_data_mut());
+            let (tramp, _, vfs) = get_state(uc.get_data_mut());
+            if !tramp.rand_stub_warned {
+                tramp.rand_stub_warned = true;
+                tracing::warn!(
+                    target: "runidbg::hle",
+                    "rand()/random() 当前使用确定性 PRNG 桩实现（xorshift64*，非真 glibc TYPE_3 状态机）；如需特定序列请用 emu.hook.importReplace(\"rand\", ...) 替换"
+                );
+            }
             let mut b = [0u8; 4];
             vfs.fill_random(&mut b);
             (u32::from_le_bytes(b) & 0x7FFF_FFFF) as u64
+        }
+        HleBuiltin::Srand => {
+            let (tramp, _, vfs) = get_state(uc.get_data_mut());
+            if !tramp.rand_stub_warned {
+                tramp.rand_stub_warned = true;
+                tracing::warn!(
+                    target: "runidbg::hle",
+                    "srand()/srandom() 当前作用于确定性 PRNG 桩实现（xorshift64*，非真 glibc TYPE_3 状态机）；如需特定序列请用 emu.hook.importReplace(\"rand\", ...) 替换"
+                );
+            }
+            vfs.seed_random(x0);
+            0
         }
         HleBuiltin::Arc4RandomBuf => {
             let len = (x1 as usize).min(1024 * 1024);
@@ -2536,12 +2776,26 @@ where
             // void *memalign(size_t alignment, size_t size)
             let align = x0.max(16);
             let size = x1.max(1);
-            let (_, mem, _) = get_state(uc.get_data_mut());
-            let raw = mem.alloc_heap(size + align).unwrap_or(0);
+            let raw = {
+                let (_, mem, _) = get_state(uc.get_data_mut());
+                mem.alloc_heap(size + align).unwrap_or(0)
+            };
             if raw == 0 {
                 0
             } else {
-                align_up(raw, align)
+                let aligned = align_up(raw, align);
+                let (tramp, mem, _) = get_state(uc.get_data_mut());
+                mem.record_heap_alloc(aligned, size, caller_pc, "memalign");
+                tramp.push_hle_event(crate::tracer::HleOpEvent {
+                    kind: crate::tracer::ExtKind::HleMalloc,
+                    subop_or_byte: 3,
+                    aux_subop: 0,
+                    dst: aligned,
+                    src: 0,
+                    len: size,
+                    caller_pc,
+                });
+                aligned
             }
         }
         HleBuiltin::Printf => {

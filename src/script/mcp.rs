@@ -412,8 +412,8 @@ impl McpServer {
                                     lines.push(format!("    [REG] {name} <- 0x{reg_val:016x}{hint}"));
                                 }
                                 if ext_path.is_some() {
-                                    for ext in reader.mem_events_for(idx) {
-                                        lines.push(BinaryTracer::format_ext_record(&ext));
+                                    for line in reader.mem_and_hle_lines_for(idx) {
+                                        lines.push(line);
                                     }
                                 }
                             }
@@ -990,13 +990,195 @@ impl McpServer {
                 );
                 self.eval_js_value(&code)
             }
+            "trace_taint" => {
+                let idx_path = PathBuf::from(req_str(args, "idxPath")?);
+                let ext_path = resolve_ext_path(
+                    &idx_path,
+                    args.get("extPath").and_then(Value::as_str),
+                );
+                let mode = args
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("backward")
+                    .to_ascii_lowercase();
+                let reg_opt = args.get("reg").filter(|v| !v.is_null());
+                let addr_opt = args.get("addr").filter(|v| !v.is_null());
+                if reg_opt.is_some() && addr_opt.is_some() {
+                    return Err(anyhow!("trace_taint 的 reg 与 addr 参数互斥，请只提供其中一个"));
+                }
+                let seed = if let Some(rv) = reg_opt {
+                    let reg_name = rv
+                        .as_str()
+                        .ok_or_else(|| anyhow!("trace_taint 参数 reg 必须为字符串"))?;
+                    let slot = crate::tracer::parse_reg_slot(reg_name)
+                        .ok_or_else(|| anyhow!("无效的寄存器名: {reg_name}"))?;
+                    crate::tracer::TaintSeed::Reg { reg_id: slot }
+                } else if let Some(av) = addr_opt {
+                    let addr = parse_addr_val(Some(av))?;
+                    let len = opt_u64_strict(args, "len")?
+                        .unwrap_or(8)
+                        .clamp(1, 4096) as usize;
+                    crate::tracer::TaintSeed::Mem { addr, len }
+                } else {
+                    return Err(anyhow!("trace_taint 需要提供 addr 或 reg 参数"));
+                };
+                let anchor_idx = match opt_u64_strict(args, "atIdx")? {
+                    Some(v) => Some(v as usize),
+                    None => opt_u64_strict(args, "startIdx")?.map(|v| v as usize),
+                };
+                let max_insns = opt_u64_strict(args, "maxInsns")?.unwrap_or(0) as usize;
+                let max_steps = opt_u64_strict(args, "maxSteps")?
+                    .unwrap_or(200)
+                    .clamp(1, 2000) as usize;
+                let track_mem_index = args
+                    .get("trackMemIndex")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let track_sp = args
+                    .get("trackSp")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let opts = crate::tracer::TaintOptions {
+                    anchor_idx,
+                    max_insns,
+                    max_steps,
+                    track_mem_index,
+                    track_sp,
+                };
+                let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+                let report = match mode.as_str() {
+                    "forward" | "fwd" => reader.taint_forward(&seed, &opts),
+                    "backward" | "bwd" | "slice" => reader.taint_backward(&seed, &opts),
+                    other => {
+                        return Err(anyhow!(
+                            "无效的 trace_taint mode `{other}`（支持 forward / backward）"
+                        ));
+                    }
+                };
+                Ok(json!({
+                    "mode": report.mode,
+                    "seed": report.seed_desc,
+                    "anchorIdx": report.anchor_idx,
+                    "scannedInsns": report.scanned_insns,
+                    "totalMatchingSteps": report.total_matching_steps,
+                    "steps": report.steps.iter().map(|s| json!({
+                        "idx": s.idx,
+                        "seq": s.seq,
+                        "pc": s.pc,
+                        "pcHex": format!("0x{:016x}", s.pc),
+                        "asm": s.asm,
+                        "kind": s.kind,
+                        "sources": s.sources,
+                        "dests": s.dests,
+                        "tagMaskHex": format!("0x{:x}", s.tag_mask),
+                        "valueHex": s.value.map(|v| format!("0x{v:x}")),
+                    })).collect::<Vec<_>>(),
+                    "taintedRegs": report.tainted_regs.iter().map(|(n, m)| json!({
+                        "name": n,
+                        "tagMaskHex": format!("0x{m:x}"),
+                    })).collect::<Vec<_>>(),
+                    "taintedMemRanges": report.tainted_mem_ranges.iter().map(|&(a, l, m)| json!({
+                        "addr": a,
+                        "addrHex": format!("0x{a:016x}"),
+                        "len": l,
+                        "tagMaskHex": format!("0x{m:x}"),
+                    })).collect::<Vec<_>>(),
+                }))
+            }
+            "trace_query" => {
+                let idx_path = PathBuf::from(req_str(args, "idxPath")?);
+                let ext_path = resolve_ext_path(
+                    &idx_path,
+                    args.get("extPath").and_then(Value::as_str),
+                );
+                let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+                let limit = opt_u64_strict(args, "limit")?
+                    .unwrap_or(100)
+                    .clamp(1, 1000) as usize;
+                let at_seq = opt_u64_strict(args, "at")?.map(|v| v.min(u32::MAX as u64) as u32);
+                let val_opt = args.get("value").filter(|v| !v.is_null());
+                let addr_opt = args.get("addr").filter(|v| !v.is_null());
+                if val_opt.is_some() && addr_opt.is_some() {
+                    return Err(anyhow!("trace_query 的 value 与 addr 参数互斥，请只提供其中一个"));
+                }
+                let hits = if let Some(val_v) = val_opt {
+                    let target = parse_addr_val(Some(val_v))?;
+                    let width_raw = match opt_u64_strict(args, "width")? {
+                        Some(w) => Some(w),
+                        None => opt_u64_strict(args, "align")?,
+                    };
+                    let width = width_raw
+                        .map(|w| w.clamp(1, 8) as u8)
+                        .unwrap_or_else(|| if target > u32::MAX as u64 { 8 } else { 4 });
+                    reader.query_writes_by_value(target, width, None, at_seq, limit)
+                } else if let Some(addr_v) = addr_opt {
+                    let addr = parse_addr_val(Some(addr_v))?;
+                    let len = opt_u64_strict(args, "len")?.unwrap_or(1).max(1);
+                    let writes_only = args
+                        .get("writesOnly")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    reader.query_addr_history(addr, len, at_seq, writes_only, limit)
+                } else {
+                    return Err(anyhow!("trace_query 需要提供 value 或 addr 参数"));
+                };
+                Ok(json!({
+                    "count": hits.len(),
+                    "hits": hits.iter().map(|h| json!({
+                        "seq": h.seq_low32,
+                        "pc": h.pc,
+                        "pcHex": format!("0x{:016x}", h.pc),
+                        "addr": h.addr,
+                        "addrHex": format!("0x{:016x}", h.addr),
+                        "size": h.size,
+                        "kind": h.kind,
+                        "value": h.value,
+                        "valueHex": format!("0x{:x}", h.value),
+                        "srcHex": (h.src != 0).then(|| format!("0x{:016x}", h.src)),
+                    })).collect::<Vec<_>>(),
+                }))
+            }
+            "trace_diff" => {
+                let idx_a = PathBuf::from(req_str(args, "idxPathA")?);
+                let idx_b = PathBuf::from(req_str(args, "idxPathB")?);
+                let ext_a = resolve_ext_path(
+                    &idx_a,
+                    args.get("extPathA").and_then(Value::as_str),
+                );
+                let ext_b = resolve_ext_path(
+                    &idx_b,
+                    args.get("extPathB").and_then(Value::as_str),
+                );
+                let limit = opt_u64_strict(args, "limit")?
+                    .unwrap_or(64)
+                    .clamp(1, 500) as usize;
+                let ra = TraceReader::open(&idx_a, ext_a.as_deref())?;
+                let rb = TraceReader::open(&idx_b, ext_b.as_deref())?;
+                let summary = TraceReader::diff_traces(&ra, &rb, limit);
+                Ok(json!({
+                    "totalA": summary.total_a,
+                    "totalB": summary.total_b,
+                    "commonPrefixInsns": summary.common_prefix_insns,
+                    "firstControlDivergenceIdx": summary.first_control_divergence_idx,
+                    "firstDataDivergenceIdx": summary.first_data_divergence_idx,
+                    "diffs": summary.diffs.iter().map(|d| json!({
+                        "idx": d.idx,
+                        "kind": d.kind,
+                        "pcA": d.pc_a,
+                        "pcAHex": format!("0x{:016x}", d.pc_a),
+                        "pcB": d.pc_b,
+                        "pcBHex": format!("0x{:016x}", d.pc_b),
+                        "detail": d.detail,
+                    })).collect::<Vec<_>>(),
+                }))
+            }
             _ => Err(anyhow!("未知的 MCP 工具: {name}")),
         }
     }
 }
 
 fn resolve_ext_path(idx_path: &Path, explicit: Option<&str>) -> Option<PathBuf> {
-    if let Some(p) = explicit {
+    if let Some(p) = explicit.map(str::trim).filter(|s| !s.is_empty()) {
         return Some(PathBuf::from(p));
     }
     let sibling = idx_path.with_extension("ext");
@@ -1004,6 +1186,16 @@ fn resolve_ext_path(idx_path: &Path, explicit: Option<&str>) -> Option<PathBuf> 
         Some(sibling)
     } else {
         None
+    }
+}
+
+fn opt_u64_strict(args: &Value, key: &str) -> Result<Option<u64>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| anyhow!("参数 `{key}` 必须为非负整数")),
     }
 }
 
@@ -1050,7 +1242,7 @@ fn parse_addr_val(v: Option<&Value>) -> Result<u64> {
 }
 
 fn tool_definitions() -> Value {
-    json!([
+    let mut tools = json!([
         {
             "name": "emu_create",
             "description": "Create a new Android ARM64 emulator instance in the persistent runidbg session.",
@@ -1060,7 +1252,8 @@ fn tool_definitions() -> Value {
                     "backend": { "type": "string", "description": "CPU backend: unicorn (default; required for trace/GDB/native hooks), dynarmic, kvm (Linux), hypervisor/hyper (macOS). Non-Unicorn backends are emulation-only." },
                     "packageName": { "type": "string", "description": "Android package name (default: com.example.app)" },
                     "searchPaths": { "type": "array", "items": { "type": "string" }, "description": "Sysroot / .so search directories" },
-                    "hleAccel": { "type": "boolean", "description": "Enable Rust HLE libc acceleration (default: true)" }
+                    "hleAccel": { "type": "boolean", "description": "Enable Rust HLE libc acceleration (default: true)" },
+                    "freezeLayout": { "type": "boolean", "description": "Isolate host emu.mem.alloc() into [host-scratch] so guest malloc heap addresses stay deterministic across runs" }
                 }
             }
         },
@@ -1404,7 +1597,9 @@ fn tool_definitions() -> Value {
                     "path": { "type": "string" }
                 }
             }
-        },
+        }
+    ]);
+    let extra = json!([
         {
             "name": "tt_record_start",
             "description": "Start Phase 2 deterministic Time-Travel recording on a Unicorn emulator (captures periodic delta keyframes, real-clock reads, host sysroot files, and external JNI callbacks).",
@@ -1494,8 +1689,67 @@ fn tool_definitions() -> Value {
                     "ttId": { "type": "integer" }
                 }
             }
+        },
+        {
+            "name": "trace_taint",
+            "description": "Offline byte-granular ARM64 taint tracking (forward) or causal backward slicing (backward) on trace.idx + trace.ext, crossing HLE memcpy/memmove/memset and immune to stack-frame / VM regfile address reuse.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["idxPath"],
+                "properties": {
+                    "idxPath": { "type": "string", "description": "Path to trace.idx file" },
+                    "extPath": { "type": "string", "description": "Optional trace.ext path (auto-detected if sibling exists)" },
+                    "mode": { "type": "string", "enum": ["forward", "backward"], "description": "Analysis direction (default backward)" },
+                    "addr": { "description": "Seed/target memory address (integer or '0x...' hex string)" },
+                    "len": { "type": "integer", "minimum": 1, "maximum": 4096, "description": "Memory byte length (default 8)" },
+                    "reg": { "type": "string", "description": "Seed/target register name (e.g. 'x0', 'w8', 'v0', 'q1')" },
+                    "atIdx": { "type": "integer", "minimum": 0, "description": "Anchor instruction index (start for forward, observation point for backward)" },
+                    "maxInsns": { "type": "integer", "minimum": 0, "description": "Optional max instructions to scan (0 = all)" },
+                    "maxSteps": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Max propagation steps returned (default 200)" },
+                    "trackMemIndex": { "type": "boolean", "description": "Track indexed load register dependencies such as S-Box lookups (default true)" },
+                    "trackSp": { "type": "boolean", "description": "Track stack pointer SP arithmetic (default false)" }
+                }
+            }
+        },
+        {
+            "name": "trace_query",
+            "description": "Offline omniscient memory/value query over trace.idx + trace.ext (including HLE memcpy/memset/malloc/free events). Query either by written value+width or by address history.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["idxPath"],
+                "properties": {
+                    "idxPath": { "type": "string" },
+                    "extPath": { "type": "string" },
+                    "value": { "description": "Find all writes producing this value (integer or '0x...' hex)" },
+                    "width": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Value match byte width (1..8)" },
+                    "addr": { "description": "Find read/write/HLE history touching [addr, addr+len)" },
+                    "len": { "type": "integer", "minimum": 1, "description": "Byte length for addr query (default 1)" },
+                    "at": { "type": "integer", "minimum": 0, "description": "Upper seq bound" },
+                    "writesOnly": { "type": "boolean", "description": "For addr query, return only writes & HLE mutations" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Max hits returned (default 100)" }
+                }
+            }
+        },
+        {
+            "name": "trace_diff",
+            "description": "Differential comparison between two offline traces (a.idx vs b.idx), reporting common prefix length, first control-flow divergence, and first register/memory/HLE data divergence.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["idxPathA", "idxPathB"],
+                "properties": {
+                    "idxPathA": { "type": "string" },
+                    "idxPathB": { "type": "string" },
+                    "extPathA": { "type": "string" },
+                    "extPathB": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Max diff entries returned (default 64)" }
+                }
+            }
         }
-    ])
+    ]);
+    if let (Some(arr), Some(more)) = (tools.as_array_mut(), extra.as_array()) {
+        arr.extend(more.iter().cloned());
+    }
+    tools
 }
 
 /// Streamable HTTP MCP 服务端句柄（基于 `tokio` + `axum`，`POST /mcp`）
