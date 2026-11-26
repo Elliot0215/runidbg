@@ -2776,6 +2776,109 @@ pub(super) fn register_native_bridge<'js>(
         )?;
     }
 
+    // good64: asmEncode(source, pc) -> Uint8Array
+    {
+        native.set(
+            "asmEncode",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>, source: String, pc: Value<'js>| -> rquickjs::Result<TypedArray<'js, u8>> {
+                    let base_pc = js_addr_to_u64_strict(&ctx, &pc)?;
+                    let bytes = crate::good64::assemble(&source, base_pc)
+                        .map_err(|e| throw_err(&ctx, format!("good64 汇编失败: {e}")))?;
+                    TypedArray::new(ctx.clone(), bytes)
+                },
+            )?,
+        )?;
+    }
+
+    // good64: asmRelocate(bytes, oldPc, newPc) -> Uint8Array
+    {
+        native.set(
+            "asmRelocate",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      bytes: TypedArray<'js, u8>,
+                      old_pc: Value<'js>,
+                      new_pc: Value<'js>|
+                      -> rquickjs::Result<TypedArray<'js, u8>> {
+                    let old_p = js_addr_to_u64_strict(&ctx, &old_pc)?;
+                    let new_p = js_addr_to_u64_strict(&ctx, &new_pc)?;
+                    let slice = bytes.as_bytes().ok_or_else(|| {
+                        throw_err(&ctx, "asmRelocate: Uint8Array 缓冲区已分离".to_string())
+                    })?;
+                    let relocated = crate::good64::relocate_instructions(slice, old_p, new_p)
+                        .map_err(|e| throw_err(&ctx, format!("good64 重定位失败: {e}")))?;
+                    TypedArray::new(ctx.clone(), relocated)
+                },
+            )?,
+        )?;
+    }
+
+    // good64: memPatchAsm(emuId, addr, source) -> writtenBytes
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "memPatchAsm",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      addr: Value<'js>,
+                      source: String|
+                      -> rquickjs::Result<usize> {
+                    let a = js_addr_to_u64_strict(&ctx, &addr)?;
+                    let bytes = crate::good64::assemble(&source, a)
+                        .map_err(|e| throw_err(&ctx, format!("good64 汇编失败: {e}")))?;
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        if !bytes.is_empty() {
+                            uc.mem_write(a, &bytes)
+                                .map_err(|e| throw_err(&ctx, format!("memPatchAsm 写入失败: {e:?}")))?;
+                            let _ = uc.flush_cache(a, a.saturating_add(bytes.len() as u64));
+                        }
+                        Ok(bytes.len())
+                    })
+                },
+            )?,
+        )?;
+    }
+
+    // good64: memInlineJump(emuId, fromAddr, targetAddr) -> writtenBytes (4B B or 16B LDR+BR)
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "memInlineJump",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      emu_id: usize,
+                      from_addr: Value<'js>,
+                      target_addr: Value<'js>|
+                      -> rquickjs::Result<usize> {
+                    let from = js_addr_to_u64_strict(&ctx, &from_addr)?;
+                    let target = js_addr_to_u64_strict(&ctx, &target_addr)?;
+                    if (from & 3) != 0 || (target & 3) != 0 {
+                        return Err(throw_err(
+                            &ctx,
+                            format!(
+                                "memInlineJump 地址必须 4 字节对齐: from=0x{from:x}, target=0x{target:x}"
+                            ),
+                        ));
+                    }
+                    let bytes = crate::good64::encode_branch_trampoline(from, target);
+                    with_uc(&ctx, &host, emu_id, |uc| {
+                        uc.mem_write(from, &bytes).map_err(|e| {
+                            throw_err(&ctx, format!("memInlineJump 写入失败: {e:?}"))
+                        })?;
+                        let _ = uc.flush_cache(from, from.saturating_add(bytes.len() as u64));
+                        Ok(bytes.len())
+                    })
+                },
+            )?,
+        )?;
+    }
+
     // ---- VFS APIs ----
     {
         let host = Rc::clone(host);
@@ -5116,6 +5219,167 @@ pub(super) fn register_native_bridge<'js>(
                         mem_arr.set(i, o)?;
                     }
                     out.set("taintedMemRanges", mem_arr)?;
+                    Ok(out)
+                },
+            )?,
+        )?;
+    }
+
+    {
+        let host = Rc::clone(host);
+        native.set(
+            "traceDecompileSlice",
+            Function::new(
+                ctx.clone(),
+                move |ctx: Ctx<'js>,
+                      trace_id: usize,
+                      opts: Object<'js>|
+                      -> rquickjs::Result<Object<'js>> {
+                    let has_reg = match opts.get::<_, Value<'js>>("reg") {
+                        Ok(v) if !v.is_undefined() && !v.is_null() => Some(v),
+                        _ => None,
+                    };
+                    let has_addr = match opts.get::<_, Value<'js>>("addr") {
+                        Ok(v) if !v.is_undefined() && !v.is_null() => Some(v),
+                        _ => None,
+                    };
+                    if has_reg.is_some() && has_addr.is_some() {
+                        return Err(throw_err(
+                            &ctx,
+                            "decompileSlice 的 reg 与 addr 参数互斥，请只提供其中一个",
+                        ));
+                    }
+                    let seed = if let Some(rv) = has_reg {
+                        let reg_name = rv
+                            .as_string()
+                            .and_then(|s| s.to_string().ok())
+                            .ok_or_else(|| throw_err(&ctx, "decompileSlice 参数 reg 必须为字符串"))?;
+                        let slot = crate::tracer::parse_reg_slot(&reg_name)
+                            .ok_or_else(|| throw_err(&ctx, format!("无效的寄存器名: {reg_name}")))?;
+                        crate::tracer::TaintSeed::Reg { reg_id: slot }
+                    } else if let Some(av) = has_addr {
+                        let addr = js_addr_to_u64_strict(&ctx, &av)?;
+                        let len: usize = opts
+                            .get::<_, f64>("len")
+                            .ok()
+                            .filter(|v| v.is_finite() && *v >= 1.0)
+                            .map(|v| (v as usize).min(8))
+                            .unwrap_or(4);
+                        crate::tracer::TaintSeed::Mem { addr, len }
+                    } else {
+                        return Err(throw_err(&ctx, "decompileSlice 需要提供 addr 或 reg 参数"));
+                    };
+
+                    let anchor_idx: Option<usize> = opts
+                        .get::<_, f64>("atIdx")
+                        .ok()
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .map(|v| v as usize);
+                    let max_insns: usize = opts
+                        .get::<_, f64>("maxInsns")
+                        .ok()
+                        .filter(|v| v.is_finite() && *v >= 0.0)
+                        .map(|v| v as usize)
+                        .unwrap_or(0);
+                    let max_steps: usize = opts
+                        .get::<_, f64>("maxSteps")
+                        .ok()
+                        .filter(|v| v.is_finite() && *v >= 1.0)
+                        .map(|v| v as usize)
+                        .unwrap_or(4096);
+                    let track_mem_index: bool = opts.get("trackMemIndex").unwrap_or(true);
+                    let track_sp: bool = opts.get("trackSp").unwrap_or(false);
+                    let simplify: bool = opts.get("simplify").unwrap_or(true);
+                    let emit_smt2: bool = opts.get("emitSmt2").unwrap_or(false);
+                    let function_name: String = opts
+                        .get::<_, String>("functionName")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty())
+                        .unwrap_or_else(|| "decompiled_slice".to_string());
+
+                    let mut initial_regs = std::collections::HashMap::new();
+                    if let Ok(ir_val) = opts.get::<_, Value<'js>>("initialRegs") {
+                        if let Some(ir_obj) = ir_val.as_object() {
+                            for (k, v) in ir_obj.props::<String, Value<'js>>().flatten() {
+                                if let Some(slot) = crate::tracer::parse_reg_slot(&k) {
+                                    let val = js_addr_to_u64_strict(&ctx, &v)?;
+                                    initial_regs.insert(slot, val);
+                                }
+                            }
+                        }
+                    }
+
+                    let decomp_opts = crate::tracer::DecompileOptions {
+                        anchor_idx,
+                        max_insns,
+                        max_steps,
+                        track_mem_index,
+                        track_sp,
+                        function_name,
+                        simplify,
+                        emit_smt2,
+                        initial_regs,
+                    };
+
+                    let h = host.try_borrow().map_err(|_| throw_err(&ctx, "不可重入"))?;
+                    let reader = h
+                        .trace_readers
+                        .get(trace_id)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| throw_err(&ctx, "无效或已关闭的 traceId"))?;
+                    let report = reader.decompile_slice(&seed, &decomp_opts);
+
+                    let out = Object::new(ctx.clone())?;
+                    out.set("seed", report.seed_desc)?;
+                    out.set("anchorIdx", report.anchor_idx as f64)?;
+                    out.set("scannedInsns", report.scanned_insns as f64)?;
+                    out.set("sliceInsns", report.slice_insns as f64)?;
+                    out.set("rawNodes", report.raw_nodes as f64)?;
+                    out.set("simplifiedNodes", report.simplified_nodes as f64)?;
+                    if let Some(exp) = report.expected_output {
+                        out.set("expectedOutputHex", format!("0x{exp:x}"))?;
+                    }
+                    if let Some(ev) = report.evaluated_output {
+                        out.set("evaluatedOutputHex", format!("0x{ev:x}"))?;
+                    }
+                    if let Some(v) = report.verified {
+                        out.set("verified", v)?;
+                    } else {
+                        out.set("verified", rquickjs::Null)?;
+                    }
+                    out.set("cCode", report.c_code)?;
+                    if let Some(smt) = report.smt2 {
+                        out.set("smt2", smt)?;
+                    } else {
+                        out.set("smt2", rquickjs::Null)?;
+                    }
+
+                    let inputs_arr = Array::new(ctx.clone())?;
+                    for (i, inp) in report.inputs.iter().enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("name", inp.name.as_str())?;
+                        o.set("kind", inp.kind)?;
+                        if let Some(a) = inp.addr {
+                            o.set("addrHex", format!("0x{a:016x}"))?;
+                        }
+                        o.set("widthBytes", inp.width_bytes as f64)?;
+                        if let Some(ref sh) = inp.sample_hex {
+                            o.set("sampleHex", sh.as_str())?;
+                        }
+                        inputs_arr.set(i, o)?;
+                    }
+                    out.set("inputs", inputs_arr)?;
+
+                    let tables_arr = Array::new(ctx.clone())?;
+                    for (i, tbl) in report.tables.iter().enumerate() {
+                        let o = Object::new(ctx.clone())?;
+                        o.set("name", tbl.name.as_str())?;
+                        o.set("baseAddrHex", format!("0x{:016x}", tbl.base_addr))?;
+                        o.set("elemBytes", tbl.elem_bytes as f64)?;
+                        o.set("observedCount", tbl.observed_entries.len() as f64)?;
+                        tables_arr.set(i, o)?;
+                    }
+                    out.set("tables", tables_arr)?;
                     Ok(out)
                 },
             )?,

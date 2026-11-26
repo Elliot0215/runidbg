@@ -318,6 +318,21 @@
           const hasVal = retval !== undefined;
           return __native.memRet(emuId, toAddr(addr), hasVal, hasVal ? retval : 0);
         },
+        asm(source, pc = 0) {
+          return __native.asmEncode(String(source), pc);
+        },
+        relocateAsm(bytes, oldPc, newPc) {
+          if (!(bytes instanceof Uint8Array)) {
+            throw new TypeError("mem.relocateAsm expects a Uint8Array");
+          }
+          return __native.asmRelocate(bytes, oldPc, newPc);
+        },
+        patchAsm(addr, source) {
+          return __native.memPatchAsm(emuId, addr, String(source));
+        },
+        inlineJump(fromAddr, targetAddr) {
+          return __native.memInlineJump(emuId, fromAddr, targetAddr);
+        },
         free(addr) {
           return __native.memFree(emuId, toAddr(addr));
         },
@@ -1421,6 +1436,15 @@
     backends() {
       return __native.emuCompiledBackends();
     },
+    asm(source, pc = 0) {
+      return __native.asmEncode(String(source), pc);
+    },
+    relocateAsm(bytes, oldPc, newPc) {
+      if (!(bytes instanceof Uint8Array)) {
+        throw new TypeError("Emu.relocateAsm expects a Uint8Array");
+      }
+      return __native.asmRelocate(bytes, oldPc, newPc);
+    },
     create(opts = {}) {
       const packageName = opts.packageName || "com.example.app";
       const searchPaths = Array.isArray(opts.searchPaths) ? opts.searchPaths.map(String) : [];
@@ -1491,6 +1515,12 @@
         },
         taintBackward(opts) {
           return __native.traceTaint(traceId, "backward", opts || {});
+        },
+        decompileSlice(opts) {
+          return __native.traceDecompileSlice(traceId, opts || {});
+        },
+        taintToC(opts) {
+          return __native.traceDecompileSlice(traceId, opts || {});
         },
         vmAnalyze(opts) {
           return __native.traceVmAnalyze(traceId, opts || {});

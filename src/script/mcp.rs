@@ -1281,6 +1281,149 @@ impl McpServer {
                     "summaryText": report.format_summary(base_addr),
                 }))
             }
+            "trace_decompile" => {
+                let idx_path = PathBuf::from(req_str(args, "idxPath")?);
+                let ext_path = resolve_ext_path(&idx_path, opt_str_strict(args, "extPath")?);
+                let reg_opt = args.get("reg").filter(|v| !v.is_null());
+                let addr_opt = args.get("addr").filter(|v| !v.is_null());
+                if reg_opt.is_some() && addr_opt.is_some() {
+                    return Err(anyhow!(
+                        "trace_decompile 的 reg 与 addr 参数互斥，请只提供其中一个"
+                    ));
+                }
+                let seed = if let Some(rv) = reg_opt {
+                    let reg_name = rv
+                        .as_str()
+                        .ok_or_else(|| anyhow!("trace_decompile 参数 reg 必须为字符串"))?;
+                    let slot = crate::tracer::parse_reg_slot(reg_name)
+                        .ok_or_else(|| anyhow!("无效的寄存器名: {reg_name}"))?;
+                    crate::tracer::TaintSeed::Reg { reg_id: slot }
+                } else if let Some(av) = addr_opt {
+                    let addr = parse_addr_val(Some(av))?;
+                    let len = opt_u64_range(args, "len", 1, 8)?.unwrap_or(4) as usize;
+                    crate::tracer::TaintSeed::Mem { addr, len }
+                } else {
+                    return Err(anyhow!("trace_decompile 需要提供 addr 或 reg 参数"));
+                };
+                let mut opts = crate::tracer::DecompileOptions::default();
+                if let Some(v) = opt_u64_strict(args, "atIdx")? {
+                    opts.anchor_idx = Some(v as usize);
+                }
+                if let Some(v) = opt_u64_strict(args, "maxInsns")? {
+                    opts.max_insns = v as usize;
+                }
+                if let Some(v) = opt_u64_range(args, "maxSteps", 1, 16384)? {
+                    opts.max_steps = v as usize;
+                }
+                if let Some(v) = opt_bool_strict(args, "trackMemIndex")? {
+                    opts.track_mem_index = v;
+                }
+                if let Some(v) = opt_bool_strict(args, "trackSp")? {
+                    opts.track_sp = v;
+                }
+                if let Some(v) = opt_bool_strict(args, "simplify")? {
+                    opts.simplify = v;
+                }
+                if let Some(v) = opt_bool_strict(args, "emitSmt2")? {
+                    opts.emit_smt2 = v;
+                }
+                if let Some(fn_name) = opt_str_strict(args, "functionName")? {
+                    if !fn_name.trim().is_empty() {
+                        opts.function_name = fn_name.trim().to_string();
+                    }
+                }
+                let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+                let report = reader.decompile_slice(&seed, &opts);
+                Ok(json!({
+                    "seed": report.seed_desc,
+                    "anchorIdx": report.anchor_idx,
+                    "scannedInsns": report.scanned_insns,
+                    "sliceInsns": report.slice_insns,
+                    "rawNodes": report.raw_nodes,
+                    "simplifiedNodes": report.simplified_nodes,
+                    "expectedOutputHex": report.expected_output.map(|v| format!("0x{v:x}")),
+                    "evaluatedOutputHex": report.evaluated_output.map(|v| format!("0x{v:x}")),
+                    "verified": report.verified,
+                    "cCode": report.c_code,
+                    "smt2": report.smt2,
+                    "inputs": report.inputs.iter().map(|i| json!({
+                        "name": i.name,
+                        "kind": i.kind,
+                        "addrHex": i.addr.map(|a| format!("0x{a:016x}")),
+                        "widthBytes": i.width_bytes,
+                        "sampleHex": i.sample_hex,
+                    })).collect::<Vec<_>>(),
+                    "tables": report.tables.iter().map(|t| json!({
+                        "name": t.name,
+                        "baseAddrHex": format!("0x{:016x}", t.base_addr),
+                        "elemBytes": t.elem_bytes,
+                        "observedCount": t.observed_entries.len(),
+                    })).collect::<Vec<_>>(),
+                }))
+            }
+            "emu_asm" => {
+                const MAX_ASM_SOURCE_LEN: usize = 64 * 1024;
+                let source = req_str(args, "source")?;
+                if source.len() > MAX_ASM_SOURCE_LEN {
+                    return Err(anyhow!(
+                        "emu_asm 源码长度 {} 超出上限 ({MAX_ASM_SOURCE_LEN} 字节)",
+                        source.len()
+                    ));
+                }
+                let explicit_addr = args
+                    .get("addr")
+                    .filter(|v| !v.is_null())
+                    .or_else(|| args.get("pc").filter(|v| !v.is_null()))
+                    .map(|v| parse_addr_val(Some(v)))
+                    .transpose()?;
+                let patch = args.get("patch").and_then(Value::as_bool).unwrap_or(false);
+                if patch && explicit_addr.is_none() {
+                    return Err(anyhow!("emu_asm 在 patch=true 时必须显式提供 addr 或 pc"));
+                }
+                let pc = explicit_addr.unwrap_or(0);
+                let bytes = crate::good64::assemble(source, pc)?;
+                let hex = bytes
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut disasm = Vec::new();
+                let (chunks, rem) = bytes.as_chunks::<4>();
+                for (idx, chunk) in chunks.iter().enumerate() {
+                    let cur_pc = pc.wrapping_add((idx * 4) as u64);
+                    let word = u32::from_le_bytes(*chunk);
+                    let text = bad64::decode(word, cur_pc)
+                        .map(|ins| ins.to_string())
+                        .unwrap_or_else(|_| format!(".word 0x{word:08x}"));
+                    disasm.push(format!("0x{cur_pc:016x}: {word:08x}  {text}"));
+                }
+                if !rem.is_empty() {
+                    let rem_pc = pc.wrapping_add((chunks.len() * 4) as u64);
+                    let rem_hex = rem
+                        .iter()
+                        .map(|b| format!("0x{b:02x}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    disasm.push(format!("0x{rem_pc:016x}: .byte {rem_hex}"));
+                }
+                let mut patched = false;
+                if patch {
+                    let emu_id = req_u64(args, "emuId")?;
+                    let src_json = serde_json::to_string(source)?;
+                    let code = format!(
+                        "(() => {{ const e = __mcp.emus[{emu_id}]; if (!e) throw new Error('unknown emuId'); return e.mem.patchAsm({pc}n, {src_json}); }})()"
+                    );
+                    let _ = self.eval_js_value(&code)?;
+                    patched = true;
+                }
+                Ok(json!({
+                    "pcHex": format!("0x{pc:016x}"),
+                    "byteLen": bytes.len(),
+                    "hex": hex,
+                    "disasm": disasm,
+                    "patched": patched,
+                }))
+            }
             _ => Err(anyhow!("未知的 MCP 工具: {name}")),
         }
     }
@@ -1905,6 +2048,44 @@ fn tool_definitions() -> Value {
                     "maxInsns": { "type": "integer", "minimum": 0, "description": "Max native instructions to scan (0 = all)" },
                     "maxSteps": { "type": "integer", "minimum": 1, "maximum": 2000, "description": "Max VM steps returned in report (default 200)" },
                     "baseAddr": { "description": "Optional module base address for +0x... offsets in summaryText" }
+                }
+            }
+        },
+        {
+            "name": "trace_decompile",
+            "description": "Dynamic taint slice -> single-path Bit-Vector SSA symbolic lifting -> algebraic/rotate/MBA deobfuscation -> self-verified compilable pseudo-C (and optional QF_BV SMT-LIB2 export). Zero path explosion, zero external solver dependency.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["idxPath"],
+                "properties": {
+                    "idxPath": { "type": "string", "description": "Path to trace.idx file" },
+                    "extPath": { "type": "string", "description": "Optional trace.ext path (auto-detected if sibling exists)" },
+                    "addr": { "description": "Target output memory address (integer or '0x...' hex string; mutually exclusive with reg)" },
+                    "len": { "type": "integer", "minimum": 1, "maximum": 8, "description": "Output memory width in bytes (default 4)" },
+                    "reg": { "type": "string", "description": "Target output register (e.g. 'x0', 'w0'; mutually exclusive with addr)" },
+                    "atIdx": { "type": "integer", "minimum": 0, "description": "Observation instruction index (default last instruction)" },
+                    "maxInsns": { "type": "integer", "minimum": 0, "description": "Max instructions to scan backward (0 = all)" },
+                    "maxSteps": { "type": "integer", "minimum": 1, "maximum": 16384, "description": "Max taint slice steps (default 4096)" },
+                    "functionName": { "type": "string", "description": "Generated C function name (default 'decompiled_slice')" },
+                    "simplify": { "type": "boolean", "description": "Enable algebraic, rotate, and MBA deobfuscation passes (default true)" },
+                    "emitSmt2": { "type": "boolean", "description": "Also emit standard QF_BV SMT-LIB2 for external Z3/Bitwuzla inversion (default false)" },
+                    "trackMemIndex": { "type": "boolean", "description": "Track indexed table/S-Box lookups (default true)" },
+                    "trackSp": { "type": "boolean", "description": "Track SP arithmetic (default false)" }
+                }
+            }
+        },
+        {
+            "name": "emu_asm",
+            "description": "Assemble ARM64 instructions using built-in lightweight assembler `good64` (returns hex bytes & bad64 verification disassembly; set patch=true with emuId+addr to patch guest memory and flush cache).",
+            "inputSchema": {
+                "type": "object",
+                "required": ["source"],
+                "properties": {
+                    "source": { "type": "string", "description": "ARM64 assembly source (supports ';' or newline separation, local labels, mov imm64 expansion, and .word/.quad directives)" },
+                    "addr": { "description": "Base PC / target patch address (integer or '0x...' hex, default 0)" },
+                    "pc": { "description": "Alias of addr" },
+                    "patch": { "type": "boolean", "description": "If true, write assembled bytes into emuId at addr and flush instruction cache" },
+                    "emuId": { "type": "integer", "description": "Target emulator ID (required when patch=true)" }
                 }
             }
         }

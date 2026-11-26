@@ -51,6 +51,7 @@ fn print_usage() {
            runidbg-cli debug <lib.so> <symbol|0xaddr> [--listen 127.0.0.1:1234] [--pkg PKG]   启动 GDB RSP 远程调试服务端（仅 Unicorn）\n\
            runidbg-cli debug --tape <file.rtape> [--checkpoint <idx|label>] [sym|0xaddr]      从 .rtape 磁带启动 GDB RSP（含二期 EVENT_LOG 时自动开启 rs/rc/watch 时间旅行调试）\n\
            runidbg-cli tape info <file.rtape>                                                 查看 .rtape 磁带检查点、时间轴事件与压缩统计\n\
+           runidbg-cli asm \"<insns>\" [--pc <hex>]                                             使用内置 good64 汇编器将 ARM64 汇编转为机器码并反汇编校验\n\
            runidbg-cli init-types [dir]                                                       生成 runidbg.d.ts 类型声明\n\
            runidbg-cli dump <trace.idx> [--ext <trace.ext>] [--base <hex>] [--skip N] [--limit N]\n\
            runidbg-cli search|find <trace.idx> [--ext <trace.ext>] [--base <hex>] [--val <hex>] [--addr <hex>] [--pc <hex>]\n\
@@ -58,6 +59,8 @@ fn print_usage() {
            runidbg-cli diff <a.idx> <b.idx> [--ext-a <a.ext>] [--ext-b <b.ext>] [--base <hex>] [--limit N]\n\
            runidbg-cli taint <trace.idx> [--ext <trace.ext>] [--mode <forward|backward>] (--addr <hex> [--len N] | --reg <x0>)\n\
                      [--at <idx>] [--max-insns N] [--limit N] [--base <hex>] [--no-mem-index] [--track-sp]\n\
+           runidbg-cli decompile <trace.idx> [--ext <trace.ext>] (--addr <hex> [--len N] | --reg <x0>)\n\
+                     [--at <idx>] [--fn <name>] [--no-simplify] [--smt2] [--out <slice.c>]\n\
            runidbg-cli vm <trace.idx> [--ext <trace.ext>] [--dispatcher <hex>] [--bc-reg <x23>] [--bc-deref]\n\
                      [--bc-addr <hex>] [--base-reg <x25>] [--reg-count 32] [--reg-size 8]\n\
                      [--layout <op_lsb:w,f0_lsb[:w],...>] [--min-handlers N] [--min-dispatches N] [--base <hex>] [--limit N] [--max-insns N]\n\
@@ -257,6 +260,63 @@ fn mcp_command(args: &[String]) -> Result<()> {
 #[cfg(not(feature = "mcp"))]
 fn mcp_command(_args: &[String]) -> Result<()> {
     bail!("当前构建未启用 MCP 服务，请使用默认 features 或 `--features mcp` 重新编译")
+}
+
+fn asm_command(args: &[String]) -> Result<()> {
+    let mut source_parts: Vec<String> = Vec::new();
+    let mut pc: u64 = 0;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "-h" || arg == "--help" {
+            println!("用法: runidbg-cli asm \"mov x0, #1; ret\" [--pc 0x40001000]");
+            return Ok(());
+        } else if arg == "--pc" || arg == "--addr" {
+            let val = take_flag_value(args, &mut i, "asm", arg)?;
+            pc = parse_u64_hex_or_dec(val)?;
+        } else if let Some(val) = arg
+            .strip_prefix("--pc=")
+            .or_else(|| arg.strip_prefix("--addr="))
+        {
+            pc = parse_u64_hex_or_dec(val)?;
+            i += 1;
+        } else if arg.starts_with("--") {
+            bail!("runidbg-cli asm: 未知选项 '{arg}'（支持 --pc / --addr / --help）");
+        } else {
+            source_parts.push(arg.to_string());
+            i += 1;
+        }
+    }
+    if source_parts.is_empty() {
+        bail!("用法: runidbg-cli asm \"mov x0, #1; ret\" [--pc 0x40001000]");
+    }
+    let src = source_parts.join(" ");
+    let bytes = runidbg_arm64_emu_tracer::good64::assemble(&src, pc)?;
+    let hex = bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!("bytes ({}) : {hex}", bytes.len());
+    let (chunks, rem) = bytes.as_chunks::<4>();
+    for (idx, chunk) in chunks.iter().enumerate() {
+        let cur_pc = pc.wrapping_add((idx * 4) as u64);
+        let word = u32::from_le_bytes(*chunk);
+        let dis = bad64::decode(word, cur_pc)
+            .map(|ins| ins.to_string())
+            .unwrap_or_else(|_| format!(".word 0x{word:08x}"));
+        println!("  0x{cur_pc:016x}: {word:08x}  {dis}");
+    }
+    if !rem.is_empty() {
+        let rem_pc = pc.wrapping_add((chunks.len() * 4) as u64);
+        let rem_hex = rem
+            .iter()
+            .map(|b| format!("0x{b:02x}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  0x{rem_pc:016x}: .byte {rem_hex}");
+    }
+    Ok(())
 }
 
 #[cfg(feature = "js")]
@@ -800,6 +860,126 @@ fn taint_command(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn decompile_command(args: &[String]) -> Result<()> {
+    let usage = "用法: runidbg-cli decompile <trace.idx> [--ext <trace.ext>] (--addr <hex> [--len N] | --reg <x0>) [--at <idx>] [--max-insns N] [--max-steps N] [--fn <name>] [--no-simplify] [--smt2] [--no-mem-index] [--track-sp] [--out <slice.c>]";
+    if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help") {
+        if args.is_empty() {
+            bail!("{usage}");
+        }
+        eprintln!("{usage}");
+        return Ok(());
+    }
+    let idx_path = PathBuf::from(&args[0]);
+    let mut ext_path: Option<PathBuf> = None;
+    let mut target_addr: Option<u64> = None;
+    let mut target_len: usize = 4;
+    let mut target_reg: Option<String> = None;
+    let mut opts = runidbg_arm64_emu_tracer::tracer::DecompileOptions::default();
+    let mut out_path: Option<PathBuf> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ext" => {
+                ext_path = Some(PathBuf::from(take_flag_value(
+                    args, &mut i, "decompile", "--ext",
+                )?));
+            }
+            "--addr" => {
+                let v = take_flag_value(args, &mut i, "decompile", "--addr")?;
+                target_addr = Some(parse_u64_hex_or_dec(v)?);
+            }
+            "--len" => {
+                let v = take_flag_value(args, &mut i, "decompile", "--len")?;
+                target_len = v.parse().context("无效的 --len 值")?;
+                if target_len == 0 || target_len > 8 {
+                    bail!("decompile --len 必须在 1..=8 之间");
+                }
+            }
+            "--reg" => {
+                target_reg = Some(
+                    take_flag_value(args, &mut i, "decompile", "--reg")?.to_string(),
+                );
+            }
+            "--at" => {
+                let v = take_flag_value(args, &mut i, "decompile", "--at")?;
+                opts.anchor_idx = Some(v.parse().context("无效的 --at 值")?);
+            }
+            "--fn" => {
+                opts.function_name =
+                    take_flag_value(args, &mut i, "decompile", "--fn")?.to_string();
+            }
+            "--max-insns" => {
+                let v = take_flag_value(args, &mut i, "decompile", "--max-insns")?;
+                opts.max_insns = v.parse().context("无效的 --max-insns 值")?;
+            }
+            "--max-steps" => {
+                let v = take_flag_value(args, &mut i, "decompile", "--max-steps")?;
+                opts.max_steps = v.parse().context("无效的 --max-steps 值")?;
+            }
+            "--no-simplify" => {
+                opts.simplify = false;
+                i += 1;
+            }
+            "--smt2" => {
+                opts.emit_smt2 = true;
+                i += 1;
+            }
+            "--no-mem-index" => {
+                opts.track_mem_index = false;
+                i += 1;
+            }
+            "--track-sp" => {
+                opts.track_sp = true;
+                i += 1;
+            }
+            "--out" => {
+                out_path = Some(PathBuf::from(take_flag_value(
+                    args, &mut i, "decompile", "--out",
+                )?));
+            }
+            other => bail!("decompile 未知参数: {other}"),
+        }
+    }
+
+    if target_reg.is_some() && target_addr.is_some() {
+        bail!("decompile 的 --addr 与 --reg 互斥，请只提供其中一个");
+    }
+    let seed = if let Some(ref reg_name) = target_reg {
+        let slot = runidbg_arm64_emu_tracer::tracer::parse_reg_slot(reg_name)
+            .ok_or_else(|| anyhow::anyhow!("无效的寄存器名: {reg_name}"))?;
+        runidbg_arm64_emu_tracer::tracer::TaintSeed::Reg { reg_id: slot }
+    } else if let Some(addr) = target_addr {
+        runidbg_arm64_emu_tracer::tracer::TaintSeed::Mem {
+            addr,
+            len: target_len,
+        }
+    } else {
+        bail!("decompile 必须提供 --addr <hex> 或 --reg <x0>");
+    };
+
+    if ext_path.is_none() {
+        ext_path = runidbg_arm64_emu_tracer::tracer::resolve_sibling_ext_path(&idx_path);
+    }
+    let reader = TraceReader::open(&idx_path, ext_path.as_deref())?;
+    let report = reader.decompile_slice(&seed, &opts);
+    let summary = report.format_summary();
+    if let Some(out) = out_path {
+        fs::write(&out, &summary)?;
+        println!(
+            "已导出精简伪 C 到 {}（slice={} insns, dag={}->{} nodes, verified={:?}）",
+            out.display(),
+            report.slice_insns,
+            report.raw_nodes,
+            report.simplified_nodes,
+            report.verified
+        );
+    } else {
+        print!("{summary}");
+    }
+    Ok(())
+}
+
 fn vm_command(args: &[String]) -> Result<()> {
     let usage = "用法: runidbg-cli vm <trace.idx> [--ext <trace.ext>] [--dispatcher <hex>] [--bc-reg <x23>] [--bc-deref] [--bc-addr <hex>] [--base-reg <x25>] [--reg-count 32] [--reg-size 8] [--layout <op_lsb:w,f0_lsb[:w],...>] [--min-handlers N] [--min-dispatches N] [--base <hex>] [--limit N] [--max-insns N]";
     if args.is_empty() || matches!(args[0].as_str(), "-h" | "--help") {
@@ -973,8 +1153,10 @@ fn main() -> Result<()> {
         "mcp" => return mcp_command(&args[2..]),
         "debug" => return debug_gdb_command(&args[2..]),
         "tape" => return tape_command(&args[2..]),
+        "asm" => return asm_command(&args[2..]),
         "diff" => return diff_command(&args[2..]),
         "taint" => return taint_command(&args[2..]),
+        "decompile" => return decompile_command(&args[2..]),
         "vm" => return vm_command(&args[2..]),
         "ui" => return ui_command(&args[2..]),
         "init-types" => return init_types_command(&args[2..]),

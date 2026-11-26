@@ -5,6 +5,7 @@ pub mod debug;
 pub mod diag;
 pub mod emulator;
 pub mod error;
+pub mod good64;
 pub mod jni;
 pub mod loader;
 pub mod logging;

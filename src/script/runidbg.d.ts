@@ -493,6 +493,18 @@ interface MemNamespace {
   patch(addr: number | bigint, bytes: Uint8Array): number;
   nop(addr: number | bigint, count?: number): number;
   ret(addr: number | bigint, retval?: number | bigint): number;
+  /** 使用内置轻量 ARM64 汇编器 `good64` 将汇编文本编译为小端字节码（支持本地标签与 `;`/换行多指令） */
+  asm(source: string, pc?: number | bigint | string): Uint8Array;
+  /** Inline Hook PC 相对指令重定位：将 `oldPc` 处的机器码搬运到 `newPc`（自动重写 `B`/`BL`/`B.cond`/`CBZ`/`TBZ`/`ADR`/`ADRP`/`LDR literal` 与块内短分支） */
+  relocateAsm(
+    bytes: Uint8Array,
+    oldPc: number | bigint | string,
+    newPc: number | bigint | string
+  ): Uint8Array;
+  /** 在 `addr` 处使用 `good64` 现场汇编并写入 Guest 内存（自动刷新后端指令缓存），返回写入字节数 */
+  patchAsm(addr: number | bigint | string, source: string): number;
+  /** Inline Hook 跳转辅助：在 `fromAddr` 写入 4B 短跳 `B`（±128MB 内）或 16B 绝对跳板 `LDR X16, #8; BR X16; .quad target` */
+  inlineJump(fromAddr: number | bigint | string, targetAddr: number | bigint | string): number;
 }
 
 interface VirtualNicConfig {
@@ -1101,6 +1113,60 @@ interface TraceTaintReport {
   }>;
 }
 
+interface TraceDecompileOptions {
+  /** 目标观测内存地址（与 `reg` 二选一） */
+  addr?: number | bigint | string;
+  /** 目标内存宽度（1..8 字节，默认 4） */
+  len?: number;
+  /** 目标观测寄存器名（如 `"x0"`, `"w0"`；与 `addr` 二选一） */
+  reg?: string;
+  /** 观测点指令下标（默认末条指令） */
+  atIdx?: number;
+  /** 最大扫描指令数（0 表示全部） */
+  maxInsns?: number;
+  /** 最大切片步数（默认 4096） */
+  maxSteps?: number;
+  /** 是否追踪访存变址/S-Box 查表（默认 true） */
+  trackMemIndex?: boolean;
+  /** 是否追踪 SP（默认 false） */
+  trackSp?: boolean;
+  /** 生成的 C 函数名称（默认 `"decompiled_slice"`） */
+  functionName?: string;
+  /** 是否启用代数/旋转/MBA 反混淆化简（默认 true） */
+  simplify?: boolean;
+  /** 是否额外导出标准 `QF_BV` SMT-LIB2 文本（默认 false） */
+  emitSmt2?: boolean;
+  /** 可选初始寄存器具体值映射（如 `{ x0: 0x1234, x1: 0x5678 }`），用于启用寄存器参数的数值自校验 */
+  initialRegs?: Record<string, number | bigint | string>;
+}
+
+interface TraceDecompileReport {
+  readonly seed: string;
+  readonly anchorIdx: number;
+  readonly scannedInsns: number;
+  readonly sliceInsns: number;
+  readonly rawNodes: number;
+  readonly simplifiedNodes: number;
+  readonly expectedOutputHex?: string;
+  readonly evaluatedOutputHex?: string;
+  readonly verified: boolean | null;
+  readonly cCode: string;
+  readonly smt2: string | null;
+  readonly inputs: Array<{
+    readonly name: string;
+    readonly kind: "reg" | "mem";
+    readonly addrHex?: string;
+    readonly widthBytes: number;
+    readonly sampleHex?: string;
+  }>;
+  readonly tables: Array<{
+    readonly name: string;
+    readonly baseAddrHex: string;
+    readonly elemBytes: number;
+    readonly observedCount: number;
+  }>;
+}
+
 interface TraceReaderHandle {
   readonly totalInsns: number;
   readonly totalExt: number;
@@ -1124,6 +1190,10 @@ interface TraceReaderHandle {
   taintForward(opts: TraceTaintOptions): TraceTaintReport;
   /** 离线反向因果切片：从输出字节/寄存器倒推精确的指令与 HLE 计算链，直达输入起源 */
   taintBackward(opts: TraceTaintOptions): TraceTaintReport;
+  /** 动态污点切片 → 单路径符号提升 → 代数/MBA 化简 → 自校验精简伪 C（及可选 SMT-LIB2） */
+  decompileSlice(opts: TraceDecompileOptions): TraceDecompileReport;
+  /** `decompileSlice` 的便捷别名 */
+  taintToC(opts: TraceDecompileOptions): TraceDecompileReport;
   /** 离线 VM 专项分析：自动识别调度循环与跳转表、统计 Handler 分布与字节码消费步长、按位域解码指令字并输出虚拟寄存器堆符号差分 */
   vmAnalyze(opts?: VmAnalyzeOptions): VmAnalysisReport;
   close(): boolean;
@@ -1139,6 +1209,14 @@ declare namespace Trace {
 declare namespace Emu {
   /** 返回当前构建在当前操作系统上默认编译启用的执行后端列表 */
   function backends(): Array<"unicorn" | "dynarmic" | "kvm" | "hypervisor">;
+  /** 使用内置轻量 ARM64 汇编器 `good64` 将汇编文本编译为小端字节码（不依赖仿真实例） */
+  function asm(source: string, pc?: number | bigint | string): Uint8Array;
+  /** 使用 `good64` 重定位器将 `oldPc` 处的 ARM64 机器码搬运到 `newPc`（超距自动展开为安全跳板/地址加载，支持块内分支重映射） */
+  function relocateAsm(
+    bytes: Uint8Array,
+    oldPc: number | bigint | string,
+    newPc: number | bigint | string
+  ): Uint8Array;
   function create(options?: EmuOptions): EmuHandle;
   /** 从 `.rtape` 磁盘磁带直接拉起实例（支持跨进程秒启与跨后端接力） */
   function loadTape(path: string, options?: LoadTapeOptions): EmuHandle;

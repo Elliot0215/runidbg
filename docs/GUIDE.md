@@ -1,6 +1,6 @@
 # runidbg 组件与工具完整使用指南
 
-本文档涵盖 `runidbg` 全部 CLI 子命令、多执行后端、QuickJS 脚本 API、设备画像（`DeviceProfile`）、零拷贝 Trace / HLE 统一流 / 离线污点切片 / 全知查询 / 双跑 Diff / VM 专项分析、`.rtape` 时间旅行调试、异步多核 RPC 服务、MCP 36 工具、GDB RSP 远程调试以及 Rust 库接口。
+本文档涵盖 `runidbg` 全部 CLI 子命令、多执行后端、QuickJS 脚本 API、`good64` 零依赖 ARM64 汇编器与重定位器、设备画像（`DeviceProfile`）、零拷贝 Trace / HLE 统一流 / 离线污点切片 / 切片反编译伪 C / 全知查询 / 双跑 Diff / VM 专项分析、`.rtape` 时间旅行调试、异步多核 RPC 服务、MCP 38 工具、GDB RSP 远程调试以及 Rust 库接口。
 
 ---
 
@@ -15,14 +15,16 @@ runidbg-cli [--log-level <trace|debug|info|warn|error>] [--log-format <compact|j
 | --- | --- | --- |
 | `run` | 运行 QuickJS 仿真脚本（支持 `--freeze-layout` 隔离宿主分配） | `runidbg-cli run --freeze-layout probe.js -- "arg1"` |
 | `serve` | 启动异步 HTTP / JSON-RPC 2.0 服务 | `runidbg-cli serve script.js --listen 0.0.0.0:8080 --workers auto --max-queue 2048 --timeout-ms 15000 --max-insns 5000000 --allow-reload` |
-| `mcp` | 启动 MCP 服务端（stdio / Streamable HTTP，36 个工具） | `runidbg-cli mcp --cwd .` 或 `runidbg-cli mcp --http 127.0.0.1:8090 --cwd .` |
+| `mcp` | 启动 MCP 服务端（stdio / Streamable HTTP，38 个工具） | `runidbg-cli mcp --cwd .` 或 `runidbg-cli mcp --http 127.0.0.1:8090 --cwd .` |
 | `debug` | 启动 ARM64 GDB RSP 远程调试服务端（支持 `.so` 或 `--tape` 时间旅行反向调试） | `runidbg-cli debug --tape sign_tt.rtape --listen 127.0.0.1:1234` |
 | `tape` | 查看 `.rtape` 磁带检查点、时间轴事件与压缩统计 | `runidbg-cli tape info ./sign_tt.rtape` |
+| `asm` | 使用内置 `good64` 零依赖汇编器将 ARM64 汇编编译为机器码并反汇编校验 | `runidbg-cli asm "paciasp; ubfx x0, x1, #4, #8; ret" --pc 0x40001000` |
 | `ui` | 启动内置暗黑 Web UI（Trace 分析 + `.rtape` 时间旅行驾驶舱） | `runidbg-cli ui ./trace.idx --base 0x40000000 --open` |
 | `init-types` | 导出 TypeScript 类型声明 `runidbg.d.ts` | `runidbg-cli init-types examples/scripts` |
 | `dump` | 离线反汇编 Trace（自动探测同级 `.ext`，含访存 R/W 与 HLE 事件） | `runidbg-cli dump trace.idx --base 0x40000000 --skip 0 --limit 50` |
 | `search` / `find` | 离线检索寄存器值 / 访存地址 / PC / ASCII / 字节序列 | `runidbg-cli find trace.idx --base 0x40000000 --val 0x03000001` |
 | `taint` | 离线字节级前向污点传播与反向因果切片（跨 HLE `memcpy` 与 S-Box 查表） | `runidbg-cli taint trace.idx --mode backward --addr 0x50006470 --len 8 --base 0x40000000` |
+| `decompile` | 动态污点切片 → 单路径符号提升 → 代数/MBA 反混淆 → 自校验精简伪 C（及可选 SMT-LIB2） | `runidbg-cli decompile trace.idx --addr 0x50006470 --len 4 --fn round_fn --smt2` |
 | `diff` | 双跑 Trace 差分（定位首次控制流分歧与首次寄存器/内存/HLE 数据分歧） | `runidbg-cli diff a.idx b.idx --base 0x40000000 --limit 64` |
 | `vm` | OLLVM / 自定义字节码 VM 专项分析（自动识别调度循环、跳转表、opmap 步长与寄存器堆差分） | `runidbg-cli vm trace.idx --base 0x40000000 --base-reg x25 --layout 6:6,12,17,22,27` |
 | `stats` | 离线热点统计（唯一 PC、Top-N 热点指令与 `BL` 目标） | `runidbg-cli stats trace.idx --base 0x40000000 --top 20` |
@@ -231,7 +233,7 @@ const diff = Trace.diff("run_a.idx", "run_b.idx", 100);
 
 ---
 
-## 5. MCP 服务端（36 个 AI 逆向工具）
+## 5. MCP 服务端（38 个 AI 逆向工具）
 
 支持 **stdio**（`runidbg-cli mcp --cwd .`）与 **Streamable HTTP**（`runidbg-cli mcp --http 127.0.0.1:8090 --cwd .`）：
 
@@ -239,8 +241,8 @@ const diff = Trace.diff("run_a.idx", "run_b.idx", 100);
 | --- | --- | --- |
 | 生命周期与执行 | `emu_create` / `emu_load` / `emu_jni_onload` / `emu_exports` / `emu_call` / `emu_eval_js` | 创建实例（支持 `backend`/`freezeLayout`）、加载 `.so`、查导出、调函数与执行 JS |
 | DEX 与 JNI | `emu_load_dex` / `emu_dex_class_info` / `emu_jni_set_field` / `emu_jni_call_native` | 加载 DEX 元数据索引、查询类/字段/方法、读写 JNI 字段与直接调用原生方法 |
-| 状态与反汇编 | `emu_regs` / `emu_mem_read` / `emu_mem_scan` / `emu_disasm` | 读寄存器、读/扫内存、`bad64` 反汇编 |
-| Trace / 污点 / Diff / VM / Hook | `emu_trace_call` / `trace_inspect` / `trace_calltree` / `trace_crypto_scan` / `trace_taint` / `trace_query` / `trace_diff` / `trace_vm_analyze` / `emu_hook_capture` | 函数级 Trace、检索、调用树、密码学扫描、离线污点切片、全知查询、双跑差分、VM 自动分析与一次性 Hook 抓取 |
+| 状态、汇编与反汇编 | `emu_regs` / `emu_mem_read` / `emu_mem_scan` / `emu_disasm` / `emu_asm` | 读寄存器、读/扫内存、`bad64` 反汇编、`good64` 现场汇编与内存 Patch |
+| Trace / 污点 / 伪 C / Diff / VM / Hook | `emu_trace_call` / `trace_inspect` / `trace_calltree` / `trace_crypto_scan` / `trace_taint` / `trace_decompile` / `trace_query` / `trace_diff` / `trace_vm_analyze` / `emu_hook_capture` | 函数级 Trace、检索、调用树、密码学扫描、离线污点切片、动态切片反编译伪 C/SMT2、全知查询、双跑差分、VM 自动分析与一次性 Hook 抓取 |
 | `.rtape` 磁带与时间旅行 | `emu_save_tape` / `emu_load_tape` / `emu_seek_tape` / `tape_info` / `tt_record_start` / `tt_record_stop` / `tt_open` / `tt_seek` / `tt_reverse_watch` / `tt_mem_read` / `tt_close` | 跨后端磁带接力、二期时间旅行录制、任意指令跳转与反向内存写/读/访问观察点 |
 | 诊断 | `emu_diag_missing` / `emu_last_crash` | 获取 `EnvDiag` 缺失环境报告与最新崩溃现场 |
 
@@ -320,7 +322,7 @@ let vm  = reader.analyze_vm(&VmAnalysisOptions::default());
 | --- | :---: | --- |
 | `js` | ✅ | QuickJS 脚本引擎（`rquickjs`） |
 | `rpc` | ✅ | 异步多核 HTTP / JSON-RPC 2.0 服务（`tokio`、`axum`、`async-channel`、`serde_json`） |
-| `mcp` | ✅ | MCP stdio / Streamable HTTP 服务端（36 个 AI 逆向工具） |
+| `mcp` | ✅ | MCP stdio / Streamable HTTP 服务端（38 个 AI 逆向工具） |
 | `apk` | ✅ | APK 一键解析与内存加载（`zip`） |
 | `ui` | ✅ | 内置暗黑 Web UI（Trace / 时间旅行驾驶舱 / RPC / EnvDiag） |
 | `dynarmic` | ✅ | 跨平台 Dynarmic ARM64 JIT 加速后端（**仅仿真模式**，构建需 `cmake` + `ninja`） |
