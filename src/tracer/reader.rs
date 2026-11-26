@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::mem::size_of;
 use std::path::{Path, PathBuf};
@@ -558,8 +558,11 @@ impl TraceReader {
         self.search_mem_bytes_bounded(pattern, None, None, 0)
     }
 
-    /// 带 `min_seq` / `max_seq` / `limit` 提前终止的字节流匹配（避免大块 memset 场景全量回放爆内存）
-    fn search_mem_bytes_bounded(
+    /// 带 `min_seq` / `max_seq` / `limit` 提前终止的字节流匹配
+    ///
+    /// 采用 4KB 页块影子内存（`PagedShadowMem`）+ 256-bit 字节集合 O(1) 剪枝 +
+    /// `HleMemset` 边界数学剪枝 + 页内连续切片 SIMD 锚点扫描（`WildcardMatcher`）。
+    pub fn search_mem_bytes_bounded(
         &self,
         pattern: &[u8],
         min_seq: Option<u32>,
@@ -576,17 +579,55 @@ impl TraceReader {
             .map(|hi| self.ext_end_index_for_seq(hi))
             .unwrap_or(self.ext_count);
         let pat_len = pattern.len();
-        let mut mem: HashMap<u64, u8> = HashMap::new();
+        let matcher = crate::mem_match::WildcardMatcher::from_exact(pattern);
+        let mut mem = crate::mem_match::PagedShadowMem::new();
         let mut hits = Vec::new();
-        let mut last_hit_addr_seq: Option<(u64, u32)> = None;
+        // 按 `seq_low32` 追踪同指令已命中地址集合，避免 `STP` 等同 seq 多写指令重复上报
+        let mut dedup_seq: Option<u32> = None;
+        let mut dedup_addrs: HashSet<u64> = HashSet::new();
 
-        let check_window = |mem: &HashMap<u64, u8>,
+        let check_range = |mem: &crate::mem_match::PagedShadowMem,
+                           start_lo: u64,
+                           start_hi: u64,
+                           seq: u32,
+                           pc: u64,
+                           hits: &mut Vec<MemPatternHit>,
+                           dedup_seq: &mut Option<u32>,
+                           dedup_addrs: &mut HashSet<u64>|
+         -> bool {
+            if *dedup_seq != Some(seq) {
+                if !dedup_addrs.is_empty() {
+                    dedup_addrs.clear();
+                }
+                *dedup_seq = Some(seq);
+            }
+            let mut stopped = false;
+            let _ = mem.scan_candidates(start_lo, start_hi, pattern, &matcher, |candidate| {
+                if dedup_addrs.insert(candidate) {
+                    hits.push(MemPatternHit {
+                        seq_low32: seq,
+                        pc,
+                        addr: candidate,
+                        matched_len: pat_len,
+                    });
+                    if limit > 0 && hits.len() >= limit {
+                        stopped = true;
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
+                std::ops::ControlFlow::Continue(())
+            });
+            stopped
+        };
+
+        let check_window = |mem: &crate::mem_match::PagedShadowMem,
                             start_addr: u64,
                             write_len: usize,
                             seq: u32,
                             pc: u64,
                             hits: &mut Vec<MemPatternHit>,
-                            last: &mut Option<(u64, u32)>|
+                            dedup_seq: &mut Option<u32>,
+                            dedup_addrs: &mut HashSet<u64>|
          -> bool {
             if let Some(lo) = min_seq {
                 if seq < lo {
@@ -595,33 +636,7 @@ impl TraceReader {
             }
             let start_lo = start_addr.saturating_sub((pat_len - 1) as u64);
             let start_hi = start_addr.saturating_add((write_len.saturating_sub(1)) as u64);
-            let mut candidate = start_lo;
-            while candidate <= start_hi {
-                let mut matched = true;
-                for (k, &pb) in pattern.iter().enumerate() {
-                    if mem.get(&candidate.wrapping_add(k as u64)).copied() != Some(pb) {
-                        matched = false;
-                        break;
-                    }
-                }
-                if matched && *last != Some((candidate, seq)) {
-                    hits.push(MemPatternHit {
-                        seq_low32: seq,
-                        pc,
-                        addr: candidate,
-                        matched_len: pat_len,
-                    });
-                    *last = Some((candidate, seq));
-                    if limit > 0 && hits.len() >= limit {
-                        return true;
-                    }
-                }
-                match candidate.checked_add(1) {
-                    Some(next) => candidate = next,
-                    None => break,
-                }
-            }
-            false
+            check_range(mem, start_lo, start_hi, seq, pc, hits, dedup_seq, dedup_addrs)
         };
 
         let mut i = 0usize;
@@ -632,18 +647,21 @@ impl TraceReader {
                     let sz = (rec.size_or_reg as usize).clamp(1, 8);
                     let addr = rec.addr;
                     let bytes = rec.value.to_le_bytes();
-                    for (off, &b) in bytes.iter().take(sz).enumerate() {
-                        mem.insert(addr.wrapping_add(off as u64), b);
-                    }
-                    if check_window(
-                        &mem,
-                        addr,
-                        sz,
-                        rec.seq_low32,
-                        rec.pc,
-                        &mut hits,
-                        &mut last_hit_addr_seq,
-                    ) {
+                    let written = &bytes[..sz];
+                    mem.write_bytes(addr, written);
+                    // O(1) 字节集合剪枝：若本次写入的字节无一出现在 pattern 中，则覆盖区间内不可能匹配
+                    if matcher.contains_any_byte(written)
+                        && check_window(
+                            &mem,
+                            addr,
+                            sz,
+                            rec.seq_low32,
+                            rec.pc,
+                            &mut hits,
+                            &mut dedup_seq,
+                            &mut dedup_addrs,
+                        )
+                    {
                         break;
                     }
                 }
@@ -654,22 +672,12 @@ impl TraceReader {
                     if i + 1 < end_idx {
                         let next = read_packed::<ExtRecord>(mmap, i + 1);
                         if is_matching_hle_meta(rec, next) {
-                            len = (next.value as usize).min(1 << 20);
+                            len = next.value.min(1 << 20) as usize;
                             i += 1;
                         }
                     }
                     if len > 0 {
-                        let mut copied = Vec::with_capacity(len);
-                        for off in 0..len {
-                            copied.push(mem.get(&src.wrapping_add(off as u64)).copied());
-                        }
-                        for (off, mb) in copied.into_iter().enumerate() {
-                            if let Some(b) = mb {
-                                mem.insert(dst.wrapping_add(off as u64), b);
-                            } else {
-                                mem.remove(&dst.wrapping_add(off as u64));
-                            }
-                        }
+                        mem.copy_range(dst, src, len);
                         if check_window(
                             &mem,
                             dst,
@@ -677,7 +685,8 @@ impl TraceReader {
                             rec.seq_low32,
                             rec.pc,
                             &mut hits,
-                            &mut last_hit_addr_seq,
+                            &mut dedup_seq,
+                            &mut dedup_addrs,
                         ) {
                             break;
                         }
@@ -686,21 +695,61 @@ impl TraceReader {
                 Some(ExtKind::HleMemset) => {
                     let dst = rec.addr;
                     let fill = rec.size_or_reg;
-                    let len = (rec.value as usize).min(1 << 20);
+                    let len = rec.value.min(1 << 20) as usize;
                     if len > 0 {
-                        for off in 0..len {
-                            mem.insert(dst.wrapping_add(off as u64), fill);
-                        }
-                        if check_window(
-                            &mem,
-                            dst,
-                            len,
-                            rec.seq_low32,
-                            rec.pc,
-                            &mut hits,
-                            &mut last_hit_addr_seq,
-                        ) {
-                            break;
+                        mem.fill_bytes(dst, fill, len);
+                        if min_seq.is_none_or(|lo| rec.seq_low32 >= lo) {
+                            if !matcher.contains_byte(fill) {
+                                // fill 不在 pattern 中：任何覆盖 [dst, dst+len) 的窗口都不可能匹配
+                            } else if matcher.all_same_exact() != Some(fill)
+                                && len > pat_len.saturating_mul(2)
+                                && dst.checked_add(len as u64).is_some()
+                            {
+                                // 大块 memset 数学剪枝：内部全为 fill 绝不可匹配，仅检查左右两个 pat_len-1 拼接边界
+                                let mut stop = false;
+                                if pat_len > 1 && dst > 0 {
+                                    let left_lo = dst.saturating_sub((pat_len - 1) as u64);
+                                    let left_hi = dst - 1;
+                                    stop = check_range(
+                                        &mem,
+                                        left_lo,
+                                        left_hi,
+                                        rec.seq_low32,
+                                        rec.pc,
+                                        &mut hits,
+                                        &mut dedup_seq,
+                                        &mut dedup_addrs,
+                                    );
+                                }
+                                if !stop && pat_len > 1 {
+                                    let right_end = dst + len as u64 - 1;
+                                    let right_lo = dst + len as u64 - (pat_len - 1) as u64;
+                                    stop = check_range(
+                                        &mem,
+                                        right_lo,
+                                        right_end,
+                                        rec.seq_low32,
+                                        rec.pc,
+                                        &mut hits,
+                                        &mut dedup_seq,
+                                        &mut dedup_addrs,
+                                    );
+                                }
+                                if stop {
+                                    break;
+                                }
+                            } else if check_window(
+                                &mem,
+                                dst,
+                                len,
+                                rec.seq_low32,
+                                rec.pc,
+                                &mut hits,
+                                &mut dedup_seq,
+                                &mut dedup_addrs,
+                            ) {
+                                break;
+                            }
                         }
                     }
                 }

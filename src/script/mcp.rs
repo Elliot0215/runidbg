@@ -359,8 +359,9 @@ impl McpServer {
                     }
                     "search_ascii" => {
                         let ascii = req_str(args, "ascii")?;
+                        let cap = skip.saturating_add(limit);
                         for hit in reader
-                            .search_mem_bytes(ascii.as_bytes())
+                            .search_mem_bytes_bounded(ascii.as_bytes(), None, None, cap)
                             .into_iter()
                             .skip(skip)
                             .take(limit)
@@ -378,7 +379,13 @@ impl McpServer {
                     "search_bytes" => {
                         let hex_str = req_str(args, "bytes")?;
                         let pat = decode_hex_bytes(hex_str)?;
-                        for hit in reader.search_mem_bytes(&pat).into_iter().skip(skip).take(limit) {
+                        let cap = skip.saturating_add(limit);
+                        for hit in reader
+                            .search_mem_bytes_bounded(&pat, None, None, cap)
+                            .into_iter()
+                            .skip(skip)
+                            .take(limit)
+                        {
                             lines.push(format!(
                                 "seq={} pc=0x{:016x}{} [MEM W] addr=0x{:016x} len={}",
                                 hit.seq_low32,

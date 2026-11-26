@@ -907,6 +907,9 @@ pub(crate) fn parse_hex_pattern(pattern: &str) -> Result<Vec<Option<u8>>> {
 }
 
 /// 在指定 Guest 内存区间内搜索通配符特征码，返回所有命中地址
+///
+/// 采用 SIMD 稀缺双字节锚点滤波（`WildcardMatcher`）+ 256KB 流式分块重叠扫描，
+/// 避免大 VMA 整块分配，吞吐较朴素滑动窗口提升一个数量级以上。
 pub(crate) fn scan_memory<B: BackendWithData<EmuState> + ?Sized>(
     uc: &B,
     start: u64,
@@ -917,6 +920,8 @@ pub(crate) fn scan_memory<B: BackendWithData<EmuState> + ?Sized>(
         return Vec::new();
     }
     let end = start.saturating_add(len);
+    let pat_len = pattern.len();
+    let matcher = crate::mem_match::WildcardMatcher::new(pattern);
     let mut hits = Vec::new();
 
     // 优先按 MemoryManager 记录的已映射 VMA 分段扫描，避免跨未映射洞导致整块 mem_read 失败（全后端兼容）
@@ -926,24 +931,60 @@ pub(crate) fn scan_memory<B: BackendWithData<EmuState> + ?Sized>(
         .regions()
         .map(|r| (r.start, r.end))
         .collect();
+
+    const BASE_CHUNK: usize = 256 * 1024;
+    let chunk_cap = BASE_CHUNK.max(pat_len.saturating_mul(2));
+    let mut buf: Vec<u8> = Vec::new();
+
     for (r_start, r_limit) in regions {
         let r_begin = r_start.max(start);
         let r_end = r_limit.min(end);
-        if r_end <= r_begin || (r_end - r_begin) < pattern.len() as u64 {
+        if r_end <= r_begin || (r_end - r_begin) < pat_len as u64 {
             continue;
         }
-        let seg_len = (r_end - r_begin) as usize;
-        let mut buf = vec![0u8; seg_len];
-        if uc.mem_read(r_begin, &mut buf).is_err() {
+        let seg_len_u64 = r_end - r_begin;
+        if seg_len_u64 <= chunk_cap as u64 {
+            let seg_len = seg_len_u64 as usize;
+            buf.resize(seg_len, 0);
+            if uc.mem_read(r_begin, &mut buf).is_err() {
+                continue;
+            }
+            let _ = matcher.for_each_match(&buf, |rel| {
+                hits.push(r_begin + rel as u64);
+                std::ops::ControlFlow::Continue(())
+            });
             continue;
         }
-        for (i, window) in buf.windows(pattern.len()).enumerate() {
-            if window
-                .iter()
-                .zip(pattern.iter())
-                .all(|(b, pat)| pat.is_none_or(|p| *b == p))
-            {
-                hits.push(r_begin + i as u64);
+
+        // 大 VMA 流式分块读取，块间保留 `pat_len - 1` 字节重叠以保证跨块边界零遗漏、零重复
+        let overlap = pat_len - 1;
+        let mut cursor = r_begin;
+        let mut carried = 0usize;
+
+        while cursor < r_end {
+            let to_read = (r_end - cursor).min((chunk_cap - carried) as u64) as usize;
+            buf.resize(carried + to_read, 0);
+            if uc.mem_read(cursor, &mut buf[carried..]).is_err() {
+                carried = 0;
+                cursor = cursor.saturating_add(to_read.max(1) as u64);
+                continue;
+            }
+            let block_base = cursor - carried as u64;
+            let _ = matcher.for_each_match(&buf, |rel| {
+                hits.push(block_base + rel as u64);
+                std::ops::ControlFlow::Continue(())
+            });
+
+            cursor += to_read as u64;
+            if cursor >= r_end {
+                break;
+            }
+            if overlap > 0 && buf.len() >= overlap {
+                let keep_from = buf.len() - overlap;
+                buf.copy_within(keep_from.., 0);
+                carried = overlap;
+            } else {
+                carried = 0;
             }
         }
     }

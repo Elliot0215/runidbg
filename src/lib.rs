@@ -8,6 +8,7 @@ pub mod error;
 pub mod jni;
 pub mod loader;
 pub mod logging;
+pub mod mem_match;
 pub mod memory;
 pub mod os;
 #[cfg(feature = "js")]
